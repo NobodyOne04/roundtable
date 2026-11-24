@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Commands (ADR 0008): `/help`, `/clear`, `/exit`, `/status`, `/usage`, `/context`, `/model test`, `/talk show|allow|deny`, `/budget`, `/turns`; `Tab` completion for commands and `@` ids, `Alt-Enter` new lines, `PgUp`/`PgDn` scrolling, `\/` escape; per-thread `usage.json`
 - Models ask each other (ADR 0007): Claude's `ask` tool through `roundtable mcp`, talk policy, per-message turn and token limits, `/talk on|off`, inline handoffs, `Esc` cancels the chain
 - Free models over the OpenAI-compatible API (ADR 0005): streaming replies, their own history fitted to the window, one retry on 5xx or a too-long request, keys from env or the OS keychain, redacted from the transcript
 - Writer lock in the checkout (ADR 0012, accepted): one writer per checkout across every roundtable and data folder, survives renames; nobody edits outside git
@@ -17,6 +18,7 @@
 - Proposed ADR 0010 (JSONL files as the transcript) and 0011 (hot in-memory model registry)
 
 ### Fixed
+- The `ask` socket falls back to a short owner-only temp folder when the data folder path is too long for a Unix socket (startup failed)
 - Writer safety after Codex review: broadcasts never write, explicit safe default modes, waiting writers keep order, the crash lock covers the whole git checkout and fails closed on unreadable history or git errors, `/quiet` unlocks only after the settle is on disk
 - Transcript, sessions and logs are readable by the owner only (data folder 0700, files 0600)
 

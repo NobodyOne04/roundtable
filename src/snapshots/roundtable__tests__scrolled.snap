@@ -1,0 +1,13 @@
+---
+source: src/main.rs
+expression: "render(&app, 60, 9)"
+---
+"┌ roundtable · scrolled up 8 lines (PgDn) ─────────────────┐"
+"│roundtable › line 0                                       │"
+"│roundtable › line 1                                       │"
+"│roundtable › line 2                                       │"
+"│roundtable › line 3                                       │"
+"└──────────────────────────────────────────────────────────┘"
+"┌──────────────────────────────────────────────────────────┐"
+"│>                                                         │"
+"└ Enter send · Alt-Enter new line · /help · Esc cancel · Ct┘"

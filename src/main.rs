@@ -24,7 +24,9 @@ use tracing_subscriber::EnvFilter;
 use notify_debouncer_mini::notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, DebouncedEventBatch, new_debouncer};
 use roundtable::agent::{self, AskBridge, Outcome, PEvent, Turn};
-use roundtable::app::{App, ChatLine, Checks, EditLock, Effect, Event, FileEdit, LineKind};
+use roundtable::app::{
+    App, ChatLine, Checks, EditLock, Effect, Event, FileEdit, LineKind, TestTarget,
+};
 use roundtable::mcp::{self, AskAnswer};
 use roundtable::openai;
 use roundtable::registry::{self, Adapter, Registry};
@@ -100,7 +102,7 @@ async fn start() -> Result<()> {
         writers: HashMap::new(),
         data_root: root.clone(),
         secrets: vec![],
-        ask_socket: root.join("ask.sock"),
+        ask_socket: ask_socket_path(&root)?,
         ask_tokens: HashMap::new(),
         ask_files: HashMap::new(),
         pending_asks: HashMap::new(),
@@ -293,6 +295,9 @@ impl Runtime {
             FileEdit::Enabled { id, enabled } => registry::set_enabled(&text, id, *enabled),
             FileEdit::Default(id) => registry::set_default(&text, id),
             FileEdit::Talk(on) => registry::set_talk_enabled(&text, *on),
+            FileEdit::Allow { from, targets } => registry::set_allow(&text, from, targets),
+            FileEdit::Budget(n) => registry::set_talk_number(&text, "budget_tokens", *n as i64),
+            FileEdit::Turns(n) => registry::set_talk_number(&text, "max_turns", i64::from(*n)),
         }
         .map_err(|e| format!("{e} (fix models.toml; the change applies in this session only)"))?;
         transcript::write_atomic(&self.models_path, text.as_bytes()).map_err(|e| e.to_string())?;
@@ -455,6 +460,53 @@ impl Runtime {
         self.ask_files
             .insert(id.to_string(), bridge.config_file.clone());
         Ok(bridge)
+    }
+
+    /// `/usage <scope>`: tokens and cost per model from `usage.json` (ADR 0010).
+    fn usage_report(&self, scope: &str) -> String {
+        let totals = match scope {
+            "thread" => match &self.thread {
+                Some(thread) => {
+                    let mut total = BTreeMap::<String, transcript::Tally>::new();
+                    for by in thread.usage().values() {
+                        for (id, tally) in by {
+                            total.entry(id.clone()).or_default().add(tally);
+                        }
+                    }
+                    Ok(total)
+                }
+                None => Ok(BTreeMap::new()),
+            },
+            "today" => self
+                .store
+                .usage(Some(&transcript::today()))
+                .map_err(|e| e.to_string()),
+            _ => self.store.usage(None).map_err(|e| e.to_string()),
+        };
+        match totals {
+            Err(why) => format!("usage: {why}"),
+            Ok(totals) if totals.is_empty() => format!("usage ({scope}): nothing yet"),
+            Ok(totals) => {
+                let mut rows = vec![format!("usage ({scope}):")];
+                for (id, t) in totals {
+                    let cost = if t.cost_usd > 0.0 {
+                        format!(", ${:.4}", t.cost_usd)
+                    } else {
+                        String::new()
+                    };
+                    let estimated = if t.estimated {
+                        " (partly estimated)"
+                    } else {
+                        ""
+                    };
+                    rows.push(format!(
+                        "{id}: {} in, {} out{cost}{estimated}",
+                        t.input, t.output
+                    ));
+                }
+                rows.join("\n")
+            }
+        }
     }
 
     fn cancel_all(&self) {
@@ -640,6 +692,44 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         let _ = reply.send(AskAnswer { text, refused });
                     }
                 }
+                Effect::NewThread => {
+                    // The next message opens a new thread; native sessions start over.
+                    rt.thread = None;
+                    rt.sessions.clear();
+                }
+                Effect::Usage(scope) => local.push_back(Event::Report(rt.usage_report(&scope))),
+                Effect::TestModel { id, target } => {
+                    let tx = tx.clone();
+                    let (cwd, outside) = (rt.cwd.clone(), rt.outside_repo);
+                    tokio::spawn(async move {
+                        let started = std::time::Instant::now();
+                        let text = match target {
+                            TestTarget::Cli { kind, cmd } => {
+                                let check = tokio::task::spawn_blocking(move || {
+                                    agent::preflight(kind, &cmd, &cwd, outside)
+                                })
+                                .await
+                                .unwrap_or_else(|e| Err(e.to_string()));
+                                match check {
+                                    Ok(version) => format!(
+                                        "{id}: ready, {version} ({} ms)",
+                                        started.elapsed().as_millis()
+                                    ),
+                                    Err(why) => format!("{id}: unavailable: {why}"),
+                                }
+                            }
+                            TestTarget::Http {
+                                base_url,
+                                model,
+                                key_ref,
+                            } => match openai::ping(&base_url, &model, key_ref).await {
+                                Ok(took) => format!("{id}: answered in {} ms", took.as_millis()),
+                                Err(why) => format!("{id}: {why}"),
+                            },
+                        };
+                        let _ = tx.send(Event::Report(text)).await;
+                    });
+                }
                 Effect::ConfirmQuiet(marker) => {
                     let result = rt.confirm_quiet(&marker, &mut local);
                     local.push_back(result);
@@ -726,6 +816,28 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             return Ok(());
         }
     }
+}
+
+/// Where the `ask` socket lives: the owner-only data folder, unless that path is too long
+/// for a Unix socket (about 104 bytes on macOS); then an owner-only folder in the temp dir.
+fn ask_socket_path(root: &Path) -> Result<PathBuf> {
+    const MAX: usize = 100;
+    let preferred = root.join("ask.sock");
+    if preferred.as_os_str().len() < MAX {
+        return Ok(preferred);
+    }
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let dir = std::env::temp_dir().join(format!("roundtable-{uid}"));
+    // private_dir sets 0700, which fails on a folder another user owns: never shared.
+    transcript::private_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join("ask.sock");
+    anyhow::ensure!(
+        path.as_os_str().len() < MAX,
+        "no short enough place for the ask socket ({})",
+        path.display()
+    );
+    Ok(path)
 }
 
 /// The socket `roundtable mcp` connects to (ADR 0007), in the owner-only data folder. Each
@@ -843,36 +955,68 @@ async fn tick(tx: mpsc::Sender<Event>) {
 }
 
 fn draw(frame: &mut Frame, app: &App) {
-    let [chat_area, input_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(frame.area());
+    // The input grows with its lines (Alt-Enter), up to a few.
+    let input_rows = app.input.split('\n').count().clamp(1, 6) as u16;
+    let completions = app.completions();
+    let popup_rows = completions.len().min(6) as u16;
+    let [chat_area, popup_area, input_area] = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(if popup_rows > 0 { popup_rows + 2 } else { 0 }),
+        Constraint::Length(input_rows + 2),
+    ])
+    .areas(frame.area());
 
     let text = if app.lines.is_empty() {
         Text::styled(
-            "Nothing at the table yet. Type to Claude, or start with @codex or @all.",
+            "Nothing at the table yet. Type to Claude, start with @codex or @all, or /help.",
             Style::new().add_modifier(Modifier::DIM),
         )
     } else {
         Text::from(app.lines.iter().flat_map(chat_lines).collect::<Vec<_>>())
     };
-    // Keep the newest lines in view. Measured before the border is added: `line_count`
-    // counts border rows too.
+    // Keep the newest lines in view unless scrolled back (PgUp). Measured before the
+    // border is added: `line_count` counts border rows too.
     let chat = Paragraph::new(text).wrap(Wrap { trim: false });
     let inner_height = chat_area.height.saturating_sub(2);
     let total = chat.line_count(chat_area.width.saturating_sub(2)) as u16;
-    let chat = chat
-        .scroll((total.saturating_sub(inner_height), 0))
-        .block(Block::bordered().title(" roundtable "));
+    let bottom = total.saturating_sub(inner_height);
+    let top = bottom.saturating_sub(app.scroll);
+    let title = if top < bottom {
+        format!(" roundtable · scrolled up {} lines (PgDn) ", bottom - top)
+    } else {
+        " roundtable ".to_string()
+    };
+    let chat = chat.scroll((top, 0)).block(Block::bordered().title(title));
     frame.render_widget(chat, chat_area);
 
-    let input = Paragraph::new(format!("> {}", app.input)).block(
-        Block::bordered()
-            .title_bottom(" Enter send · @codex @all · Esc cancel · Ctrl-C twice quit "),
-    );
+    if popup_rows > 0 {
+        let items: Vec<Line> = completions
+            .iter()
+            .take(6)
+            .enumerate()
+            .map(|(i, c)| {
+                let style = if i == 0 {
+                    Style::new().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new().add_modifier(Modifier::DIM)
+                };
+                Line::styled(c.clone(), style)
+            })
+            .collect();
+        let popup = Paragraph::new(items).block(Block::bordered().title(" Tab completes "));
+        frame.render_widget(popup, popup_area);
+    }
+
+    let input = Paragraph::new(format!("> {}", app.input)).block(Block::bordered().title_bottom(
+        " Enter send · Alt-Enter new line · /help · Esc cancel · Ctrl-C twice quit ",
+    ));
     frame.render_widget(input, input_area);
-    let typed = app.input.chars().count() as u16;
+    let last = app.input.rsplit('\n').next().unwrap_or("");
+    let row = (input_rows - 1).min(input_area.height.saturating_sub(3));
+    let col = if input_rows > 1 { 1 } else { 3 } + last.chars().count() as u16;
     frame.set_cursor_position(Position::new(
-        (input_area.x + 3 + typed).min(input_area.right().saturating_sub(2)),
-        input_area.y + 1,
+        (input_area.x + col).min(input_area.right().saturating_sub(2)),
+        input_area.y + 1 + row,
     ));
 }
 
@@ -980,6 +1124,39 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
         terminal.backend().clone()
+    }
+
+    #[test]
+    fn draws_the_completion_popup_and_a_scrolled_view() {
+        let mut app = App::default();
+        for c in "/mo".chars() {
+            app.update(Event::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )));
+        }
+        insta::assert_snapshot!("popup", render(&app, 60, 12));
+        let mut app = App::default();
+        for n in 0..12 {
+            app.note(format!("line {n}"), false);
+        }
+        app.update(Event::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )));
+        insta::assert_snapshot!("scrolled", render(&app, 60, 9));
+    }
+
+    #[test]
+    fn the_ask_socket_path_always_fits() {
+        assert_eq!(
+            ask_socket_path(Path::new("/d")).unwrap(),
+            Path::new("/d/ask.sock")
+        );
+        let long = Path::new("/").join("x".repeat(150));
+        let path = ask_socket_path(&long).unwrap();
+        assert!(path.as_os_str().len() < 100, "{}", path.display());
+        assert!(path.ends_with("ask.sock"));
     }
 
     #[test]

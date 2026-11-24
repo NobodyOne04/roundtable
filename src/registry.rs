@@ -412,6 +412,33 @@ pub fn set_talk_enabled(text: &str, enabled: bool) -> Result<String, String> {
     Ok(doc.to_string())
 }
 
+/// Sets who `from` may ask (`[talk] allow`), keeping comments and layout.
+pub fn set_allow(text: &str, from: &str, targets: &[String]) -> Result<String, String> {
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
+    if doc.get("talk").is_none() {
+        doc["talk"] = toml_edit::table();
+    }
+    if doc["talk"].get("allow").is_none() {
+        doc["talk"]["allow"] = toml_edit::value(toml_edit::InlineTable::new());
+    }
+    let mut list = toml_edit::Array::new();
+    for target in targets {
+        list.push(target.as_str());
+    }
+    doc["talk"]["allow"][from] = toml_edit::value(list);
+    Ok(doc.to_string())
+}
+
+/// Sets a number in `[talk]` (`max_turns`, `budget_tokens`), keeping comments and layout.
+pub fn set_talk_number(text: &str, key: &str, value: i64) -> Result<String, String> {
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
+    if doc.get("talk").is_none() {
+        doc["talk"] = toml_edit::table();
+    }
+    doc["talk"][key] = toml_edit::value(value);
+    Ok(doc.to_string())
+}
+
 /// Sets the top-level `default`, keeping comments and layout.
 pub fn set_default(text: &str, id: &str) -> Result<String, String> {
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
@@ -568,5 +595,13 @@ mod tests {
             "codex is disabled, so it can't be default"
         );
         assert!(set_enabled(DEFAULT_FILE, "ghost", true).is_err());
+        let text = set_allow(DEFAULT_FILE, "codex", &["claude".into()]).unwrap();
+        let text = set_talk_number(&text, "max_turns", 3).unwrap();
+        let text = set_talk_number(&text, "budget_tokens", 999).unwrap();
+        let reg = Registry::parse(&text).unwrap();
+        assert_eq!(reg.talk.allow["codex"], ["claude"]);
+        assert_eq!(reg.talk.allow["claude"], ["codex"], "others untouched");
+        assert_eq!((reg.talk.max_turns, reg.talk.budget_tokens), (3, 999));
+        assert!(text.contains("# Model-to-model talk"), "comments kept");
     }
 }

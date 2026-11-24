@@ -51,6 +51,8 @@ pub enum Event {
     Registry(Result<(Registry, Checks), String>),
     /// Something the loop failed to do, shown in the chat.
     Notice(String),
+    /// An answer to a command the loop had to work out (`/usage`, `/model test`).
+    Report(String),
     /// After `/quiet`: the marker was removed durably, or why not.
     QuietDone(Result<(), String>),
     /// The loop found a reason to lock edits mid-run (another instance crashed, or the
@@ -89,6 +91,19 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// What `/model test` pings.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TestTarget {
+    /// Rerun the CLI's preflight (version, repo and config checks).
+    Cli { kind: agent::Kind, cmd: String },
+    /// One minimal request to the chat API.
+    Http {
+        base_url: String,
+        model: String,
+        key_ref: Option<String>,
+    },
+}
+
 /// A change to `models.toml` asked for by a command; the loop writes it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileEdit {
@@ -99,6 +114,13 @@ pub enum FileEdit {
     Default(String),
     /// `[talk] enabled`, the global switch for model-to-model talk.
     Talk(bool),
+    /// `[talk] allow.<from>`: the full list of who `from` may ask.
+    Allow {
+        from: String,
+        targets: Vec<String>,
+    },
+    Budget(u64),
+    Turns(u32),
 }
 
 /// What `update` asks the loop to do. The loop executes these; results come back as `Event`s.
@@ -158,6 +180,15 @@ pub enum Effect {
     /// The user confirmed the checkout is quiet: remove the crash marker with this key
     /// (ADR 0012).
     ConfirmQuiet(String),
+    /// `/clear`: the next message opens a new thread.
+    NewThread,
+    /// `/usage <scope>`: the loop sums the transcript's usage files.
+    Usage(String),
+    /// `/model test <id>`: ping it and report latency or the error.
+    TestModel {
+        id: String,
+        target: TestTarget,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +245,8 @@ struct Seat {
     /// The identity the running turn was sent to. Its events belong to that destination,
     /// even if the registry changed meanwhile (ADR 0011).
     turn_identity: Option<String>,
+    /// Tokens sent and received in this thread (for `/context`).
+    thread_tokens: (u64, u64),
 }
 
 #[derive(Debug)]
@@ -227,6 +260,8 @@ pub struct App {
     seats: Vec<Seat>,
     /// Why nobody may edit right now; `None` lets the writer edit.
     edit_lock: Option<EditLock>,
+    /// Lines scrolled up from the newest (PgUp/PgDn); 0 follows the conversation.
+    pub scroll: u16,
     /// Quitting: running turns are being cancelled and nothing new may start.
     quitting: bool,
     /// The global talk switch (`[talk] enabled`, `/talk on|off`).
@@ -262,6 +297,7 @@ impl App {
             checks: Checks::new(),
             seats: vec![],
             edit_lock: None,
+            scroll: 0,
             quitting: false,
             talk_on: true,
             origins: BTreeMap::new(),
@@ -374,6 +410,10 @@ impl App {
                 self.lock_edits(lock);
                 vec![]
             }
+            Event::Report(text) => {
+                self.push("roundtable", text, LineKind::Info);
+                vec![]
+            }
             Event::Notice(text) => {
                 self.push("roundtable", text, LineKind::Error);
                 vec![]
@@ -402,8 +442,34 @@ impl App {
                 self.input.pop();
                 vec![]
             }
+            // Alt-Enter everywhere, Shift-Enter where the terminal reports it: a new line.
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+            {
+                self.input.push('\n');
+                vec![]
+            }
             KeyCode::Enter => self.submit(),
             KeyCode::Esc => self.cancel_all(),
+            KeyCode::Tab => {
+                if let Some(first) = self.completions().into_iter().next() {
+                    let keep = self.input.rfind(' ').map_or(0, |i| i + 1);
+                    self.input.truncate(keep);
+                    self.input.push_str(&first);
+                    self.input.push(' ');
+                }
+                vec![]
+            }
+            KeyCode::PageUp => {
+                self.scroll = self.scroll.saturating_add(10);
+                vec![]
+            }
+            KeyCode::PageDown => {
+                self.scroll = self.scroll.saturating_sub(10);
+                vec![]
+            }
             _ => vec![],
         }
     }
@@ -419,10 +485,27 @@ impl App {
         vec![Effect::Quit]
     }
 
+    /// What `Tab` would complete the input to (ADR 0008), for the popup.
+    pub fn completions(&self) -> Vec<String> {
+        let ids: Vec<String> = self
+            .registry
+            .participants
+            .iter()
+            .filter(|p| p.enabled)
+            .map(|p| p.id.clone())
+            .collect();
+        crate::commands::complete(&self.input, &ids)
+    }
+
     fn submit(&mut self) -> Vec<Effect> {
-        let input = std::mem::take(&mut self.input);
+        let mut input = std::mem::take(&mut self.input);
+        self.scroll = 0;
         if input.trim_start().starts_with('/') {
             return self.command(input.trim());
+        }
+        // `\/` sends a literal slash instead of running a command.
+        if let Some(rest) = input.trim_start().strip_prefix("\\/") {
+            input = format!("/{rest}");
         }
         let (targets, prompt, broadcast) = match self.route(&input) {
             Ok(routed) => routed,
@@ -469,6 +552,71 @@ impl App {
     fn command(&mut self, line: &str) -> Vec<Effect> {
         let words: Vec<&str> = line.split_whitespace().collect();
         match words.as_slice() {
+            ["/help"] => {
+                self.push("roundtable", crate::commands::help(), LineKind::Info);
+                vec![]
+            }
+            ["/exit"] => self.quit(),
+            ["/clear"] => self.clear(),
+            ["/status"] => {
+                let text = self.status_text();
+                self.push("roundtable", text, LineKind::Info);
+                vec![]
+            }
+            ["/usage"] => vec![Effect::Usage("thread".into())],
+            ["/usage", scope @ ("thread" | "today" | "all")] => {
+                vec![Effect::Usage(scope.to_string())]
+            }
+            ["/context"] => self.context(None),
+            ["/context", id] => self.context(Some(id)),
+            ["/model", "test", id] => {
+                let Some(p) = self.registry.get(id).cloned() else {
+                    self.push("roundtable", format!("no model `{id}`"), LineKind::Error);
+                    return vec![];
+                };
+                let target = match p.adapter {
+                    Adapter::Cli(kind) => TestTarget::Cli {
+                        kind,
+                        cmd: p.cmd.clone().unwrap_or_else(|| kind.cmd().into()),
+                    },
+                    Adapter::OpenAi => TestTarget::Http {
+                        base_url: p.base_url.clone().unwrap_or_default(),
+                        model: p.model.clone().unwrap_or_default(),
+                        key_ref: p.key.clone(),
+                    },
+                };
+                self.push("roundtable", format!("testing {id}…"), LineKind::Info);
+                vec![Effect::TestModel {
+                    id: id.to_string(),
+                    target,
+                }]
+            }
+            ["/talk", "show"] => {
+                let text = self.talk_text();
+                self.push("roundtable", text, LineKind::Info);
+                vec![]
+            }
+            ["/talk", verb @ ("allow" | "deny"), pair] => self.set_allow(pair, *verb == "allow"),
+            ["/budget", n] => match n.parse::<u64>() {
+                Ok(n) => {
+                    self.registry.talk.budget_tokens = n;
+                    self.talk_changed(
+                        format!("token budget per message is now {n}"),
+                        FileEdit::Budget(n),
+                    )
+                }
+                Err(_) => self.usage_error("/budget <tokens>"),
+            },
+            ["/turns", n] => match n.parse::<u32>() {
+                Ok(n) => {
+                    self.registry.talk.max_turns = n;
+                    self.talk_changed(
+                        format!("model-to-model turns per message: {n}"),
+                        FileEdit::Turns(n),
+                    )
+                }
+                Err(_) => self.usage_error("/turns <n>"),
+            },
             ["/models"] => {
                 let text = self.models_table();
                 self.push("roundtable", text, LineKind::Info);
@@ -500,15 +648,172 @@ impl App {
                 }
             },
             _ => {
-                self.push(
-                    "roundtable",
-                    "commands so far: /models, /model enable|disable|use <id>, /talk on|off, /quiet"
-                        .into(),
-                    LineKind::Error,
-                );
+                let name = words.first().copied().unwrap_or("");
+                let hint = match crate::commands::COMMANDS.iter().find(|c| c.name == name) {
+                    Some(c) => format!("usage: {} {}", c.name, c.args),
+                    None => format!("no command {name}; /help lists them"),
+                };
+                self.push("roundtable", hint, LineKind::Error);
                 vec![]
             }
         }
+    }
+
+    fn usage_error(&mut self, usage: &str) -> Vec<Effect> {
+        self.push("roundtable", format!("usage: {usage}"), LineKind::Error);
+        vec![]
+    }
+
+    fn talk_changed(&mut self, note: String, edit: FileEdit) -> Vec<Effect> {
+        self.push("roundtable", note.clone(), LineKind::Info);
+        vec![status(note), Effect::EditRegistry(edit)]
+    }
+
+    /// `/clear`: a fresh thread, sessions and model histories included.
+    fn clear(&mut self) -> Vec<Effect> {
+        if self.seats.iter().any(|s| s.busy) {
+            self.push(
+                "roundtable",
+                "replies are still running; Esc cancels them first".into(),
+                LineKind::Error,
+            );
+            return vec![];
+        }
+        self.lines.clear();
+        self.origins.clear();
+        self.scroll = 0;
+        for seat in &mut self.seats {
+            seat.session = None;
+            seat.history = Default::default();
+            seat.queue.clear();
+            seat.thread_tokens = (0, 0);
+        }
+        self.push("roundtable", "new thread".into(), LineKind::Info);
+        vec![Effect::NewThread]
+    }
+
+    fn status_text(&self) -> String {
+        let mut rows = vec![];
+        for p in &self.registry.participants {
+            let state = match (p.enabled, self.availability(p), self.checks.get(&p.id)) {
+                (false, ..) => "disabled".to_string(),
+                (true, Err(why), _) => format!("unavailable: {why}"),
+                (true, Ok(()), Some(Ok(version))) => format!("ready ({version})"),
+                (true, Ok(()), _) => "ready".to_string(),
+            };
+            let busy = if self.seats.iter().any(|s| s.id == p.id && s.busy) {
+                ", answering"
+            } else {
+                ""
+            };
+            rows.push(format!("{}: {state}{busy}", p.id));
+        }
+        rows.push(format!(
+            "talk: {}; writer: {}; edits: {}",
+            if self.talk_on { "on" } else { "off" },
+            self.registry.writer().unwrap_or("none"),
+            if self.locked() {
+                format!("locked {}", self.unlock_hint())
+            } else {
+                "unlocked".to_string()
+            }
+        ));
+        rows.join("\n")
+    }
+
+    /// `/context [id]` (ADR 0008): for a CLI agent only what roundtable sent and the usage it
+    /// reported (its own compaction is invisible); for an OpenAI model the estimated fill.
+    fn context(&mut self, only: Option<&str>) -> Vec<Effect> {
+        if let Some(id) = only
+            && self.registry.get(id).is_none()
+        {
+            self.push("roundtable", format!("no model `{id}`"), LineKind::Error);
+            return vec![];
+        }
+        let mut rows = vec![];
+        for p in &self.registry.participants {
+            if only.is_some_and(|id| id != p.id) {
+                continue;
+            }
+            let Some(seat) = self.seats.iter().find(|s| s.id == p.id) else {
+                continue;
+            };
+            let (sent, received) = seat.thread_tokens;
+            rows.push(match p.adapter {
+                Adapter::Cli(_) => format!(
+                    "{}: {sent} tokens in, {received} out this thread; window fill unknown (the CLI keeps and compacts its own context)",
+                    p.id
+                ),
+                Adapter::OpenAi => {
+                    let window = p.context_window.unwrap_or(crate::openai::DEFAULT_CONTEXT_WINDOW);
+                    let used: u64 = seat
+                        .history
+                        .iter()
+                        .map(|(q, a)| crate::openai::estimate(q) + crate::openai::estimate(a))
+                        .sum();
+                    format!(
+                        "{}: ~{used} of {window} tokens of history (estimate, {} exchanges); {sent} in, {received} out this thread",
+                        p.id,
+                        seat.history.len()
+                    )
+                }
+            });
+        }
+        self.push("roundtable", rows.join("\n"), LineKind::Info);
+        vec![]
+    }
+
+    fn talk_text(&self) -> String {
+        let talk = &self.registry.talk;
+        let mut rows = vec![format!(
+            "talk is {}; per message: {} turns, {} tokens",
+            if self.talk_on { "on" } else { "off" },
+            talk.max_turns,
+            talk.budget_tokens
+        )];
+        for p in &self.registry.participants {
+            let targets = talk.allow.get(&p.id).filter(|t| !t.is_empty());
+            rows.push(match targets {
+                Some(t) => format!("{} may ask {}", p.id, t.join(", ")),
+                None => format!("{} may ask no one", p.id),
+            });
+        }
+        rows.join("\n")
+    }
+
+    /// `/talk allow a->b` / `/talk deny a->b`.
+    fn set_allow(&mut self, pair: &str, allow: bool) -> Vec<Effect> {
+        let Some((from, to)) = pair.split_once("->") else {
+            return self.usage_error("/talk allow|deny <a>-><b>");
+        };
+        for id in [from, to] {
+            if self.registry.get(id).is_none() {
+                self.push("roundtable", format!("no model `{id}`"), LineKind::Error);
+                return vec![];
+            }
+        }
+        let targets = self
+            .registry
+            .talk
+            .allow
+            .entry(from.to_string())
+            .or_default();
+        targets.retain(|t| t != to);
+        if allow {
+            targets.push(to.to_string());
+        }
+        let targets = targets.clone();
+        let note = format!(
+            "{from} {} ask {to}",
+            if allow { "may now" } else { "may no longer" }
+        );
+        self.talk_changed(
+            note,
+            FileEdit::Allow {
+                from: from.to_string(),
+                targets,
+            },
+        )
     }
 
     fn models_table(&self) -> String {
@@ -659,6 +964,7 @@ impl App {
                     history: Default::default(),
                     prompt: None,
                     turn_identity: None,
+                    thread_tokens: (0, 0),
                 });
             }
         }
@@ -986,6 +1292,10 @@ impl App {
         let seat = self.seat_mut(id).expect("seat");
         seat.busy = false;
         let usage = seat.usage;
+        if let Some((tokens_in, tokens_out, ..)) = usage {
+            seat.thread_tokens.0 += tokens_in;
+            seat.thread_tokens.1 += tokens_out;
+        }
         let writable = std::mem::take(&mut seat.writable);
         let prompt = seat.prompt.take();
         let text = match seat.reply.take() {
@@ -2221,5 +2531,126 @@ mod tests {
         type_line(&mut app, "/talk on");
         app.update(agent("claude", PEvent::Done(Outcome::Complete)));
         assert_eq!(ask_tool(&type_line(&mut app, "@claude hi")), Some(true));
+    }
+
+    #[test]
+    fn help_status_context_and_usage_commands() {
+        let mut app = App::default();
+        type_line(&mut app, "/help");
+        assert!(last_text(&app).contains("/talk on|off|show"));
+        type_line(&mut app, "/status");
+        assert!(last_text(&app).contains("claude: ready (test)"));
+        assert!(last_text(&app).contains("talk: on; writer: claude; edits: unlocked"));
+        type_line(&mut app, "/context codex");
+        assert!(last_text(&app).starts_with("codex: 0 tokens in"));
+        assert!(last_text(&app).contains("window fill unknown"));
+        assert_eq!(
+            type_line(&mut app, "/usage"),
+            [Effect::Usage("thread".into())]
+        );
+        assert_eq!(
+            type_line(&mut app, "/usage all"),
+            [Effect::Usage("all".into())]
+        );
+        assert!(type_line(&mut app, "/usage forever").is_empty());
+        assert_eq!(last_text(&app), "usage: /usage [thread|today|all]");
+        assert!(type_line(&mut app, "/nope").is_empty());
+        assert_eq!(last_text(&app), "no command /nope; /help lists them");
+    }
+
+    #[test]
+    fn clear_starts_a_fresh_thread_but_not_mid_reply() {
+        let mut app = App::default();
+        type_line(&mut app, "hi");
+        assert!(
+            type_line(&mut app, "/clear").is_empty(),
+            "claude is still replying"
+        );
+        app.update(agent("claude", PEvent::Session("S1".into())));
+        app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        assert_eq!(type_line(&mut app, "/clear"), [Effect::NewThread]);
+        assert_eq!(app.lines.len(), 1, "only the 'new thread' note");
+        let effects = type_line(&mut app, "hi again");
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::StartTurn { session: None, .. }))
+        );
+    }
+
+    #[test]
+    fn talk_policy_commands_edit_memory_and_file() {
+        let mut app = App::default();
+        let effects = type_line(&mut app, "/talk allow codex->claude");
+        assert!(effects.contains(&Effect::EditRegistry(FileEdit::Allow {
+            from: "codex".into(),
+            targets: vec!["claude".into()]
+        })));
+        type_line(&mut app, "/talk show");
+        assert!(last_text(&app).contains("codex may ask claude"));
+        type_line(&mut app, "/talk deny codex->claude");
+        type_line(&mut app, "/talk show");
+        assert!(last_text(&app).contains("codex may ask no one"));
+        assert!(type_line(&mut app, "/talk allow codex->ghost").is_empty());
+        assert!(
+            type_line(&mut app, "/budget 1000")
+                .contains(&Effect::EditRegistry(FileEdit::Budget(1000)))
+        );
+        assert!(
+            type_line(&mut app, "/turns 2").contains(&Effect::EditRegistry(FileEdit::Turns(2)))
+        );
+        type_line(&mut app, "/talk show");
+        assert!(last_text(&app).contains("per message: 2 turns, 1000 tokens"));
+        assert!(type_line(&mut app, "/turns lots").is_empty());
+    }
+
+    #[test]
+    fn model_test_pings_the_right_thing() {
+        let mut app = App::default();
+        let effects = type_line(&mut app, "/model test codex");
+        assert!(
+            matches!(&effects[..], [Effect::TestModel { id, target: TestTarget::Cli { .. } }] if id == "codex")
+        );
+        reload(&mut app, &format!("{DEFAULT_FILE}{LLAMA}"));
+        let effects = type_line(&mut app, "/model test llama");
+        assert!(matches!(
+            &effects[..],
+            [Effect::TestModel {
+                target: TestTarget::Http {
+                    key_ref: Some(_),
+                    ..
+                },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn keys_complete_scroll_add_lines_and_escape_slashes() {
+        let mut app = App::default();
+        for c in "/mod".chars() {
+            app.update(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.completions(), ["/models", "/model"]);
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input, "/models ");
+        app.input.clear();
+        app.update(key(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.scroll, 10);
+        app.update(key(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.scroll, 0);
+        for c in "line one".chars() {
+            app.update(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.update(key(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(
+            app.input, "line one\n",
+            "Alt-Enter adds a line, doesn't send"
+        );
+        app.input.clear();
+        let effects = type_line(&mut app, "\\/usage is a word here");
+        assert!(effects.iter().any(
+            |e| matches!(e, Effect::StartTurn { prompt, .. } if prompt == "/usage is a word here")
+        ));
     }
 }

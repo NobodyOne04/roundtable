@@ -411,6 +411,56 @@ async fn bounded_body(response: reqwest::Response) -> String {
     String::from_utf8_lossy(&body).into_owned()
 }
 
+/// `/model test`: one minimal, non-streaming request. `Ok` is the round-trip time.
+pub async fn ping(
+    base_url: &str,
+    model: &str,
+    key_ref: Option<String>,
+) -> Result<Duration, String> {
+    let key = match key_ref {
+        None => None,
+        Some(reference) => {
+            // Off the loop, like a turn: the keychain may block.
+            let (send, recv) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let _ = send.send(resolve_key(&reference));
+            });
+            Some(recv.await.map_err(|_| "key lookup failed".to_string())??)
+        }
+    };
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_S))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())?;
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+    });
+    let mut request = client.post(&url).json(&body);
+    if let Some(key) = &key {
+        request = request.bearer_auth(key);
+    }
+    let started = std::time::Instant::now();
+    let response = request.send().await.map_err(|e| without_url(&e))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(started.elapsed());
+    }
+    let text = bounded_body(response).await;
+    let mut message = provider_message(&text).unwrap_or(text);
+    if let Some(key) = &key {
+        message = message.replace(key.as_str(), "[redacted]");
+    }
+    Err(format!(
+        "{status}: {}",
+        message.chars().take(300).collect::<String>()
+    ))
+}
+
 /// A provider's own error message from an OpenAI-style error body.
 fn provider_message(body: &str) -> Option<String> {
     let v: Value = serde_json::from_str(body).ok()?;
