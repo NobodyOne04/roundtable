@@ -87,6 +87,7 @@ async fn start() -> Result<()> {
         writers: HashMap::new(),
         data_root: root.clone(),
         secrets: vec![],
+        redactors: HashMap::new(),
         cwd,
         outside_repo,
         models_path,
@@ -158,9 +159,11 @@ struct Runtime {
     /// The running writable turn's lock and marker, by participant id.
     writers: HashMap<String, WriterGuard>,
     data_root: PathBuf,
-    /// Resolved API keys with their references, redacted from every transcript write
+    /// Resolved API keys with their references, redacted from everything shown or written
     /// (ADR 0010). Values only ever live in memory.
     secrets: Vec<(String, String)>,
+    /// Per participant: streamed text held back while it could still be part of a key.
+    redactors: HashMap<String, transcript::StreamRedactor>,
     outside_repo: bool,
     models_path: PathBuf,
     /// Fingerprint of the `models.toml` text last applied or written, so own writes and
@@ -369,6 +372,42 @@ impl Runtime {
         }
     }
 
+    /// See `Event::Agent` in the loop. Held-back text is released before `Done`, so a turn
+    /// that ends early still shows and records what it said.
+    fn redact_output(
+        &mut self,
+        id: &str,
+        output: PEvent,
+        local: &mut VecDeque<Event>,
+    ) -> Option<PEvent> {
+        let secrets = &self.secrets;
+        let clean = |text: String| {
+            let mut value = serde_json::Value::String(text);
+            transcript::redact(&mut value, secrets);
+            value.as_str().unwrap_or_default().to_string()
+        };
+        let redactor = self.redactors.entry(id.to_string()).or_default();
+        match output {
+            PEvent::TextDelta(text) => {
+                let shown = redactor.push(&text, secrets);
+                (!shown.is_empty()).then_some(PEvent::TextDelta(shown))
+            }
+            PEvent::Message(text) => Some(PEvent::Message(clean(text))),
+            PEvent::Error(text) => Some(PEvent::Error(clean(text))),
+            PEvent::Tool(text) => Some(PEvent::Tool(clean(text))),
+            PEvent::Done(outcome) => {
+                let rest = redactor.flush();
+                if rest.is_empty() {
+                    Some(PEvent::Done(outcome))
+                } else {
+                    local.push_front(Event::Agent(id.to_string(), PEvent::Done(outcome)));
+                    Some(PEvent::TextDelta(rest))
+                }
+            }
+            other => Some(other),
+        }
+    }
+
     fn cancel_all(&self) {
         for token in self.turns.values() {
             token.cancel();
@@ -414,6 +453,12 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                 }
                 continue;
             }
+            // Every participant's output, any model or CLI, is cleaned of every known key
+            // before the app shows or records it.
+            Event::Agent(id, output) => match rt.redact_output(&id, output, &mut local) {
+                Some(output) => Event::Agent(id, output),
+                None => continue,
+            },
             other => other,
         };
         if let Event::Agent(id, PEvent::Done(_)) = &event {

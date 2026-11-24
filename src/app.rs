@@ -85,7 +85,7 @@ pub enum Effect {
         model: String,
         key_ref: Option<String>,
         system: String,
-        history: Vec<(String, String)>,
+        history: std::sync::Arc<Vec<(String, String)>>,
         prompt: String,
         context_window: u64,
         max_output: u64,
@@ -158,13 +158,14 @@ struct Seat {
     held: bool,
     /// Index of the reply being streamed in `lines`.
     reply: Option<usize>,
-    /// Input and output tokens, cost, and whether roundtable estimated them (ADR 0005).
-    usage: (u64, u64, Option<f64>, bool),
+    /// Input and output tokens, cost, and whether roundtable estimated them (ADR 0005);
+    /// `None` until the turn reports usage, which a cut-off turn may never do.
+    usage: Option<(u64, u64, Option<f64>, bool)>,
     /// An OpenAI-compatible model's own history, as prompt/reply pairs (ADR 0005); it
     /// starts empty for a new destination.
     // shortcut: kept in memory for the open thread; `/resume` (ADR 0008) rebuilds it from
     // the transcript.
-    history: Vec<(String, String)>,
+    history: std::sync::Arc<Vec<(String, String)>>,
     /// The running turn's prompt, added to `history` when the reply completes.
     prompt: Option<String>,
     /// The identity the running turn was sent to. Its events belong to that destination,
@@ -553,7 +554,7 @@ impl App {
             }
             if identity_changed && let Some(seat) = self.seat_mut(&p.id) {
                 seat.session = None;
-                seat.history.clear();
+                seat.history = Default::default();
             }
         }
         let gone: Vec<String> = self
@@ -569,7 +570,7 @@ impl App {
             // Coming back later is a fresh start, whatever it points to then.
             if let Some(seat) = self.seat_mut(&id) {
                 seat.session = None;
-                seat.history.clear();
+                seat.history = Default::default();
             }
         }
         for p in &next.participants {
@@ -582,8 +583,8 @@ impl App {
                     writable: false,
                     held: false,
                     reply: None,
-                    usage: (0, 0, None, false),
-                    history: vec![],
+                    usage: None,
+                    history: Default::default(),
                     prompt: None,
                     turn_identity: None,
                 });
@@ -728,7 +729,7 @@ impl App {
         seat.writable = writable;
         seat.turn_identity = Some(p.identity.clone());
         seat.reply = Some(index);
-        seat.usage = (0, 0, None, false);
+        seat.usage = None;
         seat.prompt = Some(prompt.clone());
         let session = seat.session.clone();
         let history = seat.history.clone();
@@ -879,12 +880,18 @@ impl App {
                 cost_usd,
                 estimated,
             } => {
-                seat.usage = (input, output, cost_usd, estimated);
+                seat.usage = Some((input, output, cost_usd, estimated));
                 vec![]
             }
             PEvent::Error(text) => {
-                self.push(id, text, LineKind::Error);
-                vec![]
+                self.push(id, text.clone(), LineKind::Error);
+                // Kept in the transcript too: a failed reply should say why.
+                vec![record(
+                    party,
+                    vec![],
+                    transcript::Kind::Error,
+                    json!({ "text": text }),
+                )]
             }
             PEvent::Done(outcome) => self.finish(id, outcome),
         }
@@ -894,7 +901,7 @@ impl App {
         let party = self.turn_party(id);
         let seat = self.seat_mut(id).expect("seat");
         seat.busy = false;
-        let (tokens_in, tokens_out, cost, estimated) = seat.usage;
+        let usage = seat.usage;
         let writable = std::mem::take(&mut seat.writable);
         let prompt = seat.prompt.take();
         let text = match seat.reply.take() {
@@ -919,7 +926,8 @@ impl App {
             && let Some(prompt) = prompt
         {
             let seat = self.seat_mut(id).expect("seat");
-            seat.history.push((prompt, text.clone()));
+            // Copies only if a turn still shares it; normally the runner is done with it.
+            std::sync::Arc::make_mut(&mut seat.history).push((prompt, text.clone()));
         }
         let mut reply = record(
             party,
@@ -929,13 +937,16 @@ impl App {
             json!({
                 "text": text,
                 "status": outcome.as_str(),
-                "cost_usd": cost,
-                "usage_estimated": estimated,
+                "cost_usd": usage.and_then(|u| u.2),
+                // `null`: the turn never reported usage (unknown, not zero).
+                "usage_estimated": usage.map(|u| u.3),
                 "writable": writable,
             }),
         )
         .durable();
-        if let Effect::Record { event, .. } = &mut reply {
+        if let (Effect::Record { event, .. }, Some((tokens_in, tokens_out, ..))) =
+            (&mut reply, usage)
+        {
             event.tokens_in = Some(tokens_in);
             event.tokens_out = Some(tokens_out);
         }
@@ -1694,7 +1705,7 @@ mod tests {
                     history,
                     prompt,
                     ..
-                } => Some((id.clone(), history.clone(), prompt.clone())),
+                } => Some((id.clone(), history.to_vec(), prompt.clone())),
                 _ => None,
             })
             .collect()

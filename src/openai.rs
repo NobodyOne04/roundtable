@@ -2,6 +2,7 @@
 //! Ollama, LM Studio, OpenRouter, Groq, Gemini and anything else that speaks it. These
 //! participants only chat: no tools, no files.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -20,6 +21,9 @@ pub const DEFAULT_CONNECT_TIMEOUT_S: u64 = 10;
 pub const DEFAULT_IDLE_TIMEOUT_S: u64 = 120;
 /// Shorter keys are refused: every key must be redactable without hitting ordinary words.
 const MIN_KEY_LEN: usize = 8;
+/// Caps on what a provider may make us hold in memory (ADR 0005 review).
+const MAX_ERROR_BODY: usize = 64 * 1024;
+const MAX_SSE_EVENT: usize = 1024 * 1024;
 
 /// One request: the model's own history (oldest first, as prompt/reply pairs) and the new
 /// prompt. The runner resolves the key and fits the messages to the window.
@@ -30,7 +34,8 @@ pub struct Chat {
     /// A reference (`env:`/`keyring:`), resolved by the runner off the UI loop.
     pub key_ref: Option<String>,
     pub system: String,
-    pub history: Vec<(String, String)>,
+    /// Shared with the app's copy: starting a turn never deep-copies a long thread.
+    pub history: Arc<Vec<(String, String)>>,
     pub prompt: String,
     pub context_window: u64,
     pub max_output: u64,
@@ -82,49 +87,6 @@ pub fn fit(chat: &Chat, history: &[(String, String)]) -> Result<(Vec<Value>, usi
     Ok((messages, turns))
 }
 
-/// Hides a key in streamed text before it is shown anywhere. Text is held back by up to
-/// `key.len() - 1` bytes, so a key split across chunks is never shown in pieces.
-struct Redactor {
-    key: Option<String>,
-    pending: String,
-}
-
-impl Redactor {
-    fn new(key: Option<String>) -> Self {
-        Self {
-            key: key.filter(|k| !k.is_empty()),
-            pending: String::new(),
-        }
-    }
-
-    /// Text safe to show now.
-    fn push(&mut self, text: &str) -> String {
-        let Some(key) = &self.key else {
-            return text.to_string();
-        };
-        self.pending.push_str(text);
-        self.pending = self.pending.replace(key.as_str(), "[redacted]");
-        // Keep back what could still turn out to be the start of the key.
-        let keep = key.len().saturating_sub(1).min(self.pending.len());
-        let mut cut = self.pending.len() - keep;
-        while !self.pending.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        self.pending.drain(..cut).collect()
-    }
-
-    fn finish(&mut self) -> String {
-        std::mem::take(&mut self.pending)
-    }
-
-    fn clean(&self, text: &str) -> String {
-        match &self.key {
-            Some(key) => text.replace(key.as_str(), "[redacted]"),
-            None => text.to_string(),
-        }
-    }
-}
-
 /// What one HTTP attempt ended with.
 enum Attempt {
     Done(Outcome),
@@ -148,12 +110,20 @@ pub async fn run(id: String, chat: Chat, tx: mpsc::Sender<Event>, cancel: Cancel
     let key = match chat.key_ref.clone() {
         None => None,
         Some(reference) => {
-            let resolved = tokio::task::spawn_blocking({
-                let reference = reference.clone();
-                move || resolve_key(&reference)
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("key lookup: {e}")));
+            // A plain thread, not `spawn_blocking`: a keychain dialog nobody answers must not
+            // hold up cancel, or the runtime's shutdown at quit.
+            let (send, recv) = tokio::sync::oneshot::channel();
+            let lookup = reference.clone();
+            std::thread::spawn(move || {
+                let _ = send.send(resolve_key(&lookup));
+            });
+            let resolved = tokio::select! {
+                _ = cancel.cancelled() => {
+                    emit(PEvent::Done(Outcome::Interrupted)).await;
+                    return;
+                }
+                result = recv => result.unwrap_or_else(|_| Err("key lookup failed".into())),
+            };
             match resolved {
                 Ok(key) => {
                     // To the loop first, so the transcript redacts it before any reply.
@@ -188,12 +158,13 @@ pub async fn run(id: String, chat: Chat, tx: mpsc::Sender<Event>, cancel: Cancel
             return;
         }
     };
-    let mut redactor = Redactor::new(key.clone());
-    let mut history = chat.history.clone();
+    // Retries drop turns from the front: an index, not a second copy.
+    let mut start = 0;
     let mut trimmed = false;
     let mut retried_5xx = false;
     let outcome = loop {
-        let (messages, turns) = match fit(&chat, &history) {
+        let history = &chat.history[start..];
+        let (messages, turns) = match fit(&chat, history) {
             Ok(fitted) => fitted,
             Err(why) => {
                 emit(PEvent::Error(why)).await;
@@ -202,7 +173,7 @@ pub async fn run(id: String, chat: Chat, tx: mpsc::Sender<Event>, cancel: Cancel
         };
         let attempt = tokio::select! {
             _ = cancel.cancelled() => Attempt::Done(Outcome::Interrupted),
-            attempt = request(&client, &chat, key.as_deref(), messages, &mut redactor, &emit) => attempt,
+            attempt = request(&client, &chat, key.as_deref(), messages, &emit) => attempt,
         };
         match attempt {
             Attempt::Done(outcome) => break outcome,
@@ -210,7 +181,7 @@ pub async fn run(id: String, chat: Chat, tx: mpsc::Sender<Event>, cancel: Cancel
                 // Drop the oldest quarter (at least one) of the turns actually sent.
                 let sent_from = history.len() - turns;
                 let drop = turns.div_ceil(4);
-                history.drain(..sent_from + drop);
+                start += sent_from + drop;
                 trimmed = true;
                 tracing::info!(id, dropped = drop, "context too long, retrying");
             }
@@ -244,7 +215,6 @@ async fn request<F, Fut>(
     chat: &Chat,
     key: Option<&str>,
     messages: Vec<Value>,
-    redactor: &mut Redactor,
     emit: &F,
 ) -> Attempt
 where
@@ -290,9 +260,14 @@ where
         return Attempt::Done(Outcome::Failed);
     }
     if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
-        let message = provider_message(&text).unwrap_or_else(|| text.chars().take(300).collect());
-        let message = redactor.clean(&message);
+        let text = bounded_body(response).await;
+        let mut message = provider_message(&text).unwrap_or(text);
+        // Redact before truncating: cutting first could leave a piece of a key that no
+        // longer matches it, and would leak.
+        if let Some(key) = key {
+            message = message.replace(key, "[redacted]");
+        }
+        let message: String = message.chars().take(300).collect();
         let why = format!("{} {status}: {message}", chat.base_url);
         if status.is_server_error() {
             return Attempt::ServerError(why);
@@ -308,6 +283,8 @@ where
 
     let mut stream = response.bytes_stream();
     let mut buffer: Vec<u8> = vec![];
+    // `data:` lines of the current event; an event ends at a blank line.
+    let mut data = String::new();
     let mut usage = None;
     let mut reply_chars = String::new();
     // A clean end of the connection is not proof the model finished: only `[DONE]` or a
@@ -329,21 +306,47 @@ where
             Some(Ok(bytes)) => bytes,
         };
         buffer.extend_from_slice(&chunk);
+        if buffer.len() + data.len() > MAX_SSE_EVENT {
+            emit(PEvent::Error(format!(
+                "{}: a stream event exceeded {} KiB",
+                chat.base_url,
+                MAX_SSE_EVENT / 1024
+            )))
+            .await;
+            return Attempt::Done(Outcome::Failed);
+        }
         while let Some(end) = buffer.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = buffer.drain(..=end).collect();
             let line = String::from_utf8_lossy(&line);
-            let Some(data) = line.trim().strip_prefix("data:") else {
-                continue; // comments, `event:` lines, blank separators
-            };
-            let data = data.trim();
-            if data == "[DONE]" {
+            let line = line.trim_end_matches(['\r', '\n']);
+            if let Some(field) = line.strip_prefix("data:") {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(field.strip_prefix(' ').unwrap_or(field));
+                continue;
+            }
+            if !line.is_empty() || data.is_empty() {
+                continue; // `event:`, `id:`, comments; or a blank line with no event
+            }
+            // A blank line ends the event: parse it whole.
+            let event_data = std::mem::take(&mut data);
+            if event_data.trim() == "[DONE]" {
                 completed = true;
                 finished = true;
                 break;
             }
-            let Ok(event) = serde_json::from_str::<Value>(data) else {
-                tracing::debug!(bytes = data.len(), "unparsable SSE data, skipped");
-                continue;
+            let event = match serde_json::from_str::<Value>(&event_data) {
+                Ok(event) => event,
+                Err(_) => {
+                    // Skipping it could silently drop part of the reply.
+                    emit(PEvent::Error(format!(
+                        "{}: the provider sent an event that is not valid JSON",
+                        chat.base_url
+                    )))
+                    .await;
+                    return Attempt::Done(Outcome::Failed);
+                }
             };
             if let Some(text) = event
                 .pointer("/choices/0/delta/content")
@@ -351,10 +354,7 @@ where
                 && !text.is_empty()
             {
                 reply_chars.push_str(text);
-                let shown = redactor.push(text);
-                if !shown.is_empty() {
-                    emit(PEvent::TextDelta(shown)).await;
-                }
+                emit(PEvent::TextDelta(text.into())).await;
             }
             if event
                 .pointer("/choices/0/finish_reason")
@@ -362,22 +362,17 @@ where
             {
                 completed = true;
             }
-            if let Some(u) = event.get("usage").filter(|u| !u.is_null()) {
-                usage = Some((
-                    u["prompt_tokens"].as_u64().unwrap_or(0),
-                    u["completion_tokens"].as_u64().unwrap_or(0),
-                ));
+            if let Some(u) = event.get("usage").filter(|u| !u.is_null())
+                && let (Some(input), Some(output)) =
+                    (u["prompt_tokens"].as_u64(), u["completion_tokens"].as_u64())
+            {
+                usage = Some((input, output));
             }
             if let Some(message) = event.pointer("/error/message").and_then(Value::as_str) {
-                let message = redactor.clean(message);
                 emit(PEvent::Error(format!("{}: {message}", chat.base_url))).await;
                 return Attempt::Done(Outcome::Failed);
             }
         }
-    }
-    let rest = redactor.finish();
-    if !rest.is_empty() {
-        emit(PEvent::TextDelta(rest)).await;
     }
     if !completed {
         emit(PEvent::Error(format!(
@@ -400,6 +395,20 @@ where
     })
     .await;
     Attempt::Done(Outcome::Complete)
+}
+
+/// An error body, read up to `MAX_ERROR_BODY`: a huge error page must not fill memory.
+async fn bounded_body(response: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(Ok(chunk)) = stream.next().await {
+        let room = MAX_ERROR_BODY - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if body.len() >= MAX_ERROR_BODY {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
 }
 
 /// A provider's own error message from an OpenAI-style error body.
@@ -454,10 +463,12 @@ mod tests {
             model: "m".into(),
             key_ref: None,
             system: "sys".into(),
-            history: history
-                .into_iter()
-                .map(|(a, b)| (a.into(), b.into()))
-                .collect(),
+            history: Arc::new(
+                history
+                    .into_iter()
+                    .map(|(a, b)| (a.into(), b.into()))
+                    .collect(),
+            ),
             prompt: "now".into(),
             context_window: window,
             max_output: 10,
@@ -518,20 +529,6 @@ mod tests {
                 .contains("shorter")
         );
         assert!(resolve_key("sk-literal").is_err());
-    }
-
-    #[test]
-    fn a_key_split_across_chunks_is_never_shown() {
-        let mut r = Redactor::new(Some("SECRETKEY".into()));
-        let mut shown = String::new();
-        for chunk in ["your key is SEC", "RETK", "EY, bye"] {
-            shown.push_str(&r.push(chunk));
-            assert!(!shown.contains("SEC"), "a piece leaked: {shown}");
-        }
-        shown.push_str(&r.finish());
-        assert_eq!(shown, "your key is [redacted], bye");
-        let mut none = Redactor::new(None);
-        assert_eq!(none.push("abc"), "abc");
     }
 
     /// A fake provider: answers each connection with the next canned response and hands
@@ -630,8 +627,8 @@ mod tests {
         assert_eq!(
             events,
             [
-                // With a key, text is held back until it can't be part of the key.
-                PEvent::TextDelta("pong".into()),
+                PEvent::TextDelta("po".into()),
+                PEvent::TextDelta("ng".into()),
                 PEvent::Usage {
                     input: 12,
                     output: 2,
@@ -726,7 +723,7 @@ mod tests {
             .map(|i| (format!("q{i}"), format!("a{i}")))
             .collect::<Vec<_>>();
         let mut c = chat(vec![], 100_000);
-        c.history = history;
+        c.history = Arc::new(history);
         c.base_url = url;
         let events = run_chat(c).await;
         assert_eq!(events.last(), Some(&PEvent::Done(Outcome::Complete)));
@@ -751,7 +748,7 @@ mod tests {
             .map(|i| (format!("question {i}"), format!("answer {i}")))
             .collect::<Vec<_>>();
         let mut c = chat(vec![], 10 + 5 + 5 + 4 * 16);
-        c.history = history;
+        c.history = Arc::new(history);
         c.base_url = url;
         run_chat(c).await;
         let got = server.await.unwrap();
@@ -760,17 +757,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_echoed_key_is_redacted_in_errors() {
-        let (url, _server) = fake(vec![status(401, "bad key sk-echo-0000001")]).await;
-        // SAFETY: a variable only this test reads.
-        unsafe { std::env::set_var("ROUNDTABLE_ECHO_KEY", "sk-echo-0000001") };
+    async fn a_malformed_event_fails_instead_of_dropping_part_of_the_reply() {
+        let (url, _server) = fake(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"start"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"#,
+            "[DONE]",
+        ])])
+        .await;
         let mut c = chat(vec![], 1000);
         c.base_url = url;
-        c.key_ref = Some("env:ROUNDTABLE_ECHO_KEY".into());
         let events = run_chat(c).await;
-        let PEvent::Error(e) = &events[0] else {
-            panic!("{events:?}")
-        };
-        assert!(e.contains("[redacted]") && !e.contains("sk-echo"), "{e}");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, PEvent::Error(m) if m.contains("not valid JSON")))
+        );
+        assert_eq!(events.last(), Some(&PEvent::Done(Outcome::Failed)));
+    }
+
+    #[tokio::test]
+    async fn an_event_split_over_several_data_lines_is_one_event() {
+        let body = "data: {\"choices\":[{\"delta\":\ndata: {\"content\":\"joined\"}}]}\n\ndata: [DONE]\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{body}"
+        );
+        let (url, _server) = fake(vec![response]).await;
+        let mut c = chat(vec![], 1000);
+        c.base_url = url;
+        let events = run_chat(c).await;
+        assert_eq!(events[0], PEvent::TextDelta("joined".into()));
+        assert_eq!(events.last(), Some(&PEvent::Done(Outcome::Complete)));
     }
 }

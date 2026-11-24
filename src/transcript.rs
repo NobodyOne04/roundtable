@@ -347,6 +347,52 @@ pub fn redact(value: &mut serde_json::Value, secrets: &[(String, String)]) {
     }
 }
 
+/// Hides known keys in streamed text before it is shown or stored. Only the longest tail
+/// that could still be the start of a key is held back, so a key split across chunks never
+/// shows in pieces and ordinary text is delayed as little as possible.
+#[derive(Debug, Default)]
+pub struct StreamRedactor {
+    pending: String,
+}
+
+impl StreamRedactor {
+    /// Text safe to show now, given the known `(key, reference)` pairs.
+    pub fn push(&mut self, text: &str, secrets: &[(String, String)]) -> String {
+        self.pending.push_str(text);
+        for (key, reference) in secrets {
+            if !key.is_empty() && self.pending.contains(key.as_str()) {
+                self.pending = self
+                    .pending
+                    .replace(key.as_str(), &format!("[redacted:{reference}]"));
+            }
+        }
+        let hold = secrets
+            .iter()
+            .map(|(key, _)| held_prefix(&self.pending, key))
+            .max()
+            .unwrap_or(0);
+        let cut = self.pending.len() - hold;
+        self.pending.drain(..cut).collect()
+    }
+
+    /// Whatever is held back, at the end of a turn (finished or not).
+    pub fn flush(&mut self) -> String {
+        std::mem::take(&mut self.pending)
+    }
+}
+
+/// Length of the longest suffix of `text` that is a proper prefix of `key`.
+fn held_prefix(text: &str, key: &str) -> usize {
+    (1..key.len().min(text.len() + 1))
+        .rev()
+        .find(|&n| {
+            text.is_char_boundary(text.len() - n)
+                && key.is_char_boundary(n)
+                && text.ends_with(&key[..n])
+        })
+        .unwrap_or(0)
+}
+
 /// The `settle` that closes a crashed writer turn after `/quiet`.
 pub fn settle_event() -> NewEvent {
     NewEvent {
@@ -500,6 +546,27 @@ mod tests {
             assert_eq!(mode(&tdir.join(file)), 0o600, "{file}");
         }
         assert_eq!(mode(&root.join("roundtable.lock")), 0o600);
+    }
+
+    #[test]
+    fn streamed_keys_never_show_and_plain_text_is_not_held() {
+        let secrets = vec![("SECRETKEY".to_string(), "env:K".to_string())];
+        let mut r = StreamRedactor::default();
+        assert_eq!(
+            r.push("hello ", &secrets),
+            "hello ",
+            "nothing key-like: no delay"
+        );
+        let mut shown = String::new();
+        for chunk in ["key is SEC", "RETK", "EY ok"] {
+            shown.push_str(&r.push(chunk, &secrets));
+            assert!(!shown.contains("SEC"), "a piece leaked: {shown}");
+        }
+        shown.push_str(&r.flush());
+        assert_eq!(shown, "key is [redacted:env:K] ok");
+        let mut r = StreamRedactor::default();
+        assert_eq!(r.push("ends with SECR", &secrets), "ends with ");
+        assert_eq!(r.flush(), "SECR", "a cut-off turn still keeps its text");
     }
 
     #[test]
