@@ -70,12 +70,7 @@ async fn start() -> Result<()> {
     // checkout locks edits.
     let (checkout, lock, edit_lock) = match writer_lock::resolve(&cwd) {
         Ok(Checkout::Git { root, lock }) => {
-            let crashed = lock.crashed().map(|state| match state {
-                MarkerState::Present(text) | MarkerState::Unreadable(text) => {
-                    EditLock::Crashed(text)
-                }
-                MarkerState::Absent => unreachable!("crashed() never returns Absent"),
-            });
+            let crashed = lock.crashed().map(marker_lock);
             (root, Some(lock), crashed)
         }
         Ok(Checkout::Outside) => (cwd.clone(), None, Some(EditLock::OutsideGit)),
@@ -257,7 +252,7 @@ impl Runtime {
     }
 
     /// Writes a command's change into `models.toml`, keeping comments (ADR 0011).
-    fn edit_registry(&mut self, edit: &FileEdit) -> Result<(), String> {
+    fn edit_registry(&mut self, edit: &FileEdit) -> Result<String, String> {
         let text = fs::read_to_string(&self.models_path).map_err(|e| e.to_string())?;
         let text = match edit {
             FileEdit::Enabled { id, enabled } => registry::set_enabled(&text, id, *enabled),
@@ -266,7 +261,7 @@ impl Runtime {
         .map_err(|e| format!("{e} (fix models.toml; the change applies in this session only)"))?;
         transcript::write_atomic(&self.models_path, text.as_bytes()).map_err(|e| e.to_string())?;
         self.models_hash = Some(registry::fingerprint(&text));
-        Ok(())
+        Ok(text)
     }
 
     /// Takes the checkout lock and writes the crash marker for a writable turn of `id`,
@@ -276,6 +271,16 @@ impl Runtime {
             .lock
             .as_ref()
             .ok_or_else(|| Refusal::Failed("this checkout has no writer lock".into()))?;
+        // The folder may have become a different checkout since start (say, a nested
+        // `git init`): never lock one checkout while editing another.
+        match writer_lock::resolve(&self.cwd) {
+            Ok(Checkout::Git { lock: now, .. }) if now == *lock => {}
+            _ => {
+                return Err(Refusal::Failed(
+                    "the checkout changed since roundtable started; restart it".into(),
+                ));
+            }
+        }
         let thread = self
             .thread
             .as_ref()
@@ -313,8 +318,8 @@ impl Runtime {
                 }
                 Event::QuietDone(Ok(()))
             }
-            Ok(Cleared::Changed(text)) => {
-                local.push_back(Event::LockEdits(EditLock::Crashed(text)));
+            Ok(Cleared::Changed(state)) => {
+                local.push_back(Event::LockEdits(marker_lock(state)));
                 Event::QuietDone(Err(
                     "the marker changed since it was shown; check the new one, then /quiet".into(),
                 ))
@@ -367,10 +372,8 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             },
             other => other,
         };
-        let mut done = None;
         if let Event::Agent(id, PEvent::Done(_)) = &event {
             rt.turns.remove(id);
-            done = Some(id.clone());
         }
         // Writable turns refused in this batch (lock, marker or transcript), with why.
         let mut refused: Vec<(String, String)> = vec![];
@@ -428,12 +431,20 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     let result = rt.confirm_quiet(&marker, &mut local);
                     local.push_back(result);
                 }
-                Effect::EditRegistry(edit) => {
-                    if let Err(err) = rt.edit_registry(&edit) {
+                Effect::EditRegistry(edit) => match rt.edit_registry(&edit) {
+                    // The file may carry hand edits the app hasn't applied yet (say, a
+                    // revoked writer): apply the whole written file, not just the command.
+                    Ok(text) => {
+                        local.push_back(Event::Registry(Registry::parse(&text).map(|registry| {
+                            let checks = rt.checks(&registry);
+                            (registry, checks)
+                        })))
+                    }
+                    Err(err) => {
                         tracing::error!(%err, "editing models.toml failed");
                         local.push_back(Event::Notice(format!("models.toml: {err}")));
                     }
-                }
+                },
                 Effect::Record { mut event, durable } => {
                     let writer = (event.kind == transcript::Kind::Delivery
                         && event.payload["writable"] == true)
@@ -447,21 +458,42 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         event.payload["status"] = "refused".into();
                         event.payload["writable"] = false.into();
                         event.payload["refused"] = refusal.to_string().into();
-                        if let Refusal::Unfinished(marker) = &refusal {
-                            local.push_back(Event::LockEdits(EditLock::Crashed(marker.clone())));
+                        if let Refusal::Unfinished(state) = &refusal {
+                            local.push_back(Event::LockEdits(marker_lock(state.clone())));
                         }
                         refused.push((id.clone(), refusal.to_string()));
                     }
-                    if let Err(err) = rt.record(event, durable) {
-                        tracing::error!(%err, "transcript write failed");
-                        local.push_back(Event::Notice(format!("transcript: {err:#}")));
-                        if let Some(id) = writer
-                            && !refused.iter().any(|(r, _)| *r == id)
-                        {
-                            if let Err(err) = rt.end_writer(&id) {
+                    // The writer's own reply closes its turn: clear the marker right after it
+                    // is recorded, so a queued edit in this same batch finds the lock free.
+                    let reply_of = (event.kind == transcript::Kind::Msg
+                        && event.payload["writable"] == true
+                        && rt.writers.contains_key(&event.from.id))
+                    .then(|| event.from.id.clone());
+                    match rt.record(event, durable) {
+                        Ok(()) => {
+                            if let Some(id) = reply_of
+                                && let Err(err) = rt.end_writer(&id)
+                            {
+                                tracing::error!(%err, "ending the writer turn failed");
                                 local.push_back(Event::Notice(format!("{err:#}")));
                             }
-                            refused.push((id, "the transcript could not be written".into()));
+                        }
+                        Err(err) => {
+                            tracing::error!(%err, "transcript write failed");
+                            local.push_back(Event::Notice(format!("transcript: {err:#}")));
+                            if let Some(id) = reply_of {
+                                // The reply isn't on disk: keep the marker (fail closed),
+                                // only let the lock go.
+                                rt.writers.remove(&id);
+                            }
+                            if let Some(id) = writer
+                                && !refused.iter().any(|(r, _)| *r == id)
+                            {
+                                if let Err(err) = rt.end_writer(&id) {
+                                    local.push_back(Event::Notice(format!("{err:#}")));
+                                }
+                                refused.push((id, "the transcript could not be written".into()));
+                            }
                         }
                     }
                 }
@@ -476,13 +508,6 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     }
                 }
             }
-        }
-        // After the reply was recorded above: clear the marker, release the lock.
-        if let Some(id) = done
-            && let Err(err) = rt.end_writer(&id)
-        {
-            tracing::error!(%err, "ending the writer turn failed");
-            local.push_back(Event::Notice(format!("{err:#}")));
         }
         if quit_by.is_some() && rt.turns.is_empty() {
             return Ok(());
@@ -632,6 +657,18 @@ fn chat_lines(line: &ChatLine) -> Vec<Line<'static>> {
         ));
     }
     out
+}
+
+/// The edit lock for a crash marker. One that can't be read can't be confirmed by `/quiet`
+/// either: it locks until it can be read.
+fn marker_lock(state: MarkerState) -> EditLock {
+    match state {
+        MarkerState::Present { text, key } => EditLock::Crashed { text, key },
+        MarkerState::Unreadable(why) => {
+            EditLock::Unknown(format!("the crash marker can't be read: {why}"))
+        }
+        MarkerState::Absent => EditLock::Unknown("the crash marker vanished".into()),
+    }
 }
 
 /// `<config_dir>/roundtable`: `models.toml` (ADR 0011). Same folder as the data on macOS.

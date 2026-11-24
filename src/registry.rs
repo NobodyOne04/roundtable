@@ -252,6 +252,12 @@ fn participant(e: RawEntry) -> Result<Participant, String> {
     }
     let adapter = match e.kind {
         EntryKind::Cli => {
+            // Fields of the other kind are refused rather than silently ignored.
+            if e.base_url.is_some() || e.key.is_some() || e.context_window.is_some() {
+                return Err(at(
+                    "cli models take no `base_url`, `key` or `context_window`",
+                ));
+            }
             let cmd = e
                 .cmd
                 .as_deref()
@@ -284,6 +290,9 @@ fn participant(e: RawEntry) -> Result<Participant, String> {
             Adapter::Cli(kind)
         }
         EntryKind::Openai => {
+            if e.cmd.is_some() || e.permission_mode.is_some() {
+                return Err(at("openai models take no `cmd` or `permission_mode`"));
+            }
             let url = e
                 .base_url
                 .as_deref()
@@ -295,6 +304,9 @@ fn participant(e: RawEntry) -> Result<Participant, String> {
             if !(url.starts_with("https://") || url.starts_with("http://")) {
                 return Err(at("`base_url` must be http(s)"));
             }
+            if authority(url).contains('@') {
+                return Err(at("`base_url` must not contain user info (user@host)"));
+            }
             if remote_http && e.key.is_some() {
                 return Err(at(
                     "a key over plain http to a non-local host would travel in cleartext; use https",
@@ -303,7 +315,12 @@ fn participant(e: RawEntry) -> Result<Participant, String> {
             Adapter::OpenAi
         }
     };
-    let destination = e.cmd.as_deref().or(e.base_url.as_deref()).unwrap_or("");
+    // Each kind's own destination: a cli is its command, an openai model its URL.
+    let destination = match e.kind {
+        EntryKind::Cli => e.cmd.as_deref(),
+        EntryKind::Openai => e.base_url.as_deref(),
+    }
+    .unwrap_or("");
     let identity = fingerprint(&format!(
         "{:?}|{destination}|{}",
         e.kind,
@@ -324,8 +341,14 @@ fn participant(e: RawEntry) -> Result<Participant, String> {
     })
 }
 
+/// The `host[:port]` part of a URL, user info included if present.
+fn authority(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#']).next().unwrap_or("")
+}
+
 fn is_loopback(url: &str) -> bool {
-    let rest = url.trim_start_matches("http://");
+    let rest = authority(url);
     let host = match rest.strip_prefix('[') {
         Some(v6) => v6.split(']').next(),
         None => rest.split(['/', ':']).next(),
@@ -414,6 +437,16 @@ mod tests {
                 "never bypass",
             ),
             (
+                entry(
+                    "kind = \"openai\"\nbase_url = \"https://a\"\nmodel = \"m\"\ncmd = \"claude\"",
+                ),
+                "take no `cmd`",
+            ),
+            (
+                entry("kind = \"cli\"\ncmd = \"claude\"\nbase_url = \"https://a\""),
+                "take no `base_url`",
+            ),
+            (
                 entry("kind = \"cli\"\ncmd = \"claude\"\ncolour = \"red\""),
                 "unknown field",
             ),
@@ -460,7 +493,11 @@ mod tests {
             ));
             assert!(Registry::parse(&text).is_ok(), "{url}");
         }
-        for url in ["http://[2001:db8::1]/v1", "http://localhost.evil.com/v1"] {
+        for url in [
+            "http://[2001:db8::1]/v1",
+            "http://localhost.evil.com/v1",
+            "http://localhost:1@evil.com/v1",
+        ] {
             let text = entry(&format!(
                 "kind = \"openai\"\nbase_url = \"{url}\"\nmodel = \"m\"\nkey = \"env:K\""
             ));

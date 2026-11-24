@@ -81,8 +81,13 @@ pub struct Marker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkerState {
     Absent,
-    /// The exact file content, so `/quiet` can check it removes what the user saw.
-    Present(String),
+    /// `text` is for showing; `key` fingerprints the raw bytes, so `/quiet` removes exactly
+    /// the marker the user saw, even if two markers would display alike.
+    Present {
+        text: String,
+        key: String,
+    },
+    /// The file exists but can't be read: it can't be identified, so `/quiet` can't confirm it.
     Unreadable(String),
 }
 
@@ -92,7 +97,7 @@ pub enum Refusal {
     /// Another roundtable holds the lock: it is editing this checkout right now.
     Busy,
     /// An earlier writer never finished; edits stay locked until `/quiet`.
-    Unfinished(String),
+    Unfinished(MarkerState),
     Failed(String),
 }
 
@@ -112,7 +117,7 @@ pub enum Cleared {
     /// Removed; the marker it removed, parsed when readable.
     Removed(Option<Marker>),
     /// The marker is not the one the user confirmed: confirm this one instead.
-    Changed(String),
+    Changed(MarkerState),
     /// A writer holds the lock right now: nothing to clear.
     Busy,
 }
@@ -158,8 +163,11 @@ impl CheckoutLock {
     }
 
     pub fn marker(&self) -> MarkerState {
-        match fs::read_to_string(self.marker_path()) {
-            Ok(text) => MarkerState::Present(text),
+        match fs::read(self.marker_path()) {
+            Ok(bytes) => MarkerState::Present {
+                text: String::from_utf8_lossy(&bytes).into_owned(),
+                key: fingerprint(&bytes),
+            },
             Err(e) if e.kind() == io::ErrorKind::NotFound => MarkerState::Absent,
             Err(e) => MarkerState::Unreadable(e.to_string()),
         }
@@ -185,8 +193,7 @@ impl CheckoutLock {
         let lock = self.try_lock().map_err(fail)?.ok_or(Refusal::Busy)?;
         match self.marker() {
             MarkerState::Absent => {}
-            MarkerState::Present(text) => return Err(Refusal::Unfinished(text)),
-            MarkerState::Unreadable(why) => return Err(Refusal::Unfinished(why)),
+            state => return Err(Refusal::Unfinished(state)),
         }
         let bytes =
             serde_json::to_vec_pretty(marker).map_err(|e| Refusal::Failed(e.to_string()))?;
@@ -200,18 +207,16 @@ impl CheckoutLock {
 
     /// `/quiet`: removes the marker the user saw, only if it is still exactly that one and
     /// no writer holds the lock, and syncs before reporting success.
+    /// `confirmed` is the `key` of the marker the user saw.
     pub fn clear(&self, confirmed: &str) -> io::Result<Cleared> {
         let Some(_held) = self.try_lock()? else {
             return Ok(Cleared::Busy);
         };
         let text = match self.marker() {
             MarkerState::Absent => return Ok(Cleared::Removed(None)),
-            MarkerState::Present(text) => text,
-            MarkerState::Unreadable(why) => why,
+            MarkerState::Present { text, key } if key == confirmed => text,
+            other => return Ok(Cleared::Changed(other)),
         };
-        if text != confirmed {
-            return Ok(Cleared::Changed(text));
-        }
         match fs::remove_file(self.marker_path()) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -237,6 +242,15 @@ impl WriterGuard {
         fs::remove_file(self.lock.marker_path())?;
         sync_dir(&self.lock.dir)
     }
+}
+
+fn fingerprint(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -287,16 +301,15 @@ mod tests {
     fn a_dropped_guard_is_a_crash_until_quiet() {
         let (_d, lock) = lock();
         drop(lock.begin(&marker_for("T1", Path::new("/data"))).unwrap());
-        let Some(MarkerState::Present(shown)) = lock.crashed() else {
+        let Some(MarkerState::Present { key: shown, .. }) = lock.crashed() else {
             panic!("crash not seen")
         };
         assert!(matches!(
             lock.begin(&marker_for("T2", Path::new("/data"))),
             Err(Refusal::Unfinished(_))
         ));
-        assert_eq!(
-            lock.clear("something else").unwrap(),
-            Cleared::Changed(shown.clone()),
+        assert!(
+            matches!(lock.clear("something else").unwrap(), Cleared::Changed(MarkerState::Present { key, .. }) if key == shown),
             "only the marker the user saw is removed"
         );
         assert!(
@@ -307,16 +320,30 @@ mod tests {
     }
 
     #[test]
+    fn markers_that_display_alike_are_still_different() {
+        let (_d, lock) = lock();
+        fs::create_dir_all(&lock.dir).unwrap();
+        // Two invalid-UTF-8 markers both display as the replacement character.
+        fs::write(lock.marker_path(), [0xff]).unwrap();
+        let MarkerState::Present { key: first, .. } = lock.marker() else {
+            panic!()
+        };
+        fs::write(lock.marker_path(), [0xfe]).unwrap();
+        assert!(matches!(lock.clear(&first).unwrap(), Cleared::Changed(_)));
+        assert!(matches!(lock.marker(), MarkerState::Present { .. }));
+    }
+
+    #[test]
     fn quiet_does_nothing_while_a_writer_runs() {
         let (_d, lock) = lock();
         let _guard = lock.begin(&marker_for("T1", Path::new("/data"))).unwrap();
         let shown = match lock.marker() {
-            MarkerState::Present(t) => t,
+            MarkerState::Present { key, .. } => key,
             other => panic!("{other:?}"),
         };
         let other = CheckoutLock::at(lock.dir.clone());
         assert_eq!(other.clear(&shown).unwrap(), Cleared::Busy);
-        assert!(matches!(lock.marker(), MarkerState::Present(_)));
+        assert!(matches!(lock.marker(), MarkerState::Present { .. }));
     }
 
     fn git(dir: &Path, args: &[&str]) {
@@ -374,7 +401,7 @@ mod tests {
             panic!()
         };
         assert!(
-            matches!(lock.crashed(), Some(MarkerState::Present(_))),
+            matches!(lock.crashed(), Some(MarkerState::Present { .. })),
             "the crash is still found after the rename"
         );
     }

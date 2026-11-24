@@ -151,8 +151,13 @@ impl Store {
         })
     }
 
-    fn thread_dir(&self, id: &str) -> PathBuf {
-        self.root.join("threads").join(id)
+    /// Only a ULID names a thread: an id from a marker or a file is never trusted as a path
+    /// (no `..`, no absolute path).
+    fn thread_dir(&self, id: &str) -> Result<PathBuf> {
+        if id.len() != 26 || ulid::Ulid::from_string(id).is_err() {
+            return Err(Error::NoThread(format!("{id:?} is not a thread id")));
+        }
+        Ok(self.root.join("threads").join(id))
     }
 
     pub fn create_thread(&mut self, title: &str, checkout: &Path) -> Result<Thread> {
@@ -161,7 +166,7 @@ impl Store {
             .generate()
             .map_err(|err| io::Error::other(err.to_string()))?
             .to_string();
-        let dir = self.thread_dir(&id);
+        let dir = self.thread_dir(&id)?;
         fs::DirBuilder::new().mode(0o700).create(&dir)?;
         let meta = Meta {
             id: id.clone(),
@@ -176,7 +181,7 @@ impl Store {
     }
 
     pub fn open_thread(&self, id: &str) -> Result<Thread> {
-        let dir = self.thread_dir(id);
+        let dir = self.thread_dir(id)?;
         let meta = match fs::read(dir.join("meta.json")) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -191,7 +196,7 @@ impl Store {
     /// confirmed the checkout is quiet (ADR 0012). Never recreates a missing transcript: that
     /// would "settle" a history that no longer exists.
     pub fn settle_writer(&self, id: &str) -> Result<()> {
-        if !self.thread_dir(id).join("events.jsonl").is_file() {
+        if !self.thread_dir(id)?.join("events.jsonl").is_file() {
             return Err(Error::NoThread(format!("{id} (events.jsonl is missing)")));
         }
         let mut thread = self.open_thread(id)?;
@@ -235,6 +240,9 @@ pub struct Thread {
     events_path: PathBuf,
     file: File,
     next_seq: u64,
+    /// Set when a failed append could not be undone: the file may end in a partial line, so
+    /// nothing more is appended until the thread is reopened (which repairs the tail).
+    broken: bool,
 }
 
 impl Thread {
@@ -259,6 +267,7 @@ impl Thread {
             events_path,
             file,
             next_seq: lines,
+            broken: false,
         })
     }
 
@@ -278,20 +287,33 @@ impl Thread {
             tokens_in: event.tokens_in,
             tokens_out: event.tokens_out,
         };
+        if self.broken {
+            return Err(Error::Io(io::Error::other(
+                "an earlier write to this transcript failed; reopen the thread",
+            )));
+        }
         let mut bytes = serde_json::to_vec(&line)?;
         bytes.push(b'\n');
+        let before = self.file.metadata()?.len();
         // One write call per line, so a crash tears at most this line.
-        self.file.write_all(&bytes)?;
+        if let Err(err) = self.file.write_all(&bytes) {
+            // Undo a partial line, or the next append would bury it mid-file as corruption.
+            if self.file.set_len(before).is_err() {
+                self.broken = true;
+            }
+            return Err(err.into());
+        }
+        // The line is in the file now: its number is used even if the sync below fails.
+        self.next_seq += 1;
         if durable {
             self.file.sync_data()?;
         }
-        self.next_seq += 1;
         Ok(line.seq)
     }
 
     /// The native CLI session of each participant in this thread (`sessions.json`), so the
     /// next turn resumes it.
-    // shortcut: keyed by participant id; ADR 0010 keys by (id, identity) once 0011 adds identities.
+    /// Keys are `id/identity` (ADR 0010), built by the caller.
     pub fn save_sessions(
         &self,
         sessions: &std::collections::BTreeMap<String, String>,
@@ -364,12 +386,17 @@ pub fn private_dir(path: &Path) -> io::Result<()> {
 
 /// Writes a small file so readers see either the old or the new content, never a mix.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    // A temp name of its own, created fresh: two writers (e.g. two roundtables sharing
+    // `models.toml`) never write into each other's temp file.
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let tmp = path.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
     let mut file = OpenOptions::new()
         .mode(0o600)
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .open(&tmp)?;
     file.write_all(bytes)?;
     file.sync_data()?;
@@ -521,10 +548,23 @@ mod tests {
         assert_eq!(listed, [second.meta.clone(), first.meta.clone()]);
         assert_eq!(listed[0].checkout, dir.path().canonicalize().unwrap());
         let thread_dir = dir.path().join("threads").join(&first.meta.id);
-        assert!(
-            !thread_dir.join("meta.tmp").exists(),
-            "atomic write leaves no temp file"
-        );
+        let leftovers = fs::read_dir(&thread_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0, "atomic write leaves no temp file");
         assert!(matches!(store.open_thread("nope"), Err(Error::NoThread(_))));
+        for bad in ["../../etc", "/tmp/x", "01M86T4JZ0H3R8743FJPQ596S/"] {
+            assert!(
+                matches!(store.settle_writer(bad), Err(Error::NoThread(_))),
+                "{bad}"
+            );
+        }
     }
 }
