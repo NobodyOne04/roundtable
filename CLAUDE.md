@@ -9,7 +9,8 @@ Rust TUI console that runs Claude Code, Codex and OpenAI-compatible models in on
 - Snapshot tests use insta: after an intended UI change, `INSTA_UPDATE=always cargo test`, then review the `.snap` diff.
 
 ## Layout
-- `src/main.rs`: entry point, terminal setup/teardown, drawing; tests at the bottom, snapshots in `src/snapshots/`.
+- `src/main.rs`: entry point, terminal setup/teardown, the event loop and its source tasks (terminal input, tick), drawing; snapshots in `src/snapshots/`.
+- `src/app.rs`: `App` state, `Event`, `Effect` and `App::update`, the only place state changes (ADR 0002).
 - `.github/workflows/check.yml`: CI (fmt, clippy, nextest), required check `check` on `main`.
 - `rust-toolchain.toml`: pinned toolchain.
 - `docs/adr/`: architecture decisions (`NNNN-title.adr`), index and statuses in `docs/adr/README.md`.
@@ -17,6 +18,7 @@ Rust TUI console that runs Claude Code, Codex and OpenAI-compatible models in on
 - `AGENTS.md`: Codex context (its role here, state, pending tasks); keep "Pending for Codex" current.
 
 ## Conventions
+- State changes only in `App::update` (no I/O there); tasks send `Event`s, the loop runs `Effect`s. Never share `App` behind a lock.
 - ADR first: no code for a feature until its ADR is Accepted by the owner. Statuses live in `docs/adr/README.md`.
 - Proposals may be reviewed together in one docs PR; implementation is one ADR per PR, in the order noted in `docs/adr/README.md`, commit subjects carry `[ADR-NNNN]`.
 - When an ADR changes status, update the table in `docs/adr/README.md` in the same PR.

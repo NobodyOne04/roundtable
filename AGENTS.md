@@ -31,6 +31,9 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
   guarantee the rejected 0003 and 0006 gave, which the other accepted ADRs rely on.
 - Review the merged ADR 0001 PR #6, skipped for the same reason:
   `codex review --commit 94ba5e6 -c sandbox_mode="read-only"`.
+- Review the ADR 0002 PR #7 (`feature/adr-0002-event-loop`), skipped for the same reason:
+  `codex review --base origin/main -c sandbox_mode="read-only"` on that branch, or
+  `--commit <its squash sha>` once merged.
 
 ## Notes
 - ADR 0004: the owner chose a git worktree per agent for the single-writer limit
