@@ -1,0 +1,57 @@
+# 0008. Slash commands and @mentions
+
+- Status: Proposed
+- Date: 2026-11-24
+
+The console should feel like Claude Code: type to chat, `/` for commands, `@` to address.
+This ADR fixes the command set and input grammar for v1.
+
+## Technical details
+- Input grammar: a line starting with `/` is a command; otherwise a message. Leading
+  `@<id>` tokens set recipients (`@codex`, `@claude @llama`, `@all`); none means the
+  default model. `\/` escapes a literal slash.
+- Completion: `/` and `@` open a popup filtered as you type (commands; enabled model ids).
+- Commands are a static table (`name, args, help, handler`), so `/help` is generated.
+
+| Group | Command | Does |
+|---|---|---|
+| Session | `/help` | list commands |
+| | `/clear` | start a new thread |
+| | `/resume` | pick a past thread |
+| | `/fork` | branch the current thread here |
+| | `/exit` | quit (also `Ctrl-D` on empty input) |
+| Info | `/usage [today\|thread\|all]` | tokens and cost per model, from the log |
+| | `/context [id]` | what each participant has seen and how full its window is |
+| | `/status` | each participant: up, unavailable (why), CLI version |
+| Models | `/models` | list: id, kind, role, enabled |
+| | `/model add` | guided form, writes `models.toml` and keychain |
+| | `/model enable <id>` / `/model disable <id>` | see [0006](0006-model-registry-config.adr) |
+| | `/model use <id>` | set default recipient |
+| | `/model test <id>` | one-token ping, shows latency or the error |
+| Talk | `/talk on\|off` | global switch for model-to-model talk |
+| | `/talk allow <a>-><b>` / `/talk deny <a>-><b>` | edit the matrix |
+| | `/talk show` | print the matrix |
+| | `/budget <tokens>` / `/turns <n>` | per-message limits ([0007](0007-model-to-model-communication.adr)) |
+| Context | `/compact [id]` | summarize history for a chat-only model to fit its window |
+| | `/handoff <id>` | send a summary of the thread to `<id>` and make it default |
+
+- Keys: `Enter` send, `Shift-Enter` newline, `Esc` cancel running replies, `Ctrl-C`
+  twice quits, `Tab` cycles panes, `PgUp/PgDn` scroll, `Enter` on a handoff expands it.
+- `/context` for CLI agents shows what roundtable sent and the usage they reported; it
+  cannot show what the agent kept after its own compaction, and says so.
+- Commands that change config write it at once and log a `status` event.
+
+- Release order:
+  - v1: `/help` `/clear` `/resume` `/exit`, `/models` `/model enable|disable|use|test`,
+    `/usage` `/status` `/context`;
+  - with `ask` ([0007](0007-model-to-model-communication.adr)): the whole Talk group,
+    `/talk off` included;
+  - later: `/model add` (guided setup; until then, edit `models.toml`), `/compact`,
+    `/handoff`, `/fork` (see [0003](0003-sqlite-event-log.adr)).
+
+Consequences: a familiar surface, discoverable through `/help` and completion. Cost: a
+large surface overall, delivered in the order above.
+
+## Technologies and alternatives
+- Involved: tui-textarea, ratatui popup widgets
+- Alternatives: a separate command mode (vim-style `:`): less familiar to Claude Code users; flags at launch only: no live control

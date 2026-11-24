@@ -1,0 +1,99 @@
+# 0003. Append-only SQLite event log is the transcript
+
+- Status: Proposed
+- Date: 2026-11-24
+
+The point of roundtable is seeing who said what to whom. This ADR makes one append-only
+log the single source of truth; the chat view, `/usage`, `/context`, resume and replay are
+all reads of it.
+
+## Technical details
+- File: `<data_dir>/roundtable/roundtable.db` (`dirs::data_dir()`: `~/Library/Application
+  Support` on macOS, `~/.local/share` on Linux). WAL mode.
+- Crate: `rusqlite` with the `bundled` feature (SQLite compiled in). Writes happen on a
+  dedicated blocking task fed by the event loop, so the UI never waits on disk. Every
+  write is acknowledged back to the loop as an `Event` after commit:
+  - a handoff is committed (intent row) *before* its prompt is dispatched;
+  - a reply is shown as complete only after its final row is acknowledged;
+  - on start, turns left without a final row are marked `interrupted` and never resent
+    automatically.
+- Single instance: the app takes an exclusive `flock` on `roundtable.db.lock` before
+  opening the DB. A second instance exits with "roundtable is already running (pid N)".
+  So recovery at start can never touch a live turn of another instance. (Several
+  instances at once would need per-turn ownership; not in v1.)
+- Unclean writer exit, fail closed: the lock dies with the TUI, but a CLI killed with
+  it (SIGKILL) may survive, with its hooks, MCP servers and tools. roundtable does not
+  try to find and kill such processes (pids and pgids get reused; tools outlive their
+  CLI). Instead, a writable turn's row is committed as `pending` *before* the CLI is
+  spawned. At start, a writable turn still `pending` stays `pending` (shown as
+  "unconfirmed") until the user confirms in a dialog that the checkout is quiet ("a
+  previous writer may still be running in <checkout>"); only then is it marked
+  `interrupted`. No writable turn starts in that checkout meanwhile, so restarting
+  without confirming never clears the interlock.
+  Read-only turns are unaffected.
+- Schema (v1, migrations by `PRAGMA user_version`):
+  ```sql
+  threads(
+    id TEXT PRIMARY KEY, title TEXT, created_at INTEGER,
+    checkout TEXT NOT NULL,                        -- canonical path it was created in
+    parent_id TEXT, fork_event_id INTEGER          -- set for forks
+  )
+  sessions(                                        -- native CLI session per thread
+    thread_id TEXT, participant_id TEXT, identity TEXT, native_id TEXT,
+    PRIMARY KEY (thread_id, participant_id, identity)  -- new identity = fresh session
+  )
+  events(
+    id INTEGER PRIMARY KEY,
+    thread_id TEXT NOT NULL REFERENCES threads(id),
+    turn_id INTEGER,                -- the user message this event descends from
+    parent_id INTEGER,              -- the event that caused it (ask -> handoff -> reply)
+    ts INTEGER NOT NULL,            -- unix ms
+    from_id TEXT NOT NULL,          -- 'user', participant id, or 'router'
+    to_ids TEXT,                    -- JSON array of resolved recipients at send time
+    kind TEXT NOT NULL,             -- msg|tool_call|tool_result|handoff|approval|error|status
+    payload TEXT NOT NULL,          -- JSON
+    tokens_in INTEGER, tokens_out INTEGER, cost_usd REAL,
+    status TEXT                     -- pending|complete|blocked|interrupted|failed
+  )
+  ```
+- `/resume` of a thread whose `checkout` differs from the current directory is
+  transcript-only: it can be read, nothing can be sent, so no agent ever reads one
+  checkout's files for another checkout's thread. The thread list shows each thread's
+  checkout.
+- Identities: every participant reference is a pair `{id, identity}`, where `identity`
+  is a hash of `kind` + `base_url`/`cmd` + `model`. `from` and every entry of `to_ids`
+  use it, so `@all` rows record each endpoint they reached and each reply records the
+  endpoint that wrote it. History is bound to destinations, not to reusable ids
+  ([0005](0005-openai-compatible-models.adr)). (Schema above: `from_id`/`to_ids` hold
+  these pairs as JSON.)
+- `to_ids` stores the resolved recipients (`@all` resolved against the enabled set at
+  that moment). Delivery is tracked per recipient in
+  `deliveries(event_id, participant_id, identity, status, ts)` with status
+  `queued|sent|blocked|cancelled`. History builders
+  ([0005](0005-openai-compatible-models.adr)) use only events with a `sent` delivery to
+  that model, so a queued, blocked or cancelled prompt never reaches it later.
+  `turn_id` and `parent_id` link concurrent handoffs to the call that started them.
+- Append-only: rows are never deleted, and only in-flight `msg` and `handoff` rows are
+  updated, once, when they settle: final `status` (and for `msg`, final payload).
+- Handoffs store the exact prompt sent to the target, not a summary. A blocked handoff
+  keeps its row with `status = blocked` and the rule that fired in `payload.reason`.
+- Fork (`/fork`, not in v1): new thread with `parent_id` and `fork_event_id`; events are
+  not copied. Each CLI session is forked natively (Claude `--resume <id> --fork-session`,
+  Codex `exec fork`) and stored in `sessions` for the child thread, so parent and child
+  never share a native session. Shipped only once both adapters can branch at the
+  chosen point.
+- Raw agent output is kept in `payload.raw` only behind a debug flag, to bound DB size.
+- Secrets: config holds only key references ([0006](0006-model-registry-config.adr)), but
+  a resolved key can still come back inside a tool result or a provider error. So the
+  writer replaces every resolved key value with `[redacted:<key-ref>]` in `payload` and
+  `payload.raw` before any row is written. Secrets the user pastes into the chat are not
+  detected; prompts and replies are stored as-is because that is the product, and the
+  README says so plainly.
+
+Consequences: replay, search and accounting come for free; a crash loses at most the
+in-flight reply, and never silently: it is marked `interrupted`. Cost: the DB grows without bound; a later `/prune` or retention setting
+may be needed.
+
+## Technologies and alternatives
+- Involved: rusqlite (bundled), serde_json, dirs
+- Alternatives: JSONL files per thread: trivial to write, but `/usage` across threads and indexed lookups get slow; sqlx: async, but compile-time checks need a DB at build and add weight

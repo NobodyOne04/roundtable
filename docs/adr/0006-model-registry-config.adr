@@ -1,0 +1,63 @@
+# 0006. Model registry in TOML, enable/disable, keys in the OS keychain
+
+- Status: Proposed
+- Date: 2026-11-24
+
+Participants come and go: new free models, a model the owner wants silenced. This ADR
+defines where they are declared, how they are switched off, and where secrets live.
+
+## Technical details
+- File: `<config_dir>/roundtable/models.toml` (`dirs::config_dir()`). Created with
+  `claude` and `codex` entries on first run if missing.
+  ```toml
+  default = "claude"
+  writer = "claude"   # the only participant allowed to edit files (ADR 0004)
+
+  [[model]]
+  id = "claude"     # unique, used in @mentions; [a-z0-9-]+
+  kind = "cli"      # cli | openai
+  cmd = "claude"
+  enabled = true
+  role = "lead"     # free text shown in the UI and sent as a system hint; grants nothing
+
+  [[model]]
+  id = "llama"
+  kind = "openai"
+  base_url = "http://localhost:11434/v1"
+  model = "llama3.3"
+  context_window = 128000
+  key = "keyring:ollama"   # optional; omitted for local runners
+  enabled = true
+  ```
+- Secrets: `key` is always a reference (`keyring:<name>` or `env:<VAR>`), never the key
+  itself. A literal key in the file is refused at load with an error naming the line.
+  Keychain through the `keyring` crate (macOS Keychain, Linux Secret Service).
+- Disable (`/model disable <id>` or `enabled = false`):
+  - routing, `@all` and handoffs skip it; `@<id>` replies "`<id>` is disabled";
+  - a reply in progress is cancelled and stored as `interrupted`
+    ([0002](0002-single-owner-event-loop.adr));
+  - its history stays in the log, so enabling it again continues the thread;
+  - the change is written back to `models.toml`, so it survives restarts;
+  - the UI greys it out in the context pane.
+- The default model cannot be disabled while it is default; `/model use` another first.
+- Writes keep comments and order (`toml_edit`), so hand edits survive.
+- Validation at load:
+  - unique ids, matching `[a-z0-9-]+`, not a reserved name (`all`, `user`, `router`,
+    `you`);
+  - known `kind`, required fields per kind;
+  - `base_url` is `https://`, or `http://` only for loopback hosts (`localhost`,
+    `127.0.0.1`, `::1`), so a key is never sent in cleartext over a network. An entry
+    with a `key` and a non-loopback `http://` URL is refused;
+  - invalid entries are skipped with a visible warning, never a crash;
+  - `writer` must name one enabled `kind = "cli"` entry after filtering; otherwise there
+    is no writer and every agent runs read-only (fail closed), with a warning;
+  - `default` is checked *after* filtering: if it is missing or disabled, there is no
+    default and a message without `@mention` asks the user to pick a recipient.
+
+Consequences: adding or silencing a model needs no rebuild; secrets stay out of the file
+and the log. Cost: two places to look (file and keychain) when a key is wrong; `/status`
+names which one failed.
+
+## Technologies and alternatives
+- Involved: toml, toml_edit, serde, keyring, dirs
+- Alternatives: keys in the TOML file: simplest, but ends up in dotfiles repos and backups; `.env` file: same risk; YAML/JSON config: TOML is the Rust norm and keeps comments with toml_edit

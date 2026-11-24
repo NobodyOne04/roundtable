@@ -1,0 +1,97 @@
+# 0007. Model-to-model talk: an `ask` tool, a policy matrix and hard limits
+
+- Status: Proposed
+- Date: 2026-11-24
+
+The headline feature: participants ask each other things, and the user sees every
+exchange. This ADR decides how a request is made, who may make it, and what stops loops.
+
+## Technical details
+- Mechanism: one MCP tool, `ask(to: string, prompt: string) -> string`.
+  - With stdio MCP each CLI launches the server itself as its own subprocess, so that
+    subprocess is not the running TUI. The bridge: the binary has a subcommand
+    `roundtable mcp`, which the CLIs launch. It serves the `ask` tool over stdio and
+    forwards each call to the running TUI over a private Unix socket
+    (`$XDG_RUNTIME_DIR` or the data dir, mode `0600`).
+  - Each launch gets its identity through env vars set by the adapter
+    (`ROUNDTABLE_SOCKET`, `ROUNDTABLE_CALLER`, `ROUNDTABLE_TURN`, and a one-time token
+    the TUI checks), so the router knows who is asking and in which turn.
+  - Permission: registering a server does not let a headless turn call it. Claude gets
+    a narrow grant `--allowedTools mcp__roundtable__ask` (that tool only); Codex gets the
+    equivalent per-server approval setting of the pinned version. Who may actually ask
+    whom is still decided by the router, not by this grant. The round trip test runs
+    with a fresh config, without any approvals the user saved before.
+  - Registration: Claude Code gets a generated JSON file through `--mcp-config <file>`;
+    Codex gets `-c mcp_servers.roundtable.command="roundtable"`,
+    `-c 'mcp_servers.roundtable.args=["mcp"]'` and an env allowlist
+    (`mcp_servers.roundtable.env_vars` with all four `ROUNDTABLE_*` names), because Codex
+    does not forward arbitrary parent env vars to stdio MCP servers. Both are verified by
+    an `ask` round trip test on first launch and on resume, per pinned CLI version; the
+    test fails if the bridge starts without its socket or token.
+  - Chat-only models ([0005](0005-openai-compatible-models.adr)) do not get the tool in
+    v1: they answer, they do not start conversations.
+- Every `ask` goes to the router, which checks, in order:
+  1. global switch (`/talk on|off`),
+  2. target exists and is enabled ([0006](0006-model-registry-config.adr)),
+  3. policy matrix allows `from → to`,
+  4. target is idle: one active turn per native session. A busy target (including the
+     caller itself) returns `busy` at once. This also rules out deadlocks such as
+     `A → B → C → A`, with no cycle detection needed,
+  5. turn limit (`max_turns`, default 6 model-to-model turns per user message),
+  6. token budget (`budget_tokens`, default 50 000 per user message).
+  The target session is *claimed* in the event loop at check time, synchronously, before
+  the handoff row is even submitted for commit; a second caller sees it busy. The claim
+  is released when the reply ends or the handoff is blocked.
+  Turns and budget are *reserved* atomically against the originating user message
+  (`turn_id` in [0003](0003-sqlite-event-log.adr)) before dispatch, so parallel calls
+  cannot both pass on the same remaining amount. The token budget is an estimate where an
+  adapter cannot cap output; actual usage is booked when it arrives.
+  Pass: the prompt is delivered (read-only, see [0004](0004-cli-agent-adapters.adr)) and
+  the reply returned as the tool result. Fail: the tool returns `blocked: <reason>` or
+  `busy` so the caller can carry on.
+- Every decision is logged ([0003](0003-sqlite-event-log.adr)) as a `handoff` row with
+  the exact prompt; one that is stopped gets `status = blocked` and the rule that fired.
+- The session claim is not only for `ask`: every dispatch path takes it, including a
+  user's direct `@codex` and each recipient of `@all`. A user message to a busy session
+  is queued (shown as "queued for codex") and sent when the claim is released, after
+  rechecking that the recipient is still enabled with the same identity; disabling a
+  model cancels its queued deliveries. An `ask`
+  to a busy session returns `busy` at once, because a waiting agent would deadlock.
+- Recheck on commit: the handoff row is committed before dispatch, and the user may hit
+  `/talk off` or disable the target in between. So when the commit acknowledgement
+  arrives, checks 1-3 run again, plus: the caller's turn is still active (not
+  cancelled by `Esc`) and the target claim is still held. If any fails, the handoff is
+  closed as `blocked`, the claim released, and nothing is sent.
+- Commit failure (e.g. disk full): the writer reports a failure `Event` instead of an
+  acknowledgement; the router releases the claim and reservations, completes the
+  waiting `ask` with `error: not logged`, and never dispatches an unlogged prompt.
+- Policy in `models.toml`:
+  ```toml
+  [talk]
+  enabled = true
+  max_turns = 6
+  budget_tokens = 50000
+  allow = { claude = ["codex", "llama"], codex = [] }   # absent = may not ask anyone
+  ```
+  Default deny: a pair not listed may not talk.
+- UI: a handoff renders inline under the caller's message as `claude → codex`,
+  collapsed, expanding to the full prompt and reply. Blocked ones render dimmed with the
+  reason.
+- At a limit the call returns `blocked: turn limit` (or `budget`) and the status line
+  shows it; nothing pauses. The user continues by sending another message, which gets a
+  fresh allowance. An interactive "continue +N" prompt may come later.
+- Ships together: `ask`, `/talk on|off`, inline handoffs and cancellation of a whole
+  chain (`Esc` cancels the caller and every pending `ask` below it) land in one PR.
+  No talk without the off switch. That PR includes minimal `/talk on|off` handling;
+  [0008](0008-slash-commands-and-mentions.adr), implemented after it, moves it into the
+  command table with the rest of the Talk group.
+- `@all` from the user is not model-to-model talk: each enabled model answers the user
+  independently, in parallel.
+
+Consequences: conversations are explicit, auditable and bounded. Cost: depends on each CLI
+accepting an extra MCP server at launch; if one does not, that agent can be asked but
+cannot ask.
+
+## Technologies and alternatives
+- Involved: rmcp (official Rust MCP SDK), stdio transport, Unix domain socket (tokio::net::UnixStream)
+- Alternatives: parse "@codex" out of agent replies: no structure, easy to trigger by accident; shared message bus file (agmsg style): works without MCP but agents must be told to poll it; A2A protocol: built for remote services, heavy for local CLIs
