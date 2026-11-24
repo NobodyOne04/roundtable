@@ -125,8 +125,13 @@ Claude, the read-only sandbox for Codex, both without your own MCP servers, hook
 plugins.
 
 **After a crash.** If roundtable dies while the writer works, the CLI may keep editing.
-On the next start in that checkout, edits stay locked (every turn read-only) until you
-check nothing is running and type `/quiet`.
+On the next start anywhere in that checkout (the git repo, from any folder in it), edits
+stay locked, so every turn is read-only, until you check nothing is running and type
+`/quiet`. A thread whose history can't be read also keeps edits locked, since nobody can tell
+whether its writer finished; repair it or move its folder out of `threads/`.
+
+**Waiting writers.** If you change `writer` while the old one is still editing, a message
+to the new writer waits until the old one is done instead of editing alongside it.
 
 ## Requirements
 

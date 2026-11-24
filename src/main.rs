@@ -1,7 +1,7 @@
 //! roundtable: one terminal chat for Claude Code, Codex and other models.
 //! Stack: ADR 0001. Event loop: ADR 0002. Transcript files: ADR 0010. CLI agents: ADR 0004.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -68,6 +68,7 @@ async fn start() -> Result<()> {
         thread: None,
         sessions: BTreeMap::new(),
         turns: HashMap::new(),
+        checkout: checkout_root(&cwd),
         cwd,
         outside_repo,
         models_path,
@@ -91,14 +92,11 @@ async fn start() -> Result<()> {
             Err(why) => app.note(format!("{id}: unavailable: {why}"), true),
         }
     }
-    let unfinished = runtime
+    let locks = runtime
         .store
-        .unfinished_writers(&runtime.cwd)
+        .writer_locks(&runtime.checkout)
         .context("checking for unfinished writer turns")?;
-    app.lock_edits(
-        unfinished.into_iter().map(|m| m.id).collect(),
-        &runtime.cwd.display().to_string(),
-    );
+    app.lock_edits(locks, &runtime.checkout.display().to_string());
     if let Some(why) = load_error {
         app.note(
             format!("{} not applied: {why}", runtime.models_path.display()),
@@ -136,6 +134,9 @@ struct Runtime {
     sessions: BTreeMap<String, String>,
     turns: HashMap<String, CancellationToken>,
     cwd: PathBuf,
+    /// The git worktree root around `cwd` (or `cwd` outside git): threads and the writer
+    /// lock belong to the checkout, wherever in it roundtable was started.
+    checkout: PathBuf,
     outside_repo: bool,
     models_path: PathBuf,
     /// Fingerprint of the `models.toml` text last applied or written, so own writes and
@@ -163,7 +164,7 @@ impl Runtime {
                     .chars()
                     .take(60)
                     .collect();
-                let thread = self.store.create_thread(&title, &self.cwd)?;
+                let thread = self.store.create_thread(&title, &self.checkout)?;
                 tracing::info!(thread = %thread.meta.id, "thread opened");
                 self.thread.insert(thread)
             }
@@ -244,10 +245,26 @@ impl Runtime {
         Ok(())
     }
 
-    /// Closes each thread's unfinished writer turn with a `settle`, after the user confirmed
-    /// the checkout is quiet (ADR 0010).
-    fn confirm_quiet(&mut self, threads: &[String]) -> Result<()> {
+    /// Closes each thread's unfinished writer turn with a durable `settle`, after the user
+    /// confirmed the checkout is quiet (ADR 0010). Reports which succeeded, so the app only
+    /// unlocks what is really on disk.
+    fn confirm_quiet(&mut self, threads: &[String]) -> Event {
+        let mut settled = vec![];
+        let mut failed = vec![];
         for id in threads {
+            match self.settle_writer(id) {
+                Ok(()) => settled.push(id.clone()),
+                Err(err) => {
+                    tracing::error!(thread = %id, %err, "settling the writer turn failed");
+                    failed.push((id.clone(), format!("{err:#}")));
+                }
+            }
+        }
+        Event::QuietDone { settled, failed }
+    }
+
+    fn settle_writer(&mut self, id: &str) -> Result<()> {
+        {
             let mut thread = self.store.open_thread(id)?;
             let settle = NewEvent {
                 turn: None,
@@ -283,9 +300,15 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
     let _watcher = watch_registry(&rt.models_path, tx.clone())?;
 
     let mut quit_by: Option<tokio::time::Instant> = None;
+    // Events the loop raises itself: handled before the channel, never dropped (a full
+    // channel must not lose, say, the `Done` of a turn that never started).
+    let mut local: VecDeque<Event> = VecDeque::new();
     loop {
         let deadline = quit_by.unwrap_or_else(tokio::time::Instant::now);
-        let event = tokio::select! {
+        let event = if let Some(event) = local.pop_front() {
+            event
+        } else {
+            tokio::select! {
             event = rx.recv() => match event {
                 Some(event) => event,
                 None => return Ok(()),
@@ -293,6 +316,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             _ = tokio::time::sleep_until(deadline), if quit_by.is_some() => {
                 tracing::warn!(left = rt.turns.len(), "turns did not stop in time");
                 return Ok(());
+            }
             }
         };
         let event = match event {
@@ -333,8 +357,8 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         // Fail closed (ADR 0010): an editable turn never starts unrecorded,
                         // or a crash during it would leave no lock behind.
                         let why = "not started: the writer marker could not be written".into();
-                        let _ = tx.try_send(Event::Agent(id.clone(), PEvent::Error(why)));
-                        let _ = tx.try_send(Event::Agent(id, PEvent::Done(Outcome::Failed)));
+                        local.push_back(Event::Agent(id.clone(), PEvent::Error(why)));
+                        local.push_back(Event::Agent(id, PEvent::Done(Outcome::Failed)));
                         continue;
                     }
                     let token = CancellationToken::new();
@@ -357,16 +381,11 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     }
                 }
                 Effect::CancelTurns => rt.cancel_all(),
-                Effect::ConfirmQuiet(threads) => {
-                    if let Err(err) = rt.confirm_quiet(&threads) {
-                        tracing::error!(%err, "closing unfinished writer turns failed");
-                        let _ = tx.try_send(Event::Notice(format!("transcript: {err:#}")));
-                    }
-                }
+                Effect::ConfirmQuiet(threads) => local.push_back(rt.confirm_quiet(&threads)),
                 Effect::EditRegistry(edit) => {
                     if let Err(err) = rt.edit_registry(&edit) {
                         tracing::error!(%err, "editing models.toml failed");
-                        let _ = tx.try_send(Event::Notice(format!("models.toml: {err}")));
+                        local.push_back(Event::Notice(format!("models.toml: {err}")));
                     }
                 }
                 Effect::Record { event, durable } => {
@@ -377,7 +396,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     if let Err(err) = rt.record(event, durable) {
                         unmarked.extend(marker);
                         tracing::error!(%err, "transcript write failed");
-                        let _ = tx.try_send(Event::Notice(format!("transcript: {err:#}")));
+                        local.push_back(Event::Notice(format!("transcript: {err:#}")));
                     }
                 }
                 Effect::SaveSession {
@@ -387,7 +406,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                 } => {
                     if let Err(err) = rt.save_session(&id, &identity, session) {
                         tracing::error!(%err, "saving the session failed");
-                        let _ = tx.try_send(Event::Notice(format!("sessions: {err:#}")));
+                        local.push_back(Event::Notice(format!("sessions: {err:#}")));
                     }
                 }
             }
@@ -540,6 +559,19 @@ fn chat_lines(line: &ChatLine) -> Vec<Line<'static>> {
         ));
     }
     out
+}
+
+/// The git worktree root around `cwd`, or `cwd` itself outside git (or without git).
+fn checkout_root(cwd: &Path) -> PathBuf {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|root| PathBuf::from(root.trim()))
+        .unwrap_or_else(|| cwd.to_path_buf())
 }
 
 /// `<config_dir>/roundtable`: `models.toml` (ADR 0011). Same folder as the data on macOS.
