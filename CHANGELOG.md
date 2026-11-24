@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Three-pane layout (ADR 0009): threads (`Ctrl-B`, `Enter` resumes), context per participant (`Ctrl-K`), status line, collapsible tool and handoff lines, Markdown replies, `Tab` focus
 - `/resume` (ADR 0008, 0010): reopen a past thread with its chat, CLI sessions and model histories (only for participants still pointing where they did); threads from another checkout open read-only
 - Commands (ADR 0008): `/help`, `/clear`, `/exit`, `/status`, `/usage`, `/context`, `/model test`, `/talk show|allow|deny`, `/budget`, `/turns`; `Tab` completion for commands and `@` ids, `Alt-Enter` new lines, `PgUp`/`PgDn` scrolling, `\/` escape; per-thread `usage.json`
 - Models ask each other (ADR 0007): Claude's `ask` tool through `roundtable mcp`, talk policy, per-message turn and token limits, `/talk on|off`, inline handoffs, `Esc` cancels the chain

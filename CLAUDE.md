@@ -9,7 +9,8 @@ Rust TUI console that runs Claude Code, Codex and OpenAI-compatible models in on
 - Snapshot tests use insta: after an intended UI change, `INSTA_UPDATE=always cargo test`, then review the `.snap` diff.
 
 ## Layout
-- `src/main.rs`: entry point, terminal setup/teardown, the event loop and its source tasks (terminal input, tick), drawing; snapshots in `src/snapshots/`.
+- `src/ui.rs`: drawing: panes, chat lines, Markdown, status line (ADR 0009). The binary only; logic stays in the library.
+- `src/main.rs`: entry point, terminal setup/teardown, the event loop and its source tasks (terminal input, tick, the `ask` socket); screen snapshots in `src/snapshots/`.
 - `src/lib.rs`: the library (all logic); `main.rs` only runs the terminal.
 - `src/agent.rs`: Claude Code and Codex adapters (command + JSON parser) and the process runner: process group, cancel, reap (ADR 0004).
 - `tests/fixtures/`: recorded CLI output per version (`claude-<ver>-turnN.jsonl`, `codex-<ver>-turnN.jsonl`), stripped of paths and account fields.

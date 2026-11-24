@@ -53,6 +53,8 @@ pub enum Event {
     Notice(String),
     /// An answer to a command the loop had to work out (`/usage`, `/model test`).
     Report(String),
+    /// The threads pane's list (newest first), from the loop.
+    Threads(Vec<ThreadRow>),
     /// `/resume`: the loop opened a past thread; the app rebuilds it.
     Resumed {
         title: String,
@@ -219,6 +221,47 @@ pub struct ChatLine {
     pub who: String,
     pub text: String,
     pub kind: LineKind,
+    /// Tool and handoff lines show one line until expanded (`Enter`, ADR 0009).
+    pub expanded: bool,
+}
+
+impl ChatLine {
+    /// Lines that collapse to one row and expand on `Enter`.
+    pub fn expandable(&self) -> bool {
+        matches!(self.kind, LineKind::Tool | LineKind::Handoff)
+    }
+}
+
+/// Which part of the screen keys go to (`Tab` cycles, ADR 0009).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Input,
+    /// Up/Down pick a tool or handoff line, `Enter` expands it.
+    Chat,
+    /// Up/Down pick a thread, `Enter` resumes it.
+    Threads,
+}
+
+/// One row of the threads pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadRow {
+    pub id: String,
+    pub title: String,
+    pub day: String,
+    /// It belongs to another checkout.
+    pub elsewhere: bool,
+}
+
+/// One row of the context pane (ADR 0009).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextRow {
+    pub id: String,
+    pub role: Option<String>,
+    /// idle, streaming, unavailable, disabled.
+    pub state: &'static str,
+    /// Estimated fill of the window, 0..1, only when knowable (chat-only models).
+    pub fill: Option<f64>,
+    pub tokens: (u64, u64),
 }
 
 /// Runtime state of one participant; survives registry reloads for as long as it runs.
@@ -275,6 +318,14 @@ pub struct App {
     pub scroll: u16,
     /// A resumed thread from another checkout: nothing may be sent into it (ADR 0010).
     read_only: Option<std::path::PathBuf>,
+    pub focus: Focus,
+    /// The tool/handoff line picked in the chat (an index into `lines`).
+    pub selected_line: Option<usize>,
+    /// The threads pane: past threads, newest first, and the picked one.
+    pub threads: Vec<ThreadRow>,
+    pub thread_pick: usize,
+    pub show_threads: bool,
+    pub show_context: bool,
     /// Quitting: running turns are being cancelled and nothing new may start.
     quitting: bool,
     /// The global talk switch (`[talk] enabled`, `/talk on|off`).
@@ -312,6 +363,12 @@ impl App {
             edit_lock: None,
             scroll: 0,
             read_only: None,
+            focus: Focus::Input,
+            selected_line: None,
+            threads: vec![],
+            thread_pick: 0,
+            show_threads: true,
+            show_context: true,
             quitting: false,
             talk_on: true,
             origins: BTreeMap::new(),
@@ -430,6 +487,11 @@ impl App {
                 sessions,
                 elsewhere,
             } => self.resume(title, &events, &sessions, elsewhere),
+            Event::Threads(rows) => {
+                self.thread_pick = self.thread_pick.min(rows.len().saturating_sub(1));
+                self.threads = rows;
+                vec![]
+            }
             Event::Report(text) => {
                 self.push("roundtable", text, LineKind::Info);
                 vec![]
@@ -452,6 +514,26 @@ impl App {
             return vec![];
         }
         self.quit_armed = false;
+        match key.code {
+            KeyCode::Char('b') if ctrl => {
+                self.show_threads = !self.show_threads;
+                return vec![];
+            }
+            KeyCode::Char('k') if ctrl => {
+                self.show_context = !self.show_context;
+                return vec![];
+            }
+            KeyCode::Tab if self.completions().is_empty() => {
+                self.cycle_focus();
+                return vec![];
+            }
+            KeyCode::Up | KeyCode::Down | KeyCode::Enter if self.focus != Focus::Input => {
+                return self.pane_key(key.code);
+            }
+            // Typing always goes to the input, wherever the focus was.
+            KeyCode::Char(_) if !ctrl => self.focus = Focus::Input,
+            _ => {}
+        }
         match key.code {
             KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit(),
             KeyCode::Char(c) if !ctrl => {
@@ -503,6 +585,129 @@ impl App {
             seat.held = false;
         }
         vec![Effect::Quit]
+    }
+
+    /// `Tab` with nothing to complete: input → chat → threads (when shown) → input.
+    fn cycle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Input => Focus::Chat,
+            Focus::Chat if self.show_threads && !self.threads.is_empty() => Focus::Threads,
+            _ => Focus::Input,
+        };
+        if self.focus == Focus::Chat && self.selected_line.is_none() {
+            self.selected_line = self.lines.iter().rposition(ChatLine::expandable);
+        }
+    }
+
+    /// Up/Down/Enter while the chat or the threads pane has the focus.
+    fn pane_key(&mut self, code: KeyCode) -> Vec<Effect> {
+        match (self.focus, code) {
+            (Focus::Chat, KeyCode::Up | KeyCode::Down) => {
+                let expandable: Vec<usize> = (0..self.lines.len())
+                    .filter(|&i| self.lines[i].expandable())
+                    .collect();
+                let at = self
+                    .selected_line
+                    .and_then(|i| expandable.iter().position(|&j| j == i));
+                self.selected_line = match (code, at) {
+                    (KeyCode::Up, Some(0)) | (_, None) => expandable.last().copied(),
+                    (KeyCode::Up, Some(n)) => Some(expandable[n - 1]),
+                    (_, Some(n)) => expandable.get(n + 1).or(expandable.last()).copied(),
+                };
+                vec![]
+            }
+            (Focus::Chat, _) => {
+                if let Some(line) = self.selected_line.and_then(|i| self.lines.get_mut(i)) {
+                    line.expanded = !line.expanded;
+                }
+                vec![]
+            }
+            (Focus::Threads, KeyCode::Up) => {
+                self.thread_pick = self.thread_pick.saturating_sub(1);
+                vec![]
+            }
+            (Focus::Threads, KeyCode::Down) => {
+                self.thread_pick = (self.thread_pick + 1).min(self.threads.len().saturating_sub(1));
+                vec![]
+            }
+            (Focus::Threads, _) => match self.threads.get(self.thread_pick) {
+                Some(row) if !self.seats.iter().any(|s| s.busy) => {
+                    self.focus = Focus::Input;
+                    vec![Effect::Resume(Some(row.id.clone()))]
+                }
+                Some(_) => {
+                    self.push(
+                        "roundtable",
+                        "replies are still running; Esc cancels them first".into(),
+                        LineKind::Error,
+                    );
+                    vec![]
+                }
+                None => vec![],
+            },
+            (Focus::Input, _) => vec![],
+        }
+    }
+
+    /// The context pane (ADR 0009): CLI agents show no fill, because their own compaction
+    /// hides what they keep; chat-only models show the estimated fill of their window.
+    pub fn context_rows(&self) -> Vec<ContextRow> {
+        self.registry
+            .participants
+            .iter()
+            .filter_map(|p| {
+                let seat = self.seats.iter().find(|s| s.id == p.id)?;
+                let state = if !p.enabled {
+                    "disabled"
+                } else if self.availability(p).is_err() {
+                    "unavailable"
+                } else if seat.busy {
+                    "streaming"
+                } else {
+                    "idle"
+                };
+                let fill = (p.adapter == Adapter::OpenAi).then(|| {
+                    let window = p
+                        .context_window
+                        .unwrap_or(crate::openai::DEFAULT_CONTEXT_WINDOW);
+                    let used: u64 = seat
+                        .history
+                        .iter()
+                        .map(|(q, a)| crate::openai::estimate(q) + crate::openai::estimate(a))
+                        .sum();
+                    (used as f64 / window.max(1) as f64).min(1.0)
+                });
+                Some(ContextRow {
+                    id: p.id.clone(),
+                    role: p.role.clone(),
+                    state,
+                    fill,
+                    tokens: seat.thread_tokens,
+                })
+            })
+            .collect()
+    }
+
+    /// The status line: the talk switch and the latest message's model-to-model use
+    /// against its limits.
+    pub fn status_line(&self) -> String {
+        let talk = &self.registry.talk;
+        let (turns, tokens) = self
+            .origins
+            .get(&(self.next_origin - 1))
+            .copied()
+            .unwrap_or_default();
+        let edits = if self.locked() {
+            " · edits locked"
+        } else {
+            ""
+        };
+        format!(
+            "talk:{} · {turns}/{} turns · {tokens}/{} tokens{edits}",
+            if self.talk_on { "on" } else { "off" },
+            talk.max_turns,
+            talk.budget_tokens
+        )
     }
 
     /// What `Tab` would complete the input to (ADR 0008), for the popup.
@@ -1259,6 +1464,7 @@ impl App {
             who: p.id.clone(),
             text: String::new(),
             kind: LineKind::Streaming,
+            expanded: false,
         });
         let seat = self.seat_mut(&p.id).expect("seat");
         seat.busy = true;
@@ -1393,6 +1599,7 @@ impl App {
                     who: id.into(),
                     text: summary.clone(),
                     kind: LineKind::Tool,
+                    expanded: false,
                 };
                 match reply {
                     Some(i) => {
@@ -1713,6 +1920,7 @@ impl App {
             who: who.into(),
             text,
             kind,
+            expanded: false,
         });
     }
 }
@@ -2954,6 +3162,82 @@ mod tests {
         assert_eq!(
             type_line(&mut app, "/resume 1"),
             [Effect::Resume(Some("1".into()))]
+        );
+    }
+
+    #[test]
+    fn tab_cycles_focus_and_enter_expands_the_picked_line() {
+        let mut app = App::default();
+        type_line(&mut app, "@claude go");
+        ask(&mut app, 1, "claude", "codex");
+        app.update(agent("codex", PEvent::Tool("ls".into())));
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Chat);
+        let picked = app.selected_line.unwrap();
+        assert_eq!(
+            app.lines[picked].kind,
+            LineKind::Tool,
+            "the newest expandable line"
+        );
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.lines[picked].expanded, "Enter expands, doesn't send");
+        app.update(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            app.lines[app.selected_line.unwrap()].kind,
+            LineKind::Handoff
+        );
+        // Typing goes back to the input.
+        app.update(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!((app.focus, app.input.as_str()), (Focus::Input, "x"));
+    }
+
+    #[test]
+    fn the_threads_pane_resumes_the_picked_thread() {
+        let mut app = App::default();
+        let row = |id: &str| ThreadRow {
+            id: id.into(),
+            title: id.into(),
+            day: "2026-11-25".into(),
+            elsewhere: false,
+        };
+        app.update(Event::Threads(vec![row("01A"), row("01B")]));
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Threads);
+        app.update(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE)),
+            [Effect::Resume(Some("01B".into()))]
+        );
+        assert_eq!(app.focus, Focus::Input);
+        app.update(key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert!(!app.show_threads, "Ctrl-B hides the pane");
+    }
+
+    #[test]
+    fn status_line_and_context_rows() {
+        let mut app = App::default();
+        reload(&mut app, &format!("{DEFAULT_FILE}{LLAMA}"));
+        type_line(&mut app, "@claude go");
+        ask(&mut app, 1, "claude", "codex");
+        assert_eq!(app.status_line(), "talk:on · 1/6 turns · 0/50000 tokens");
+        let rows = app.context_rows();
+        let claude = rows.iter().find(|r| r.id == "claude").unwrap();
+        assert_eq!(
+            (claude.state, claude.fill),
+            ("streaming", None),
+            "CLI: fill unknown"
+        );
+        let llama = rows.iter().find(|r| r.id == "llama").unwrap();
+        assert_eq!((llama.state, llama.fill), ("idle", Some(0.0)));
+        type_line(&mut app, "/model disable llama");
+        assert_eq!(
+            app.context_rows()
+                .iter()
+                .find(|r| r.id == "llama")
+                .unwrap()
+                .state,
+            "disabled"
         );
     }
 }
