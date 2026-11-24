@@ -563,7 +563,9 @@ fn checkout_root(cwd: &Path) -> Result<PathBuf, String> {
         return Ok(PathBuf::from(root.strip_suffix('\n').unwrap_or(&root)));
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("not a git repository") {
+    // Exactly git's "no repository here or above"; a broken worktree says
+    // "not a git repository: <gitdir>" and must not count as outside a repo.
+    if stderr.contains("not a git repository (or any of the parent directories)") {
         Ok(cwd.to_path_buf())
     } else {
         Err(stderr.trim().to_string())
@@ -637,6 +639,12 @@ mod tests {
         assert_eq!(root, repo.canonicalize().unwrap(), "trailing space kept");
         let outside = tempfile::tempdir().unwrap();
         assert_eq!(checkout_root(outside.path()).unwrap(), outside.path());
+
+        // A linked worktree whose gitdir is gone: broken, not "outside a repo".
+        let broken = dir.path().join("broken");
+        fs::create_dir(&broken).unwrap();
+        fs::write(broken.join(".git"), "gitdir: /nonexistent/worktrees/x\n").unwrap();
+        assert!(checkout_root(&broken).is_err());
     }
 
     #[test]

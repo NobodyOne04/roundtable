@@ -128,7 +128,8 @@ plugins.
 On the next start anywhere in that checkout (the git repo, from any folder in it), edits
 stay locked, so every turn is read-only, until you check nothing is running and type
 `/quiet`. A thread whose history can't be read also keeps edits locked, since nobody can tell
-whether its writer finished; repair it or move its folder out of `threads/`.
+whether its writer finished; repair it or move its folder out of `threads/`. So does a
+checkout whose git root can't be determined (git missing, or a broken worktree).
 
 **Waiting writers.** If you change `writer` while the old one is still editing, a message
 to the new writer waits until the old one is done instead of editing alongside it.
