@@ -1,0 +1,11 @@
+---
+source: src/main.rs
+expression: terminal.backend()
+---
+"┌ roundtable ──────────────────────────┐"
+"│       Nothing at the table yet.      │"
+"│                                      │"
+"│          q or Ctrl-C to quit         │"
+"│                                      │"
+"│                                      │"
+"└──────────────────────────────────────┘"
