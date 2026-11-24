@@ -462,6 +462,59 @@ impl Runtime {
         Ok(bridge)
     }
 
+    /// `/resume`: without a choice, the recent threads, numbered; with one (a number from that
+    /// list or an id prefix), the thread opened for further messages.
+    fn resume(&mut self, which: Option<&str>) -> Event {
+        let threads = match self.store.list_threads() {
+            Ok(threads) => threads,
+            Err(err) => return Event::Notice(format!("listing threads: {err}")),
+        };
+        let Some(which) = which else {
+            if threads.is_empty() {
+                return Event::Report("no past threads".into());
+            }
+            let mut rows =
+                vec!["past threads (newest first); /resume <n> reopens one:".to_string()];
+            for (n, meta) in threads.iter().take(20).enumerate() {
+                let here = if meta.checkout == self.checkout {
+                    ""
+                } else {
+                    "  [elsewhere]"
+                };
+                rows.push(format!(
+                    "{:>2}. {}  {}{here}",
+                    n + 1,
+                    transcript::day_of(meta.created_at),
+                    meta.title
+                ));
+            }
+            return Event::Report(rows.join("\n"));
+        };
+        let Some(meta) = pick_thread(&threads, which) else {
+            return Event::Notice(format!("no thread {which}; /resume lists them"));
+        };
+        let thread = match self.store.open_thread(&meta.id) {
+            Ok(thread) => thread,
+            Err(err) => return Event::Notice(format!("opening the thread: {err}")),
+        };
+        let events = match thread.events() {
+            Ok(events) => events,
+            Err(err) => return Event::Notice(format!("reading the thread: {err}")),
+        };
+        let sessions = thread.load_sessions();
+        let elsewhere = (meta.checkout != self.checkout).then(|| meta.checkout.clone());
+        self.sessions = sessions.clone();
+        // Further messages go into this thread (ADR 0010); nothing is sent into one from
+        // another checkout, so it is not opened for writing then.
+        self.thread = elsewhere.is_none().then_some(thread);
+        Event::Resumed {
+            title: meta.title.clone(),
+            events,
+            sessions,
+            elsewhere,
+        }
+    }
+
     /// `/usage <scope>`: tokens and cost per model from `usage.json` (ADR 0010).
     fn usage_report(&self, scope: &str) -> String {
         let totals = match scope {
@@ -698,6 +751,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     rt.sessions.clear();
                 }
                 Effect::Usage(scope) => local.push_back(Event::Report(rt.usage_report(&scope))),
+                Effect::Resume(which) => local.push_back(rt.resume(which.as_deref())),
                 Effect::TestModel { id, target } => {
                     let tx = tx.clone();
                     let (cwd, outside) = (rt.cwd.clone(), rt.outside_repo);
@@ -1065,6 +1119,22 @@ fn chat_lines(line: &ChatLine) -> Vec<Line<'static>> {
     out
 }
 
+/// `/resume <which>`: a number from the list (newest first) or the start of an id.
+fn pick_thread<'a>(threads: &'a [transcript::Meta], which: &str) -> Option<&'a transcript::Meta> {
+    match which.parse::<usize>() {
+        Ok(n) if n >= 1 => threads.get(n - 1),
+        _ => {
+            let which = which.to_uppercase();
+            let mut found = threads.iter().filter(|m| m.id.starts_with(&which));
+            // Ambiguous prefixes pick nothing rather than a guess.
+            match (found.next(), found.next()) {
+                (Some(one), None) => Some(one),
+                _ => None,
+            }
+        }
+    }
+}
+
 /// The edit lock for a crash marker. One that can't be read can't be confirmed by `/quiet`
 /// either: it locks until it can be read.
 fn marker_lock(state: MarkerState) -> EditLock {
@@ -1157,6 +1227,31 @@ mod tests {
         let path = ask_socket_path(&long).unwrap();
         assert!(path.as_os_str().len() < 100, "{}", path.display());
         assert!(path.ends_with("ask.sock"));
+    }
+
+    #[test]
+    fn resume_picks_by_number_or_unambiguous_id_prefix() {
+        let meta = |id: &str| roundtable::transcript::Meta {
+            id: id.into(),
+            title: id.into(),
+            created_at: 0,
+            checkout: "/".into(),
+            parent_id: None,
+            fork_event: None,
+        };
+        let threads = [meta("01AAA"), meta("01AAB"), meta("01BCC")];
+        assert_eq!(pick_thread(&threads, "2").unwrap().id, "01AAB");
+        assert!(pick_thread(&threads, "9").is_none());
+        assert!(pick_thread(&threads, "0").is_none());
+        assert_eq!(
+            pick_thread(&threads, "01b").unwrap().id,
+            "01BCC",
+            "case-insensitive"
+        );
+        assert!(
+            pick_thread(&threads, "01AA").is_none(),
+            "ambiguous picks nothing"
+        );
     }
 
     #[test]

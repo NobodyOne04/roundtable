@@ -53,6 +53,15 @@ pub enum Event {
     Notice(String),
     /// An answer to a command the loop had to work out (`/usage`, `/model test`).
     Report(String),
+    /// `/resume`: the loop opened a past thread; the app rebuilds it.
+    Resumed {
+        title: String,
+        events: Vec<transcript::EventLine>,
+        /// `sessions.json`: `id/identity -> native session`.
+        sessions: BTreeMap<String, String>,
+        /// The thread belongs to another checkout: read it, send nothing (ADR 0010).
+        elsewhere: Option<std::path::PathBuf>,
+    },
     /// After `/quiet`: the marker was removed durably, or why not.
     QuietDone(Result<(), String>),
     /// The loop found a reason to lock edits mid-run (another instance crashed, or the
@@ -182,6 +191,8 @@ pub enum Effect {
     ConfirmQuiet(String),
     /// `/clear`: the next message opens a new thread.
     NewThread,
+    /// `/resume`: list past threads (`None`) or reopen one (a number from the list, or an id).
+    Resume(Option<String>),
     /// `/usage <scope>`: the loop sums the transcript's usage files.
     Usage(String),
     /// `/model test <id>`: ping it and report latency or the error.
@@ -262,6 +273,8 @@ pub struct App {
     edit_lock: Option<EditLock>,
     /// Lines scrolled up from the newest (PgUp/PgDn); 0 follows the conversation.
     pub scroll: u16,
+    /// A resumed thread from another checkout: nothing may be sent into it (ADR 0010).
+    read_only: Option<std::path::PathBuf>,
     /// Quitting: running turns are being cancelled and nothing new may start.
     quitting: bool,
     /// The global talk switch (`[talk] enabled`, `/talk on|off`).
@@ -298,6 +311,7 @@ impl App {
             seats: vec![],
             edit_lock: None,
             scroll: 0,
+            read_only: None,
             quitting: false,
             talk_on: true,
             origins: BTreeMap::new(),
@@ -410,6 +424,12 @@ impl App {
                 self.lock_edits(lock);
                 vec![]
             }
+            Event::Resumed {
+                title,
+                events,
+                sessions,
+                elsewhere,
+            } => self.resume(title, &events, &sessions, elsewhere),
             Event::Report(text) => {
                 self.push("roundtable", text, LineKind::Info);
                 vec![]
@@ -503,6 +523,15 @@ impl App {
         if input.trim_start().starts_with('/') {
             return self.command(input.trim());
         }
+        if let Some(checkout) = &self.read_only {
+            let why = format!(
+                "this thread belongs to {}: read-only here (/clear starts a new one)",
+                checkout.display()
+            );
+            self.input = input;
+            self.push("roundtable", why, LineKind::Error);
+            return vec![];
+        }
         // `\/` sends a literal slash instead of running a command.
         if let Some(rest) = input.trim_start().strip_prefix("\\/") {
             input = format!("/{rest}");
@@ -558,6 +587,18 @@ impl App {
             }
             ["/exit"] => self.quit(),
             ["/clear"] => self.clear(),
+            ["/resume"] => vec![Effect::Resume(None)],
+            ["/resume", which] => {
+                if self.seats.iter().any(|s| s.busy) {
+                    self.push(
+                        "roundtable",
+                        "replies are still running; Esc cancels them first".into(),
+                        LineKind::Error,
+                    );
+                    return vec![];
+                }
+                vec![Effect::Resume(Some(which.to_string()))]
+            }
             ["/status"] => {
                 let text = self.status_text();
                 self.push("roundtable", text, LineKind::Info);
@@ -659,6 +700,114 @@ impl App {
         }
     }
 
+    /// Rebuilds a past thread from its transcript (`/resume`): the chat, each CLI's native
+    /// session and each OpenAI model's history, but only for participants still pointing
+    /// where they did then (identity), so nothing reaches a new destination.
+    fn resume(
+        &mut self,
+        title: String,
+        events: &[transcript::EventLine],
+        sessions: &BTreeMap<String, String>,
+        elsewhere: Option<std::path::PathBuf>,
+    ) -> Vec<Effect> {
+        self.lines.clear();
+        self.origins.clear();
+        self.scroll = 0;
+        for seat in &mut self.seats {
+            seat.session = None;
+            seat.history = Default::default();
+            seat.queue.clear();
+            seat.thread_tokens = (0, 0);
+        }
+        let current: BTreeMap<String, String> = self
+            .registry
+            .participants
+            .iter()
+            .map(|p| (p.id.clone(), p.identity.clone()))
+            .collect();
+        let same = |party: &transcript::Party| {
+            party.identity.is_some() && current.get(&party.id) == party.identity.as_ref()
+        };
+        // Per participant: the prompt of its latest delivery, waiting for its reply.
+        let mut pending: BTreeMap<String, String> = BTreeMap::new();
+        for e in events {
+            let text = |key: &str| e.payload[key].as_str().unwrap_or_default().to_string();
+            match e.kind {
+                transcript::Kind::Msg if e.from.id == "user" => {
+                    let to: Vec<&str> = e.to.iter().map(|p| p.id.as_str()).collect();
+                    self.push(
+                        &format!("you → {}", to.join(", ")),
+                        text("text"),
+                        LineKind::User,
+                    );
+                }
+                transcript::Kind::Msg => {
+                    let outcome = match e.payload["status"].as_str() {
+                        Some("interrupted") => Outcome::Interrupted,
+                        Some("failed") => Outcome::Failed,
+                        _ => Outcome::Complete,
+                    };
+                    let who = match e.to.first().map(|p| p.id.as_str()) {
+                        Some(to) if to != "user" => format!("{} → {to}", e.from.id),
+                        _ => e.from.id.clone(),
+                    };
+                    self.push(&who, text("text"), LineKind::Reply(outcome));
+                    if let Some(seat) = self.seat_mut(&e.from.id) {
+                        seat.thread_tokens.0 += e.tokens_in.unwrap_or(0);
+                        seat.thread_tokens.1 += e.tokens_out.unwrap_or(0);
+                    }
+                    let prompt = pending.remove(&e.from.id);
+                    if outcome == Outcome::Complete
+                        && same(&e.from)
+                        && let Some(prompt) = prompt
+                        && let Some(seat) = self.seat_mut(&e.from.id)
+                    {
+                        std::sync::Arc::make_mut(&mut seat.history).push((prompt, text("text")));
+                    }
+                }
+                transcript::Kind::Delivery if e.payload["status"] == "sent" => {
+                    for to in e.to.iter().filter(|p| same(p)) {
+                        pending.insert(to.id.clone(), text("text"));
+                    }
+                }
+                transcript::Kind::Handoff => {
+                    let to = e.to.first().map(|p| p.id.as_str()).unwrap_or("?");
+                    let who = format!("{} → {to}", e.from.id);
+                    if e.payload["status"] == "blocked" {
+                        self.push(&who, format!("blocked: {}", text("reason")), LineKind::Info);
+                    } else {
+                        self.push(&who, text("prompt"), LineKind::Handoff);
+                    }
+                }
+                transcript::Kind::ToolCall => {
+                    self.push(&e.from.id, text("summary"), LineKind::Tool);
+                }
+                transcript::Kind::Error => {
+                    self.push(&e.from.id, text("text"), LineKind::Error);
+                }
+                _ => {}
+            }
+        }
+        // Native CLI sessions, keyed by the identity they were made with.
+        for p in self.registry.participants.clone() {
+            if let Some(session) = sessions.get(&format!("{}/{}", p.id, p.identity))
+                && let Some(seat) = self.seat_mut(&p.id)
+            {
+                seat.session = Some(session.clone());
+            }
+        }
+        let note = match &elsewhere {
+            Some(checkout) => format!(
+                "resumed \"{title}\" read-only: it belongs to {}; /clear starts a new thread here",
+                checkout.display()
+            ),
+            None => format!("resumed \"{title}\""),
+        };
+        self.read_only = elsewhere;
+        self.push("roundtable", note, LineKind::Info);
+        vec![]
+    }
+
     fn usage_error(&mut self, usage: &str) -> Vec<Effect> {
         self.push("roundtable", format!("usage: {usage}"), LineKind::Error);
         vec![]
@@ -682,6 +831,7 @@ impl App {
         self.lines.clear();
         self.origins.clear();
         self.scroll = 0;
+        self.read_only = None;
         for seat in &mut self.seats {
             seat.session = None;
             seat.history = Default::default();
@@ -2652,5 +2802,158 @@ mod tests {
         assert!(effects.iter().any(
             |e| matches!(e, Effect::StartTurn { prompt, .. } if prompt == "/usage is a word here")
         ));
+    }
+
+    /// A past thread's transcript, as the loop would hand it over.
+    fn past_thread(app: &App) -> Vec<transcript::EventLine> {
+        let id = |p: &str| app.registry.get(p).unwrap().identity.clone();
+        let party = |p: &str, identity: Option<String>| transcript::Party {
+            id: p.into(),
+            identity,
+        };
+        let line = |seq, from, to: Vec<transcript::Party>, kind, payload: serde_json::Value| {
+            transcript::EventLine {
+                seq,
+                ts: 0,
+                turn: None,
+                parent: None,
+                from,
+                to,
+                kind,
+                payload,
+                tokens_in: Some(3),
+                tokens_out: Some(1),
+            }
+        };
+        use transcript::Kind::*;
+        vec![
+            line(
+                0,
+                party("user", None),
+                vec![party("llama", Some(id("llama")))],
+                Msg,
+                json!({"text": "q1"}),
+            ),
+            line(
+                1,
+                party("router", None),
+                vec![party("llama", Some(id("llama")))],
+                Delivery,
+                json!({"status": "sent", "text": "q1"}),
+            ),
+            line(
+                2,
+                party("llama", Some(id("llama"))),
+                vec![party("user", None)],
+                Msg,
+                json!({"text": "a1", "status": "complete"}),
+            ),
+            line(
+                3,
+                party("claude", Some(id("claude"))),
+                vec![party("codex", Some(id("codex")))],
+                Handoff,
+                json!({"status": "sent", "prompt": "check this"}),
+            ),
+            line(
+                4,
+                party("router", None),
+                vec![party("llama", Some("old-endpoint".into()))],
+                Delivery,
+                json!({"status": "sent", "text": "q0"}),
+            ),
+            line(
+                5,
+                party("llama", Some("old-endpoint".into())),
+                vec![party("user", None)],
+                Msg,
+                json!({"text": "from the old endpoint", "status": "complete"}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn resume_rebuilds_the_chat_sessions_and_model_history() {
+        let mut app = App::default();
+        reload(&mut app, &format!("{DEFAULT_FILE}{LLAMA}"));
+        let events = past_thread(&app);
+        let claude = app.registry.get("claude").unwrap().identity.clone();
+        let sessions = BTreeMap::from([
+            (format!("claude/{claude}"), "S-claude".to_string()),
+            ("codex/stale-identity".to_string(), "S-old".to_string()),
+        ]);
+        assert!(
+            app.update(Event::Resumed {
+                title: "old".into(),
+                events,
+                sessions,
+                elsewhere: None,
+            })
+            .is_empty()
+        );
+        let shown: Vec<(&str, &str)> = app
+            .lines
+            .iter()
+            .map(|l| (l.who.as_str(), l.text.as_str()))
+            .collect();
+        assert!(shown.contains(&("you → llama", "q1")));
+        assert!(shown.contains(&("llama", "a1")));
+        assert!(shown.contains(&("claude → codex", "check this")));
+        assert_eq!(app.lines.last().unwrap().text, "resumed \"old\"");
+
+        let effects = type_line(&mut app, "@llama q2");
+        assert_eq!(
+            chats(&effects)[0].1,
+            [("q1".to_string(), "a1".to_string())],
+            "only exchanges with the current endpoint"
+        );
+        let effects = type_line(&mut app, "@claude hi");
+        assert!(
+            effects.iter().any(
+                |e| matches!(e, Effect::StartTurn { session: Some(s), .. } if s == "S-claude")
+            )
+        );
+        let effects = type_line(&mut app, "@codex hi");
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::StartTurn { session: None, .. })),
+            "a session made for another identity is not resumed"
+        );
+    }
+
+    #[test]
+    fn a_thread_from_another_checkout_is_read_only() {
+        let mut app = App::default();
+        reload(&mut app, &format!("{DEFAULT_FILE}{LLAMA}"));
+        let events = past_thread(&app);
+        app.update(Event::Resumed {
+            title: "elsewhere".into(),
+            events,
+            sessions: BTreeMap::new(),
+            elsewhere: Some("/other/repo".into()),
+        });
+        assert!(last_text(&app).contains("read-only"));
+        assert!(type_line(&mut app, "hello").is_empty());
+        assert!(last_text(&app).contains("belongs to /other/repo"));
+        app.input.clear();
+        assert_eq!(type_line(&mut app, "/clear"), [Effect::NewThread]);
+        assert!(
+            !type_line(&mut app, "hello").is_empty(),
+            "a new thread can be written"
+        );
+    }
+
+    #[test]
+    fn resume_waits_for_running_replies() {
+        let mut app = App::default();
+        assert_eq!(type_line(&mut app, "/resume"), [Effect::Resume(None)]);
+        type_line(&mut app, "hi");
+        assert!(type_line(&mut app, "/resume 1").is_empty());
+        app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        assert_eq!(
+            type_line(&mut app, "/resume 1"),
+            [Effect::Resume(Some("1".into()))]
+        );
     }
 }

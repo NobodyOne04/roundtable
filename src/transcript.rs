@@ -353,6 +353,14 @@ impl Thread {
         &self.usage
     }
 
+    /// The sessions saved by `save_sessions`; empty when there are none yet.
+    pub fn load_sessions(&self) -> std::collections::BTreeMap<String, String> {
+        fs::read(self.dir.join("sessions.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
     /// The native CLI session of each participant in this thread (`sessions.json`), so the
     /// next turn resumes it.
     /// Keys are `id/identity` (ADR 0010), built by the caller.
