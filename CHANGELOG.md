@@ -10,6 +10,7 @@
 - Proposed ADR 0010 (JSONL files as the transcript) and 0011 (hot in-memory model registry)
 
 ### Changed
+- README matches the ADRs: roadmap in build order with progress, worktree decision, hot-registry and disable behaviour, chat-only models, requirements
 - ADRs 0010 and 0011 accepted
 - ADRs 0001, 0002, 0004, 0005, 0007, 0008, 0009 accepted; 0003 (SQLite) and 0006 (registry) rejected
 - ADR 0004: single-writer limit decided, git worktree per agent

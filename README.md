@@ -2,8 +2,9 @@
 
 A terminal console where Claude Code, Codex and free models sit at one table, and you watch them talk.
 
-> **Status: early build.** The architecture is decided ([`docs/adr/`](docs/adr/README.md));
-> the code so far is the skeleton: it opens an empty table and quits.
+> **Status: early build.** The architecture is decided in [`docs/adr/`](docs/adr/README.md).
+> Built so far: the skeleton and the event loop (ADR 0001, 0002). It opens an empty table
+> and quits; no agents yet. See [Roadmap](#roadmap).
 
 ## What it is
 
@@ -12,7 +13,8 @@ One chat, several participants:
 - **Agents**: Claude Code and Codex, driven through their own CLIs and your own logins.
   They edit files and run tools.
 - **Models**: any OpenAI-compatible endpoint: Ollama, LM Studio, OpenRouter free models,
-  Groq, Gemini. They answer, review and give second opinions.
+  Groq, Gemini. Chat only: they answer, review and give second opinions; they don't edit
+  files or start conversations with others.
 
 What makes it different from running them side by side: participants can **ask each other**
 (`claude → codex`), and every exchange shows inline in the chat with the exact prompt sent,
@@ -32,23 +34,29 @@ the reply, and the tokens it cost.
 ## Planned features
 
 - `@claude`, `@codex`, `@all` to address participants; no mention goes to the default.
+  With `@all`, every enabled participant answers you independently.
 - Slash commands like Claude Code: `/help`, `/usage`, `/context`, `/status`, `/models`,
   `/model enable|disable|use|test`, `/talk on|off|allow|deny|show`, `/budget`, `/turns`,
   `/resume`, `/clear`. Full list: [ADR 0008](docs/adr/0008-slash-commands-and-mentions.adr).
 - Add any free model with a few lines of config, no rebuild, no restart: the registry is
-  hot, so edits to the file or `/model …` commands apply at once.
-- Disable a model at any time: it stops receiving messages, keeps its history.
+  hot, so edits to the file or `/model …` commands apply at once. An edit with an error
+  is not applied at all; the chat shows the error and the old registry stays live.
+- Disable a model at any time: its running reply and queued messages are cancelled, and
+  it keeps its history for when you enable it again.
 - Model-to-model talk with a policy matrix (who may ask whom), turn and token limits, and
   a global off switch.
-- One writer per checkout: only the `writer` agent edits files, one turn at a time; everyone else is read-only.
-  Read-only turns also run without your own MCP servers and hooks, which could write.
+- One writer per checkout: only the `writer` agent edits files, one turn at a time across
+  all threads; everyone else is read-only and runs without your own MCP servers and hooks,
+  which could write. Each non-writer will get its own git worktree, so nothing it runs can
+  touch the writer's files (decided in ADR 0004, details in a later ADR).
 - Every message, handoff and blocked call is kept as plain JSONL files, one folder per
-  thread (`tail -f` it to watch live): replay, resume,
-  usage per model.
+  thread (`tail -f` it to watch live): replay, resume, usage per model. A thread is tied to
+  the checkout it started in; resumed elsewhere, it is read-only.
 
 ## Config preview
 
-`~/.config/roundtable/models.toml` (macOS: `~/Library/Application Support/roundtable/`):
+`models.toml` in your config dir (Linux: `~/.config/roundtable/`, macOS:
+`~/Library/Application Support/roundtable/`), created with `claude` and `codex` on first run:
 
 ```toml
 default = "claude"
@@ -99,11 +107,14 @@ For a shorter command, add `alias rt=roundtable` to your shell (with the binary 
 `~/Library/Application Support/roundtable/`, Linux: `~/.local/share/roundtable/`); set
 `RUST_LOG=debug` for more.
 
-## Requirements (planned)
+## Requirements
 
 - macOS or Linux.
-- The agent CLIs you want at the table, installed and logged in: `claude`, `codex`.
-- For free local models: Ollama or LM Studio.
+- Planned, as agents land: the agent CLIs you want at the table, installed and logged in
+  (`claude`, `codex`; tested versions will be listed here), and Ollama or LM Studio for
+  free local models.
+- From step 4: start it inside a git repo; outside one, Codex runs only after you confirm.
+- From step 3: one roundtable at a time; a second instance exits with "already running".
 
 ## Privacy
 
@@ -121,11 +132,22 @@ Rust, tokio, ratatui, plain JSONL files for the transcript, MCP for the `ask` to
 
 ## Roadmap
 
-1. **MVP**: chat with `@claude` / `@codex`, streaming, event log, `/help` `/models` `/status`.
-2. OpenAI-compatible models, enable/disable, `/usage` `/context`.
-3. Model-to-model `ask`, talk policy, limits, inline handoffs.
-4. Resume, guided `/model add`, `/compact`, `/handoff`, `/fork`.
-5. Git worktree per agent, approvals, ACP adapter.
+Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
+
+| Step | ADR | What you get | State |
+|---|---|---|---|
+| 1 | [0001](docs/adr/0001-rust-tokio-ratatui.adr) | Skeleton: toolchain, terminal safety, CI | done |
+| 2 | [0002](docs/adr/0002-single-owner-event-loop.adr) | Event loop: one owner of state, events in, effects out | done |
+| 3 | [0010](docs/adr/0010-filesystem-event-log.adr) | Transcript as JSONL files, single-instance lock | next |
+| 4 | [0004](docs/adr/0004-cli-agent-adapters.adr) | Claude Code and Codex in the chat, read-only until 0011 | |
+| 5 | [0011](docs/adr/0011-hot-model-registry.adr) | Hot model registry, `writer`, enable/disable | |
+| 6 | [0005](docs/adr/0005-openai-compatible-models.adr) | Free models over the OpenAI-compatible API | |
+| 7 | [0007](docs/adr/0007-model-to-model-communication.adr) | Model-to-model `ask`, talk policy, limits, `/talk on\|off` | |
+| 8 | [0008](docs/adr/0008-slash-commands-and-mentions.adr) | Full command set and completion | |
+| 9 | [0009](docs/adr/0009-tui-layout.adr) | Three-pane layout | |
+
+Later, each with its own ADR first: git worktree per agent, `/model add` (guided),
+`/compact`, `/handoff`, `/fork`, approvals, an ACP adapter.
 
 ## License
 
