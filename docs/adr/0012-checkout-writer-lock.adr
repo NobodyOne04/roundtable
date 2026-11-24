@@ -1,0 +1,58 @@
+# 0012. The writer lock lives in the checkout
+
+- Status: Accepted
+- Date: 2026-11-25
+- Amends: [0010](0010-filesystem-event-log.adr) (the unclean-writer interlock only)
+
+The single-writer guarantee (ADR 0004) and the crash interlock (ADR 0010) are kept in the
+transcript, under the data folder, and matched to checkouts by path. A checkout renamed
+after a crash, or a second roundtable with another data folder (`XDG_DATA_HOME`), misses an
+unfinished writer. This ADR moves the writer lock into the checkout itself.
+
+## Technical details
+- Where: `<git dir>/roundtable/` of the checkout, from `git rev-parse --absolute-git-dir`
+  run in the working folder (a linked worktree has its own git dir, so each worktree is its
+  own checkout). The git dir moves with the checkout and is the same for every roundtable
+  on it, whatever its data folder. Nothing is written to the working tree.
+- Only git checkouts can have a writer. Outside git every turn is read-only: no second,
+  weaker locking scheme. If `GIT_DIR` or `GIT_WORK_TREE` is set in roundtable's
+  environment, edits are locked too: two launches with different overrides could otherwise
+  resolve one checkout to two lock directories. Git errors lock edits, as now.
+- Two files:
+  - `writer.lock`: an exclusive `flock` held for exactly one writable turn. The OS drops it
+    when the process dies, so it means "a writer is running right now", across instances
+    and data folders.
+  - `writer.json`: the crash marker `{pid, started_ms, thread, data_root}`.
+- Starting a writable turn, in this order, before the delivery is recorded as `sent`:
+  1. take `writer.lock` (held: another roundtable is editing this checkout, refuse);
+  2. check `writer.json` is absent (present: an earlier writer never finished, refuse and
+     lock edits);
+  3. write `writer.json`, sync it and sync the `roundtable/` directory (and the git dir the
+     first time the folder is created), so the marker survives power loss.
+  Any failure refuses the turn (fail closed); the delivery is then recorded `refused`, not
+  `sent`, and the turn is shown failed. Cross-instance contention refuses rather than
+  queues: the other instance's turn length is unknown, and the user can resend.
+- Ending it: after the CLI is reaped and the reply recorded, remove `writer.json`, sync the
+  directory, then release the lock.
+- Startup: `writer.json` present while the lock is free means a writer crashed: edits are
+  locked and the chat shows the marker. `/quiet` takes the lock, checks the marker is byte
+  for byte the one that was shown (otherwise it shows the new one and asks again), removes
+  it, syncs, and only then unlocks. It appends `settle interrupted` to the marker's thread
+  when that thread is in this data folder; otherwise it records a `status` line in the
+  current thread. An unreadable marker also locks; `/quiet` removes it after the same
+  confirmation.
+- The transcript keeps its `writable` delivery and reply lines as history, but they no
+  longer decide anything: the transcript scan (`Store::writer_locks`) is removed.
+- No migration: the transcript-based lock shipped the same day (PR #13); the owner's data
+  folder was checked and has no open writer markers.
+- Known limit: if the checkout is renamed *during* a writable turn and another checkout
+  takes its old path, cleanup by path could touch the wrong marker. Pinning the directory
+  needs `openat`; not worth it for this case.
+
+Consequences: concurrent instances and crashes are covered per checkout, across data
+folders and renames, with two small files. Cost: roundtable writes a subfolder into the git
+dir; outside git nobody edits.
+
+## Technologies and alternatives
+- Involved: std `File::try_lock`, `git rev-parse --absolute-git-dir`, serde_json
+- Alternatives: keep the transcript scan and add a checkout id file: still two sources of truth; a data-root fallback outside git: a second, weaker scheme (Codex critique); a `.roundtable/` folder in the working tree: shows up in `git status` and needs ignoring; a global lock in the home folder keyed by path: breaks on rename, which is the case to fix

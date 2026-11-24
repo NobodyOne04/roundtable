@@ -176,7 +176,8 @@ pub fn command(kind: Kind, turn: &Turn) -> (Command, Vec<u8>) {
 /// between versions, and a new event type must never break a turn.
 pub fn parse(kind: Kind, line: &str) -> Vec<PEvent> {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
-        tracing::debug!(agent = kind.id(), line, "not JSON, skipped");
+        // Never the line itself: it may hold tool output or credentials.
+        tracing::debug!(agent = kind.id(), bytes = line.len(), "not JSON, skipped");
         return vec![];
     };
     match kind {
@@ -287,6 +288,21 @@ pub async fn run(
     tx: mpsc::Sender<Event>,
     cancel: CancellationToken,
 ) {
+    // Checked at every launch, not only at startup: a project config added later would
+    // otherwise load into a read-only turn.
+    if kind == Kind::Codex
+        && let Some(path) = codex_project_config(&turn.cwd)
+    {
+        let why = format!(
+            "{} exists; Codex turns are refused (ADR 0004)",
+            path.display()
+        );
+        let _ = tx.send(Event::Agent(id.clone(), PEvent::Error(why))).await;
+        let _ = tx
+            .send(Event::Agent(id, PEvent::Done(Outcome::Failed)))
+            .await;
+        return;
+    }
     let (cmd, input) = command(kind, &turn);
     run_command(id, kind, cmd, input, tx, cancel).await;
 }
@@ -323,18 +339,19 @@ pub async fn run_command(
         }
     };
     let pgid = child.id();
+    // The prompt is written alongside reading the output, not before it: a CLI that fills
+    // its output pipe before reading all of a large prompt would otherwise deadlock.
     if let Some(mut stdin) = child.stdin.take() {
-        // Dropping stdin afterwards closes it, which tells the CLI the prompt is complete.
-        if let Err(err) = stdin.write_all(&input).await {
-            tracing::warn!(agent = kind.id(), %err, "writing the prompt failed");
-        }
+        let agent = kind.id();
+        tokio::spawn(async move {
+            // Dropping stdin afterwards closes it: the prompt is complete.
+            if let Err(err) = stdin.write_all(&input).await {
+                tracing::warn!(agent, %err, "writing the prompt failed");
+            }
+        });
     }
-    let mut stderr = child.stderr.take().expect("stderr is piped");
-    let stderr_task = tokio::spawn(async move {
-        let mut text = String::new();
-        let _ = stderr.read_to_string(&mut text).await;
-        text
-    });
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let stderr_task = tokio::spawn(stderr_tail(stderr));
     let mut lines = BufReader::new(child.stdout.take().expect("stdout is piped")).lines();
 
     let mut outcome = loop {
@@ -355,30 +372,64 @@ pub async fn run_command(
         }
     };
 
-    if outcome == Outcome::Interrupted {
-        signal_group(pgid, libc::SIGTERM);
-        if tokio::time::timeout(KILL_GRACE, child.wait())
-            .await
-            .is_err()
-        {
-            signal_group(pgid, libc::SIGKILL);
+    // Output closed is not the end: the CLI may still run. Cancellation stays honoured
+    // while waiting for it to exit.
+    let status = if outcome == Outcome::Interrupted {
+        None
+    } else {
+        tokio::select! {
+            status = child.wait() => Some(status),
+            _ = cancel.cancelled() => {
+                outcome = Outcome::Interrupted;
+                None
+            }
         }
-    }
-    let status = child.wait().await;
+    };
+    let status = match status {
+        Some(status) => status,
+        None => {
+            signal_group(pgid, libc::SIGTERM);
+            if tokio::time::timeout(KILL_GRACE, child.wait())
+                .await
+                .is_err()
+            {
+                signal_group(pgid, libc::SIGKILL);
+            }
+            child.wait().await
+        }
+    };
     // Tools the CLI started share its group; none may outlive the turn.
     signal_group(pgid, libc::SIGKILL);
     if outcome == Outcome::Complete && !status.as_ref().is_ok_and(|s| s.success()) {
         outcome = Outcome::Failed;
     }
     if outcome == Outcome::Failed {
-        let stderr = stderr_task.await.unwrap_or_default();
-        let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
+        let tail = stderr_task.await.unwrap_or_default();
         if !tail.is_empty() {
-            let tail: Vec<&str> = tail.into_iter().rev().collect();
-            emit(PEvent::Error(tail.join("\n"))).await;
+            emit(PEvent::Error(tail)).await;
         }
     }
     emit(PEvent::Done(outcome)).await;
+}
+
+/// The last few lines of stderr, read continuously but kept bounded: a noisy CLI must not
+/// grow memory without limit when only the tail is ever shown.
+async fn stderr_tail(mut stderr: tokio::process::ChildStderr) -> String {
+    const KEEP: usize = 4096;
+    let mut tail: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while let Ok(n) = stderr.read(&mut chunk).await {
+        if n == 0 {
+            break;
+        }
+        tail.extend_from_slice(&chunk[..n]);
+        if tail.len() > KEEP {
+            tail.drain(..tail.len() - KEEP);
+        }
+    }
+    let text = String::from_utf8_lossy(&tail);
+    let lines: Vec<&str> = text.lines().rev().take(3).collect();
+    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
 }
 
 fn signal_group(pgid: Option<u32>, signal: libc::c_int) {
@@ -652,6 +703,61 @@ mod tests {
         assert_eq!(
             events,
             [PEvent::Error("boom".into()), PEvent::Done(Outcome::Failed)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_large_prompt_does_not_deadlock_a_chatty_cli() {
+        // Writes 1 MiB of output before reading any input: with the prompt written first,
+        // both sides would block on full pipes.
+        let script = r#"head -c 1048576 /dev/zero | tr '\0' 'x'; echo; cat > /dev/null; printf '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n'"#;
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script]);
+        let (tx, mut rx) = mpsc::channel(64);
+        let prompt = vec![b'p'; 4 * 1024 * 1024];
+        tokio::spawn(run_command(
+            "codex".into(),
+            Kind::Codex,
+            cmd,
+            prompt,
+            tx,
+            CancellationToken::new(),
+        ));
+        let events = tokio::time::timeout(Duration::from_secs(20), async {
+            let mut events = vec![];
+            while let Some(Event::Agent(_, event)) = rx.recv().await {
+                let done = matches!(event, PEvent::Done(_));
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            events
+        })
+        .await
+        .expect("deadlocked");
+        assert_eq!(
+            events,
+            [
+                PEvent::Message("ok".into()),
+                PEvent::Done(Outcome::Complete)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_tail_of_noisy_stderr_is_kept() {
+        let events = run_fake(
+            "i=0; while [ $i -lt 20000 ]; do echo noise $i >&2; i=$((i+1)); done; echo last >&2; exit 1",
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            events,
+            [
+                PEvent::Error("noise 19998\nnoise 19999\nlast".into()),
+                PEvent::Done(Outcome::Failed)
+            ]
         );
     }
 

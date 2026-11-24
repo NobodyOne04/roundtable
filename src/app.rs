@@ -8,7 +8,7 @@ use serde_json::json;
 
 use crate::agent::{self, Outcome, PEvent};
 use crate::registry::{Adapter, Participant, Registry};
-use crate::transcript::{self, Lock, NewEvent, Party};
+use crate::transcript::{self, NewEvent, Party};
 
 /// Preflight result per participant id: the CLI version, or why it can't take turns.
 pub type Checks = BTreeMap<String, Result<String, String>>;
@@ -31,11 +31,23 @@ pub enum Event {
     Registry(Result<(Registry, Checks), String>),
     /// Something the loop failed to do, shown in the chat.
     Notice(String),
-    /// After `/quiet`: threads whose `settle` reached the disk, and those that failed.
-    QuietDone {
-        settled: Vec<String>,
-        failed: Vec<(String, String)>,
-    },
+    /// After `/quiet`: the marker was removed durably, or why not.
+    QuietDone(Result<(), String>),
+    /// The loop found a reason to lock edits mid-run (another instance crashed, or the
+    /// marker changed before `/quiet`).
+    LockEdits(EditLock),
+}
+
+/// Why edits are locked (ADR 0012).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditLock {
+    /// A writer crashed and left this marker (`text` to show); `/quiet` removes exactly the
+    /// marker with this `key`.
+    Crashed { text: String, key: String },
+    /// The checkout can't be named reliably (a git problem): fix it and restart.
+    Unknown(String),
+    /// Not a git checkout: nobody edits here.
+    OutsideGit,
 }
 
 /// A change to `models.toml` asked for by a command; the loop writes it.
@@ -77,9 +89,9 @@ pub enum Effect {
         session: String,
     },
     EditRegistry(FileEdit),
-    /// The user confirmed the checkout is quiet: close these threads' unfinished writer
-    /// turns with a `settle`, which unlocks edits (ADR 0010).
-    ConfirmQuiet(Vec<String>),
+    /// The user confirmed the checkout is quiet: remove the crash marker with this key
+    /// (ADR 0012).
+    ConfirmQuiet(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +129,9 @@ struct Seat {
     /// Index of the reply being streamed in `lines`.
     reply: Option<usize>,
     usage: (u64, u64, Option<f64>),
+    /// The identity the running turn was sent to. Its events belong to that destination,
+    /// even if the registry changed meanwhile (ADR 0011).
+    turn_identity: Option<String>,
 }
 
 #[derive(Debug)]
@@ -128,11 +143,8 @@ pub struct App {
     registry: Registry,
     checks: Checks,
     seats: Vec<Seat>,
-    /// Threads whose writer turn never finished (a crash): edits stay locked until `/quiet`.
-    edits_locked: Vec<String>,
-    /// Threads whose history can't be read: writer state unknown, so edits stay locked
-    /// until the folder is moved away (fail closed, ADR 0010).
-    unreadable: Vec<(String, String)>,
+    /// Why nobody may edit right now; `None` lets the writer edit.
+    edit_lock: Option<EditLock>,
     /// Quitting: running turns are being cancelled and nothing new may start.
     quitting: bool,
     /// First Ctrl-C arms, the second quits.
@@ -162,8 +174,7 @@ impl App {
             registry: Registry::parse("").expect("empty registry"),
             checks: Checks::new(),
             seats: vec![],
-            edits_locked: vec![],
-            unreadable: vec![],
+            edit_lock: None,
             quitting: false,
             quit_armed: false,
         };
@@ -182,72 +193,40 @@ impl App {
     }
 
     /// At startup: a previous writer in this checkout may still be running (ADR 0010).
-    pub fn lock_edits(&mut self, locks: Vec<Lock>) {
-        let mut checkouts = vec![];
-        for lock in locks {
-            match lock {
-                Lock::Open { id, checkout } => {
-                    self.edits_locked.push(id);
-                    let checkout = checkout.display().to_string();
-                    if !checkouts.contains(&checkout) {
-                        checkouts.push(checkout);
-                    }
-                }
-                Lock::Unreadable { id, why } => self.unreadable.push((id, why)),
-            }
-        }
-        if !checkouts.is_empty() {
-            // Every checkout is named: `/quiet` confirms all of them, so the user must know
-            // which (e.g. an outer repo around a nested one).
-            self.push(
-                "roundtable",
-                format!(
-                    "edits are locked: a writer from an earlier run never finished in {}, and \
-                     may still be running. Check nothing is editing there, then type /quiet. \
-                     Until then every turn is read-only.",
-                    checkouts.join(" and ")
-                ),
-                LineKind::Error,
-            );
-        }
-        for (id, why) in self.unreadable.clone() {
-            self.push(
-                "roundtable",
-                format!(
-                    "edits are locked: thread {id} can't be read ({why}), so whether its writer \
-                     finished is unknown. Repair it or move its folder out of threads/, then \
-                     restart."
-                ),
-                LineKind::Error,
-            );
-        }
-    }
-
-    /// Git couldn't name the checkout root, so a crashed writer elsewhere in the checkout
-    /// could be missed: fail closed.
-    pub fn lock_unknown_checkout(&mut self, why: &str) {
-        self.unreadable.push(("checkout".into(), why.into()));
-        self.push(
-            "roundtable",
-            format!(
-                "edits are locked: git can't tell this checkout's root ({why}), so a writer \
-                 that crashed elsewhere in it could be missed. Fix git, then restart."
+    pub fn lock_edits(&mut self, lock: EditLock) {
+        let text = match &lock {
+            EditLock::Crashed { text: marker, .. } => format!(
+                "edits are locked: a writer never finished in this checkout and may still be \
+                 running. Check nothing is editing it, then type /quiet. Its marker:\n{marker}"
             ),
-            LineKind::Error,
-        );
+            EditLock::Unknown(why) => format!(
+                "edits are locked: git can't tell this checkout ({why}), so a writer elsewhere \
+                 in it could be missed. Fix that, then restart."
+            ),
+            EditLock::OutsideGit => {
+                "not a git checkout: every turn is read-only here (ADR 0012)".to_string()
+            }
+        };
+        let kind = if lock == EditLock::OutsideGit {
+            LineKind::Info
+        } else {
+            LineKind::Error
+        };
+        self.push("roundtable", text, kind);
+        self.edit_lock = Some(lock);
     }
 
-    /// How to lift the lock, for messages: `/quiet` can't fix unreadable history.
+    /// How to lift the lock, for messages.
     fn unlock_hint(&self) -> &'static str {
-        if self.unreadable.is_empty() {
-            "until /quiet"
-        } else {
-            "until the problem shown above is fixed and roundtable restarted"
+        match self.edit_lock {
+            Some(EditLock::Crashed { .. }) => "until /quiet",
+            Some(EditLock::Unknown(_)) => "until the git problem is fixed and roundtable restarted",
+            Some(EditLock::OutsideGit) | None => "outside a git checkout",
         }
     }
 
     fn locked(&self) -> bool {
-        !self.edits_locked.is_empty() || !self.unreadable.is_empty()
+        self.edit_lock.is_some()
     }
 
     /// The only place state changes. No I/O here, so it is testable without a terminal.
@@ -277,21 +256,21 @@ impl App {
                 );
                 vec![]
             }
-            Event::QuietDone { settled, failed } => {
-                self.edits_locked.retain(|id| !settled.contains(id));
-                for (id, why) in failed {
-                    self.push(
-                        "roundtable",
-                        format!("thread {id} could not be settled ({why}); /quiet to retry"),
-                        LineKind::Error,
-                    );
-                }
-                let note = if self.locked() {
-                    "edits are still locked"
-                } else {
-                    "edits unlocked"
-                };
-                self.push("roundtable", note.into(), LineKind::Info);
+            Event::QuietDone(Ok(())) => {
+                self.edit_lock = None;
+                self.push("roundtable", "edits unlocked".into(), LineKind::Info);
+                vec![]
+            }
+            Event::QuietDone(Err(why)) => {
+                self.push(
+                    "roundtable",
+                    format!("edits are still locked: {why}"),
+                    LineKind::Error,
+                );
+                vec![]
+            }
+            Event::LockEdits(lock) => {
+                self.lock_edits(lock);
                 vec![]
             }
             Event::Notice(text) => {
@@ -395,23 +374,20 @@ impl App {
             ["/model", "enable", id] => self.set_enabled(id, true),
             ["/model", "disable", id] => self.set_enabled(id, false),
             ["/model", "use", id] => self.use_default(id),
-            // The lock is lifted only when `QuietDone` confirms the settles are on disk.
-            ["/quiet"] if !self.edits_locked.is_empty() => {
-                vec![Effect::ConfirmQuiet(self.edits_locked.clone())]
-            }
-            ["/quiet"] if !self.unreadable.is_empty() => {
-                self.push(
-                    "roundtable",
-                    "/quiet can't unlock unreadable threads: repair or move them, then restart"
-                        .into(),
-                    LineKind::Error,
-                );
-                vec![]
-            }
-            ["/quiet"] => {
-                self.push("roundtable", "edits are not locked".into(), LineKind::Info);
-                vec![]
-            }
+            ["/quiet"] => match &self.edit_lock {
+                // Lifted only when `QuietDone` confirms the marker is gone from disk.
+                Some(EditLock::Crashed { key, .. }) => vec![Effect::ConfirmQuiet(key.clone())],
+                Some(_) => {
+                    let hint =
+                        format!("/quiet can't help: edits are locked {}", self.unlock_hint());
+                    self.push("roundtable", hint, LineKind::Error);
+                    vec![]
+                }
+                None => {
+                    self.push("roundtable", "edits are not locked".into(), LineKind::Info);
+                    vec![]
+                }
+            },
             _ => {
                 self.push(
                     "roundtable",
@@ -547,6 +523,10 @@ impl App {
         for id in gone {
             notes.push(format!("{id} left"));
             effects.extend(self.unseat(&id));
+            // Coming back later is a fresh start, whatever it points to then.
+            if let Some(seat) = self.seat_mut(&id) {
+                seat.session = None;
+            }
         }
         for p in &next.participants {
             if self.seat_mut(&p.id).is_none() {
@@ -559,6 +539,7 @@ impl App {
                     held: false,
                     reply: None,
                     usage: (0, 0, None),
+                    turn_identity: None,
                 });
             }
         }
@@ -699,6 +680,7 @@ impl App {
         let seat = self.seat_mut(&p.id).expect("seat");
         seat.busy = true;
         seat.writable = writable;
+        seat.turn_identity = Some(p.identity.clone());
         seat.reply = Some(index);
         seat.usage = (0, 0, None);
         let session = seat.session.clone();
@@ -739,22 +721,25 @@ impl App {
     }
 
     fn agent_event(&mut self, id: &str, event: PEvent) -> Vec<Effect> {
-        let identity = self
-            .registry
-            .get(id)
-            .map(|p| p.identity.clone())
-            .unwrap_or_default();
-        let party = self.party(id);
+        let current = self.registry.get(id).map(|p| p.identity.clone());
+        let party = self.turn_party(id);
         let Some(seat) = self.seat_mut(id) else {
             return vec![];
         };
         let reply = seat.reply;
         match event {
             PEvent::Session(session) => {
-                if seat.session.as_deref() == Some(session.as_str()) {
+                // Saved under the identity the turn went to; it becomes the seat's session
+                // only if that is still the participant's destination.
+                let Some(identity) = seat.turn_identity.clone() else {
                     return vec![];
+                };
+                if current.as_ref() == Some(&identity) {
+                    if seat.session.as_deref() == Some(session.as_str()) {
+                        return vec![];
+                    }
+                    seat.session = Some(session.clone());
                 }
-                seat.session = Some(session.clone());
                 vec![Effect::SaveSession {
                     id: id.into(),
                     identity,
@@ -821,7 +806,7 @@ impl App {
     }
 
     fn finish(&mut self, id: &str, outcome: Outcome) -> Vec<Effect> {
-        let party = self.party(id);
+        let party = self.turn_party(id);
         let seat = self.seat_mut(id).expect("seat");
         seat.busy = false;
         let (tokens_in, tokens_out, cost) = seat.usage;
@@ -888,6 +873,20 @@ impl App {
 
     fn seat_mut(&mut self, id: &str) -> Option<&mut Seat> {
         self.seats.iter_mut().find(|s| s.id == id)
+    }
+
+    /// The participant as the running turn knew it (see `Seat::turn_identity`).
+    fn turn_party(&self, id: &str) -> Party {
+        let identity = self
+            .seats
+            .iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.turn_identity.clone())
+            .or_else(|| self.registry.get(id).map(|p| p.identity.clone()));
+        Party {
+            id: id.into(),
+            identity,
+        }
     }
 
     fn party(&self, id: &str) -> Party {
@@ -1321,10 +1320,10 @@ mod tests {
     #[test]
     fn locked_edits_run_read_only_until_quiet() {
         let mut app = App::default();
-        app.lock_edits(vec![Lock::Open {
-            id: "T1".into(),
-            checkout: "/repo".into(),
-        }]);
+        app.lock_edits(EditLock::Crashed {
+            text: "{marker}".into(),
+            key: "k1".into(),
+        });
         assert!(last_text(&app).starts_with("edits are locked"));
         let effects = type_line(&mut app, "fix");
         assert_eq!(writable(&effects), [("claude".into(), false)]);
@@ -1337,28 +1336,26 @@ mod tests {
 
         assert_eq!(
             type_line(&mut app, "/quiet"),
-            [Effect::ConfirmQuiet(vec!["T1".into()])]
+            [Effect::ConfirmQuiet("k1".into())]
         );
-        // Not unlocked until the settle is confirmed on disk.
+        // Not unlocked until the removal is confirmed on disk.
         assert_eq!(
             writable(&type_line(&mut app, "fix")),
             [("claude".into(), false)]
         );
         app.update(agent("claude", PEvent::Done(Outcome::Complete)));
-        app.update(Event::QuietDone {
-            settled: vec![],
-            failed: vec![("T1".into(), "disk full".into())],
-        });
-        assert_eq!(last_text(&app), "edits are still locked");
+        app.update(Event::QuietDone(Err("disk full".into())));
+        assert_eq!(last_text(&app), "edits are still locked: disk full");
+        // The marker changed meanwhile: the new one must be confirmed instead.
+        app.update(Event::LockEdits(EditLock::Crashed {
+            text: "{other}".into(),
+            key: "k2".into(),
+        }));
         assert_eq!(
             type_line(&mut app, "/quiet"),
-            [Effect::ConfirmQuiet(vec!["T1".into()])],
-            "a failed settle can be retried"
+            [Effect::ConfirmQuiet("k2".into())]
         );
-        app.update(Event::QuietDone {
-            settled: vec!["T1".into()],
-            failed: vec![],
-        });
+        app.update(Event::QuietDone(Ok(())));
         assert_eq!(last_text(&app), "edits unlocked");
         assert_eq!(
             writable(&type_line(&mut app, "fix")),
@@ -1484,50 +1481,22 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_threads_lock_and_quiet_cannot_lift_it() {
-        let mut app = App::default();
-        app.lock_edits(vec![Lock::Unreadable {
-            id: "T9".into(),
-            why: "meta.json: eof".into(),
-        }]);
-        assert!(last_text(&app).contains("thread T9 can't be read"));
-        assert!(type_line(&mut app, "/quiet").is_empty());
-        assert_eq!(
-            writable(&type_line(&mut app, "fix")),
-            [("claude".into(), false)]
-        );
-        assert!(
-            app.lines.iter().any(|l| l.text
-                == "read-only: edits are locked until the problem shown above is fixed and roundtable restarted"),
-            "the hint names the real way out"
-        );
-    }
-
-    #[test]
-    fn the_lock_names_every_checkout_it_covers() {
-        let mut app = App::default();
-        app.lock_edits(vec![
-            Lock::Open {
-                id: "T1".into(),
-                checkout: "/outer".into(),
-            },
-            Lock::Open {
-                id: "T2".into(),
-                checkout: "/outer/nested".into(),
-            },
-        ]);
-        assert!(last_text(&app).contains("never finished in /outer and /outer/nested"));
-    }
-
-    #[test]
-    fn an_unknown_checkout_locks_edits() {
-        let mut app = App::default();
-        app.lock_unknown_checkout("fatal: detected dubious ownership");
-        assert!(last_text(&app).starts_with("edits are locked: git can't tell"));
-        assert_eq!(
-            writable(&type_line(&mut app, "fix")),
-            [("claude".into(), false)]
-        );
+    fn git_problems_and_outside_git_lock_without_quiet() {
+        for lock in [
+            EditLock::Unknown("GIT_DIR is set".into()),
+            EditLock::OutsideGit,
+        ] {
+            let mut app = App::default();
+            app.lock_edits(lock.clone());
+            assert_eq!(
+                writable(&type_line(&mut app, "fix")),
+                [("claude".into(), false)],
+                "{lock:?}"
+            );
+            app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+            assert!(type_line(&mut app, "/quiet").is_empty(), "{lock:?}");
+            assert!(last_text(&app).starts_with("/quiet can't help"), "{lock:?}");
+        }
     }
 
     #[test]
@@ -1541,6 +1510,55 @@ mod tests {
             writable(&effects),
             [("claude".into(), false)],
             "the writer was removed while it waited"
+        );
+    }
+
+    #[test]
+    fn a_late_session_stays_with_the_destination_it_came_from() {
+        let mut app = App::default();
+        type_line(&mut app, "@claude long task");
+        let old = app.registry.get("claude").unwrap().identity.clone();
+        reload(
+            &mut app,
+            &DEFAULT_FILE.replace("# model = \"claude-opus-5-5\"", "model = \"other\""),
+        );
+        // The old turn reports its session after the switch.
+        let effects = app.update(agent("claude", PEvent::Session("OLD".into())));
+        assert_eq!(
+            effects,
+            [Effect::SaveSession {
+                id: "claude".into(),
+                identity: old,
+                session: "OLD".into()
+            }]
+        );
+        app.update(agent("claude", PEvent::Done(Outcome::Interrupted)));
+        let effects = type_line(&mut app, "@claude again");
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::StartTurn { session: None, .. })),
+            "the new destination does not resume the old session"
+        );
+    }
+
+    #[test]
+    fn a_participant_that_leaves_and_returns_starts_fresh() {
+        let mut app = App::default();
+        type_line(&mut app, "@codex hi");
+        app.update(agent("codex", PEvent::Session("S".into())));
+        app.update(agent("codex", PEvent::Done(Outcome::Complete)));
+        let without = DEFAULT_FILE
+            .replace("id = \"codex\"", "id = \"gone\"")
+            .replace("codex = []", "gone = []")
+            .replace("claude = [\"codex\"]", "claude = [\"gone\"]");
+        reload(&mut app, &without);
+        reload(&mut app, DEFAULT_FILE);
+        let effects = type_line(&mut app, "@codex back");
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::StartTurn { session: None, .. }))
         );
     }
 

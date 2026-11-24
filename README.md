@@ -124,12 +124,13 @@ writer itself when reached through `@all` or several mentions, is read-only: pla
 Claude, the read-only sandbox for Codex, both without your own MCP servers, hooks and
 plugins.
 
-**After a crash.** If roundtable dies while the writer works, the CLI may keep editing.
-On the next start anywhere in that checkout (the git repo, from any folder in it), edits
-stay locked, so every turn is read-only, until you check nothing is running and type
-`/quiet`. A thread whose history can't be read also keeps edits locked, since nobody can tell
-whether its writer finished; repair it or move its folder out of `threads/`. So does a
-checkout whose git root can't be determined (git missing, or a broken worktree).
+**After a crash.** Only one writer edits a checkout at a time, across every roundtable on
+it, whatever its data folder: the lock and a crash marker live in the checkout's own git
+folder (`.git/roundtable/`), so they move with it if it is renamed. If roundtable dies while
+the writer works, the CLI may keep editing; on the next start in that checkout edits stay
+locked (every turn read-only) and the chat shows the marker. Check nothing is running, then
+type `/quiet`. Outside a git checkout nobody edits, and if git can't tell the checkout
+(git missing, a broken worktree, `GIT_DIR`/`GIT_WORK_TREE` set) edits stay locked.
 
 **Waiting writers.** If you change `writer` while the old one is still editing, a message
 to the new writer waits until the old one is done instead of editing alongside it.
