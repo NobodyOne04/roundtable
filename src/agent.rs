@@ -114,11 +114,15 @@ pub struct AskBridge {
     pub socket: PathBuf,
     pub caller: String,
     pub token: String,
+    /// Where the loop wrote `claude_config()` (0600, owner-only folder): the token never
+    /// appears on a command line, where `ps` would show it.
+    pub config_file: PathBuf,
 }
 
 impl AskBridge {
-    /// Claude's `--mcp-config` JSON: the roundtable server, and only it.
-    fn claude_config(&self) -> String {
+    /// Claude's `--mcp-config` JSON: the roundtable server, and only it. Written to
+    /// `config_file` by the loop; never passed inline.
+    pub fn claude_config(&self) -> String {
         json!({"mcpServers": {"roundtable": {
             "command": self.exe,
             "args": ["mcp"],
@@ -154,7 +158,7 @@ pub fn command(kind: Kind, turn: &Turn) -> (Command, Vec<u8>) {
             ]);
             let servers = turn.ask.as_ref().map_or_else(
                 || r#"{"mcpServers":{}}"#.to_string(),
-                AskBridge::claude_config,
+                |bridge| bridge.config_file.to_string_lossy().into_owned(),
             );
             if turn.writable {
                 // The writer runs with the user's own setup, but always with an explicit mode,
@@ -728,6 +732,7 @@ mod tests {
                 socket: "/data/ask.sock".into(),
                 caller: "claude".into(),
                 token: "T1".into(),
+                config_file: "/data/mcp/turn.json".into(),
             }),
         };
         let (cmd, _) = command(Kind::Claude, &turn);
@@ -737,7 +742,16 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         let config = &args[args.iter().position(|a| a == "--mcp-config").unwrap() + 1];
-        let config: Value = serde_json::from_str(config).unwrap();
+        assert_eq!(
+            config, "/data/mcp/turn.json",
+            "a path, never the token itself"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("T1")),
+            "no token on the command line"
+        );
+        let config: Value =
+            serde_json::from_str(&turn.ask.as_ref().unwrap().claude_config()).unwrap();
         let servers = config["mcpServers"].as_object().unwrap();
         assert_eq!(servers.keys().collect::<Vec<_>>(), ["roundtable"]);
         assert_eq!(servers["roundtable"]["args"][0], "mcp");

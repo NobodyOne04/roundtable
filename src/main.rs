@@ -102,6 +102,7 @@ async fn start() -> Result<()> {
         secrets: vec![],
         ask_socket: root.join("ask.sock"),
         ask_tokens: HashMap::new(),
+        ask_files: HashMap::new(),
         pending_asks: HashMap::new(),
         next_ask: 1,
         redactors: HashMap::new(),
@@ -183,6 +184,8 @@ struct Runtime {
     /// running turn that may ask (token -> caller), and the connections waiting for answers.
     ask_socket: PathBuf,
     ask_tokens: HashMap<String, String>,
+    /// Per caller: its turn's MCP config file, deleted when the turn ends.
+    ask_files: HashMap<String, PathBuf>,
     pending_asks: HashMap<u64, tokio::sync::oneshot::Sender<AskAnswer>>,
     next_ask: u64,
     /// Per participant: streamed text held back while it could still be part of a key.
@@ -432,6 +435,28 @@ impl Runtime {
         }
     }
 
+    /// A one-time token for `id`'s turn and its MCP config, written owner-only so the token
+    /// stays off command lines (ADR 0007).
+    fn ask_bridge(&mut self, id: &str) -> Result<AskBridge> {
+        let token = ulid::Ulid::generate().to_string();
+        let dir = self.data_root.join("mcp");
+        transcript::private_dir(&dir)?;
+        // The file name is not the token.
+        let config_file = dir.join(format!("{}.json", ulid::Ulid::generate()));
+        let bridge = AskBridge {
+            exe: std::env::current_exe().unwrap_or_else(|_| "roundtable".into()),
+            socket: self.ask_socket.clone(),
+            caller: id.to_string(),
+            token: token.clone(),
+            config_file,
+        };
+        transcript::write_atomic(&bridge.config_file, bridge.claude_config().as_bytes())?;
+        self.ask_tokens.insert(token, id.to_string());
+        self.ask_files
+            .insert(id.to_string(), bridge.config_file.clone());
+        Ok(bridge)
+    }
+
     fn cancel_all(&self) {
         for token in self.turns.values() {
             token.cancel();
@@ -509,6 +534,9 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             rt.turns.remove(id);
             // Its token dies with the turn: a late `ask` from it is refused.
             rt.ask_tokens.retain(|_, caller| caller != id);
+            if let Some(file) = rt.ask_files.remove(id) {
+                let _ = fs::remove_file(file);
+            }
         }
         // Writable turns refused in this batch (lock, marker or transcript), with why.
         let mut refused: Vec<(String, String)> = vec![];
@@ -543,16 +571,18 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         local.push_back(Event::Agent(id, PEvent::Done(Outcome::Failed)));
                         continue;
                     }
-                    let ask = ask_tool.then(|| {
-                        let token = ulid::Ulid::generate().to_string();
-                        rt.ask_tokens.insert(token.clone(), id.clone());
-                        AskBridge {
-                            exe: std::env::current_exe().unwrap_or_else(|_| "roundtable".into()),
-                            socket: rt.ask_socket.clone(),
-                            caller: id.clone(),
-                            token,
+                    let ask = if ask_tool {
+                        match rt.ask_bridge(&id) {
+                            Ok(bridge) => Some(bridge),
+                            Err(err) => {
+                                // Without its config file the turn just runs without `ask`.
+                                local.push_back(Event::Notice(format!("ask tool: {err:#}")));
+                                None
+                            }
                         }
-                    });
+                    } else {
+                        None
+                    };
                     let token = CancellationToken::new();
                     rt.turns.insert(id.clone(), token.clone());
                     let turn = Turn {
