@@ -119,7 +119,9 @@ For a shorter command, add `alias rt=roundtable` to your shell (with the binary 
 - The agent CLIs, installed and logged in. Tested with Claude Code 2.1.331 and
   codex-cli 0.171.0; their JSON output changes between versions, so others may misbehave.
 - Start it inside a git repo; outside one, Codex is unavailable unless you pass
-  `--outside-repo`.
+  `--outside-repo`. Codex is also unavailable in a project that has its own
+  `.codex/config.toml` (here or in a parent folder): such a config can start MCP servers
+  or run programs that a read-only turn couldn't stop.
 - One roundtable at a time; a second instance exits with "already running".
 - Planned (step 6): Ollama or LM Studio for free local models.
 

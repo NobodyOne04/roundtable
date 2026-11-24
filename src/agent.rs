@@ -372,9 +372,10 @@ pub fn preflight(kind: Kind, cwd: &std::path::Path, outside_repo: bool) -> Resul
                 "not inside a git repo: start roundtable in one, or pass --outside-repo".into(),
             );
         }
-        if let Some(path) = codex_project_mcp(cwd) {
+        if let Some(path) = codex_project_config(cwd) {
             return Err(format!(
-                "{} declares MCP servers, which read-only turns can't exclude (ADR 0004)",
+                "{} exists; a project Codex config can start MCP servers or run programs \
+                 that read-only turns can't exclude (ADR 0004)",
                 path.display()
             ));
         }
@@ -382,9 +383,10 @@ pub fn preflight(kind: Kind, cwd: &std::path::Path, outside_repo: bool) -> Resul
     Ok(version)
 }
 
-/// A project-level Codex config with MCP servers in `cwd` or any parent: `--ignore-user-config`
-/// skips only the user's own config, so such a server would run in read-only turns.
-fn codex_project_mcp(cwd: &std::path::Path) -> Option<PathBuf> {
+/// Any project-level Codex config in `cwd` or a parent. `--ignore-user-config` skips only the
+/// user's own config, and a project config can declare MCP servers, `notify` programs and
+/// more, so its mere presence fails closed instead of trusting a scan of its keys.
+fn codex_project_config(cwd: &std::path::Path) -> Option<PathBuf> {
     let user_config = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))
@@ -392,7 +394,7 @@ fn codex_project_mcp(cwd: &std::path::Path) -> Option<PathBuf> {
     cwd.ancestors()
         .map(|dir| dir.join(".codex").join("config.toml"))
         .filter(|path| Some(path) != user_config.as_ref())
-        .find(|path| std::fs::read_to_string(path).is_ok_and(|s| s.contains("mcp_servers")))
+        .find(|path| path.exists())
 }
 
 #[cfg(test)]
@@ -469,6 +471,25 @@ mod tests {
     fn unknown_and_broken_lines_are_skipped() {
         assert!(parse(Kind::Claude, r#"{"type":"brand_new_event"}"#).is_empty());
         assert!(parse(Kind::Codex, "not json").is_empty());
+    }
+
+    #[test]
+    fn any_project_codex_config_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(codex_project_config(&nested), None);
+        std::fs::create_dir_all(dir.path().join("a/.codex")).unwrap();
+        // No MCP key at all: still refused.
+        std::fs::write(
+            dir.path().join("a/.codex/config.toml"),
+            "notify = [\"x\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            codex_project_config(&nested),
+            Some(dir.path().join("a/.codex/config.toml"))
+        );
     }
 
     #[test]
@@ -570,8 +591,21 @@ mod tests {
             .trim()
             .parse()
             .unwrap();
+        // The killed tool may linger briefly as a zombie until its new parent reaps it.
+        let gone = (0..100)
+            .any(|_| !running(pid) || (std::thread::sleep(Duration::from_millis(20)), false).1);
+        assert!(gone, "the background tool outlived the cancelled turn");
+    }
+
+    /// Alive and not a zombie (`/proc` on Linux; elsewhere existence only).
+    fn running(pid: libc::pid_t) -> bool {
         // SAFETY: signal 0 only checks whether the process exists.
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
-        assert!(!alive, "the background tool outlived the cancelled turn");
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => !stat.contains(") Z "),
+            Err(_) => true,
+        }
     }
 }
