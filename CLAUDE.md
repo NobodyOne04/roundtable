@@ -25,7 +25,7 @@ Rust TUI console that runs Claude Code, Codex and OpenAI-compatible models in on
 - `AGENTS.md`: Codex context (its role here, state, pending tasks); keep "Pending for Codex" current.
 
 ## Conventions
-- Resolved API keys live only in `Runtime::secrets` and are redacted by `Runtime::record`; never log or show a key value, only its reference.
+- Resolved API keys reach the loop only as `Event::KeyResolved` (`Secret` hides its value in Debug) and live in `Runtime::secrets`. All participant output is cleaned by `Runtime::redact_output` before the app sees it, and transcript writes by `Runtime::record`; never log or show a key value, only its reference. Provider text is not logged.
 - Events the loop raises itself go into its `local` queue, never `try_send` on its own channel (a full channel would drop them).
 - Each ADR implementation PR marks its row `done` in the README roadmap and the next one `next`.
 - New CLI version: record a fresh two-turn fixture (sanitize: no paths, account or credential fields, no request ids such as `api_message_id`, `msg_…`, `uuid`, thinking `signature`), keep the old one, and update the tested versions in the README.

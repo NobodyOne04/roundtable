@@ -106,7 +106,10 @@ keeping `max_output_tokens` (default 4096) free for the reply. They never edit f
 
 API keys are never written here: use `key = "keyring:<name>"` (OS keychain, service
 `roundtable`: `security add-generic-password -s roundtable -a <name> -w` on macOS) or
-`key = "env:<VAR>"`. Keys are read for each request and redacted from the transcript; a literal key is refused, and so is a key over plain `http://` to a
+`key = "env:<VAR>"`. Keys are read for each request (shorter than 8 characters is refused)
+and removed from everything roundtable shows, logs or saves, whichever participant printed
+them. `connect_timeout_s` (default 10) and `idle_timeout_s` (default 120) tune the HTTP
+timeouts; redirects are never followed; a literal key is refused, and so is a key over plain `http://` to a
 non-local host. Changing a model's `cmd`, `base_url` or `model` makes it a new destination:
 its old session and history are not carried over.
 
