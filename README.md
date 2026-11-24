@@ -2,8 +2,8 @@
 
 A terminal console where Claude Code, Codex and free models sit at one table, and you watch them talk.
 
-> **Status: design phase.** No code yet. The architecture is drafted as ADRs in
-> [`docs/adr/`](docs/adr/README.md), all *Proposed*, none approved.
+> **Status: early build.** The architecture is decided ([`docs/adr/`](docs/adr/README.md));
+> the code so far is the skeleton: it opens an empty table and quits.
 
 ## What it is
 
@@ -85,6 +85,19 @@ allow = { claude = ["codex", "llama"], codex = [] }
 
 API keys are never written here: use `key = "keyring:<name>"` (OS keychain) or
 `key = "env:<VAR>"`.
+
+## Build and run
+
+```sh
+cargo build --release
+./target/release/roundtable          # q or Ctrl-C to quit
+```
+
+The Rust toolchain is pinned in `rust-toolchain.toml`; rustup installs it on first build.
+For a shorter command, add `alias rt=roundtable` to your shell (with the binary on your
+`PATH`). Logs go to `roundtable.log` in your data dir (macOS:
+`~/Library/Application Support/roundtable/`, Linux: `~/.local/share/roundtable/`); set
+`RUST_LOG=debug` for more.
 
 ## Requirements (planned)
 

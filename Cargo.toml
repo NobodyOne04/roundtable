@@ -1,0 +1,18 @@
+[package]
+name = "roundtable"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "A terminal console where Claude Code, Codex and free models sit at one table"
+repository = "https://github.com/NobodyOne04/roundtable"
+publish = false
+
+[dependencies]
+anyhow = "1"
+dirs = "7"
+ratatui = "0.30"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+insta = "1"

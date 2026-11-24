@@ -1,0 +1,17 @@
+name: check
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rustup reads rust-toolchain.toml and installs the pinned toolchain with rustfmt and clippy.
+      - uses: taiki-e/install-action@nextest
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo nextest run --locked
