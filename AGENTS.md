@@ -34,6 +34,7 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
 - Review the ADR 0002 PR #7 (`feature/adr-0002-event-loop`), skipped for the same reason:
   `codex review --base origin/main -c sandbox_mode="read-only"` on that branch, or
   `--commit <its squash sha>` once merged.
+- Review the ADR 0010 PR (`feature/adr-0010-transcript-files`), skipped for the same reason.
 
 ## Notes
 - ADR 0004: the owner chose a git worktree per agent for the single-writer limit

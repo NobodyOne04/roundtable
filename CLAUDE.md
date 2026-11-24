@@ -10,6 +10,8 @@ Rust TUI console that runs Claude Code, Codex and OpenAI-compatible models in on
 
 ## Layout
 - `src/main.rs`: entry point, terminal setup/teardown, the event loop and its source tasks (terminal input, tick), drawing; snapshots in `src/snapshots/`.
+- `src/lib.rs`: the library (all logic); `main.rs` only runs the terminal.
+- `src/transcript.rs`: transcript files, single-instance lock, atomic writes (ADR 0010).
 - `src/app.rs`: `App` state, `Event`, `Effect` and `App::update`, the only place state changes (ADR 0002).
 - `.github/workflows/check.yml`: CI (fmt, clippy, nextest), required check `check` on `main`.
 - `rust-toolchain.toml`: pinned toolchain.
@@ -18,6 +20,7 @@ Rust TUI console that runs Claude Code, Codex and OpenAI-compatible models in on
 - `AGENTS.md`: Codex context (its role here, state, pending tasks); keep "Pending for Codex" current.
 
 ## Conventions
+- Transcript lines are append-only: never rewrite `events.jsonl`; a status change is a new `settle`/`delivery` line. Small JSON files go through `transcript::write_atomic`.
 - State changes only in `App::update` (no I/O there); tasks send `Event`s, the loop runs `Effect`s. Never share `App` behind a lock.
 - ADR first: no code for a feature until its ADR is Accepted by the owner. Statuses live in `docs/adr/README.md`.
 - Proposals may be reviewed together in one docs PR; implementation is one ADR per PR, in the order noted in `docs/adr/README.md`, commit subjects carry `[ADR-NNNN]`.
