@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- The writer may edit (ADR 0004, 0011): only a message to the writer alone, with its `permission_mode`; after a crash edits stay locked until `/quiet` (ADR 0010)
 - Live model registry (ADR 0011): `models.toml` written on first run, edits applied while running (all or nothing), `/models`, `/model enable|disable|use`, identities bind sessions and history to a destination
 - Claude Code and Codex in the chat (ADR 0004): `@claude`, `@codex`, `@all`, streaming replies, tool lines, queue when busy, `Esc` cancels (whole process group), sessions resumed, read-only for now, preflight with versions
 - Transcript files (ADR 0010): append-only JSONL per thread, torn-line repair, atomic metadata, and only one roundtable running at a time

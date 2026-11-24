@@ -94,11 +94,15 @@ pub struct Turn {
     pub outside_repo: bool,
     /// From the registry; `None` lets the CLI pick.
     pub model: Option<String>,
+    /// The writer's own turn: may edit files (ADR 0004). Every other turn is read-only.
+    pub writable: bool,
+    /// The writer's configured mode; `None` keeps the CLI's own default. The registry
+    /// refuses bypass and full-access modes.
+    pub permission_mode: Option<String>,
 }
 
 /// The command for a turn, plus what goes on its stdin. The prompt always travels on stdin:
 /// no quoting issues, no length limit, not visible in `ps`.
-// shortcut: every turn is read-only; ADR 0011 brings the `writer` that may edit.
 pub fn command(kind: Kind, turn: &Turn) -> (Command, Vec<u8>) {
     let mut cmd = Command::new(&turn.cmd);
     cmd.current_dir(&turn.cwd);
@@ -112,16 +116,25 @@ pub fn command(kind: Kind, turn: &Turn) -> (Command, Vec<u8>) {
                 "stream-json",
                 "--include-partial-messages",
                 "--verbose",
+            ]);
+            if turn.writable {
+                // The writer runs with the user's own setup and its configured mode.
+                if let Some(mode) = &turn.permission_mode {
+                    cmd.args(["--permission-mode", mode]);
+                }
+            } else {
                 // Read-only, and without the user's MCP servers, hooks and plugins, which
                 // could write despite plan mode.
-                "--permission-mode",
-                "plan",
-                "--strict-mcp-config",
-                "--mcp-config",
-                r#"{"mcpServers":{}}"#,
-                "--setting-sources",
-                "",
-            ]);
+                cmd.args([
+                    "--permission-mode",
+                    "plan",
+                    "--strict-mcp-config",
+                    "--mcp-config",
+                    r#"{"mcpServers":{}}"#,
+                    "--setting-sources",
+                    "",
+                ]);
+            }
             if let Some(session) = &turn.session {
                 cmd.args(["--resume", session]);
             }
@@ -136,14 +149,16 @@ pub fn command(kind: Kind, turn: &Turn) -> (Command, Vec<u8>) {
             if let Some(session) = &turn.session {
                 cmd.args(["resume", session.as_str()]);
             }
-            // `--ignore-user-config` drops the user's MCP servers (auth still works); the
-            // sandbox is set through `-c` because `exec resume` has no `-s`.
-            cmd.args([
-                "--json",
-                "--ignore-user-config",
-                "-c",
-                r#"sandbox_mode="read-only""#,
-            ]);
+            cmd.arg("--json");
+            // The sandbox is set through `-c` because `exec resume` has no `-s`.
+            if turn.writable {
+                if let Some(mode) = &turn.permission_mode {
+                    cmd.args(["-c", &format!("sandbox_mode=\"{mode}\"")]);
+                }
+            } else {
+                // `--ignore-user-config` drops the user's MCP servers (auth still works).
+                cmd.args(["--ignore-user-config", "-c", r#"sandbox_mode="read-only""#]);
+            }
             if turn.outside_repo {
                 cmd.arg("--skip-git-repo-check");
             }
@@ -533,6 +548,8 @@ mod tests {
             cwd: ".".into(),
             outside_repo: false,
             model: Some("m1".into()),
+            writable: false,
+            permission_mode: Some("acceptEdits".into()),
         };
         let args = |kind| {
             let (cmd, _) = command(kind, &turn);
@@ -550,6 +567,44 @@ mod tests {
         assert!(codex.contains(r#"sandbox_mode="read-only""#));
         assert!(!codex.contains("--skip-git-repo-check"));
         assert!(codex.ends_with("-m m1 -"));
+        assert!(
+            !claude.contains("acceptEdits"),
+            "a read-only turn ignores the writer's mode"
+        );
+    }
+
+    #[test]
+    fn the_writer_turn_drops_read_only_flags_and_uses_its_mode() {
+        let mut turn = Turn {
+            cmd: "claude".into(),
+            prompt: "hi".into(),
+            session: None,
+            cwd: ".".into(),
+            outside_repo: false,
+            model: None,
+            writable: true,
+            permission_mode: Some("acceptEdits".into()),
+        };
+        let args = |kind, turn: &Turn| {
+            let (cmd, _) = command(kind, turn);
+            cmd.as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let claude = args(Kind::Claude, &turn);
+        assert!(claude.ends_with("--verbose --permission-mode acceptEdits"));
+        assert!(!claude.contains("plan") && !claude.contains("--setting-sources"));
+        turn.permission_mode = Some("workspace-write".into());
+        let codex = args(Kind::Codex, &turn);
+        assert_eq!(codex, r#"exec --json -c sandbox_mode="workspace-write" -"#);
+        turn.permission_mode = None;
+        assert_eq!(
+            args(Kind::Codex, &turn),
+            "exec --json -",
+            "the CLI's own default"
+        );
     }
 
     async fn run_fake(script: &str, cancel: CancellationToken) -> Vec<PEvent> {
