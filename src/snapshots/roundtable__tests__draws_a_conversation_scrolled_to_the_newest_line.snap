@@ -1,0 +1,14 @@
+---
+source: src/main.rs
+expression: "render(&app, 60, 10)"
+---
+"┌ roundtable ──────────────────────────────────────────────┐"
+"│you → claude, codex › review the plan                     │"
+"│claude › Two notes:                                       │"
+"│1. a …                                                    │"
+"│  ↳ codex ran cat CLAUDE.md                               │"
+"│codex › Looks fine.                                       │"
+"└──────────────────────────────────────────────────────────┘"
+"┌──────────────────────────────────────────────────────────┐"
+"│>                                                         │"
+"└ Enter send · @codex @all · Esc cancel · Ctrl-C twice quit┘"
