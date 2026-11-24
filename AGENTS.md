@@ -21,26 +21,13 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
   `## Codex review`.
 
 ## Pending for Codex
-- Review 7 of PR #1 was skipped (usage limit) and the PR is merged since. Review the
-  merged commit: `codex review --commit eeec51a -c sandbox_mode="read-only"`.
-  Report findings to Claude; Claude fixes them in a follow-up `docs/` PR.
-- Review the ADR 0004 decision change (worktree per agent), skipped for the same reason:
-  `codex review --commit 9491219 -c sandbox_mode="read-only"`.
-- Critique ADR 0010 and 0011 (`adr-critique`), skipped for the same reason; they are
-  accepted already, so report findings for the owner to decide on. Check they keep every
-  guarantee the rejected 0003 and 0006 gave, which the other accepted ADRs rely on.
-- Review the merged ADR 0001 PR #6, skipped for the same reason:
-  `codex review --commit 94ba5e6 -c sandbox_mode="read-only"`.
-- Review the ADR 0002 PR #7 (`feature/adr-0002-event-loop`), skipped for the same reason:
-  `codex review --base origin/main -c sandbox_mode="read-only"` on that branch, or
-  `--commit <its squash sha>` once merged.
-- Review the ADR 0010 PR (`feature/adr-0010-transcript-files`), skipped for the same reason.
-- Review the ADR 0004 PR (`feature/adr-0004-cli-agents`), skipped for the same reason. Also
-  record a real two-turn Codex fixture: `tests/fixtures/codex-0.171.0-turn1.jsonl` was cut
-  from one turn, and resume was never recorded.
-- Review the ADR 0011 PR (`feature/adr-0011-hot-registry`), skipped for the same reason.
-- Writer PR #13: reviewed five times on 2026-11-25; every finding fixed except the
-  owner decision below. Re-review only if the owner changes the lock design.
+- Record a real two-turn Codex fixture (first turn plus `exec resume`):
+  `tests/fixtures/codex-0.171.0-turn1.jsonl` was cut from one turn, and resume was never
+  recorded. Sanitize as CLAUDE.md says, and hand it to Claude to commit.
+
+Done 2026-11-25: a full-codebase review (every file in `src/`, against the ADRs) replaced the
+per-PR reviews that were skipped during the usage limit; its fixes are in PR #15. The
+deferred finding: events carry no `turn`/`parent` yet (ADR 0010), to be built with ADR 0007.
 
 ## Notes
 - The writer lock moved into the checkout (ADR 0012, `src/writer_lock.rs`); the transcript
