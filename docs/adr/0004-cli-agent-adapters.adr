@@ -61,7 +61,7 @@ run tools). This ADR decides how roundtable drives them.
     A test runs read-only turns, first launch and resume, with a write-capable MCP server
     and a writing hook in a throwaway user config and in a project config, and checks the
     checkout is untouched. Real filesystem isolation
-    for non-writers comes with the worktree ADR;
+    for non-writers comes with the worktree ADR (owner decision, see below);
   - the writer runs with the permission mode set in its config entry, the CLI's own
     default if unset; roundtable never passes a bypass flag;
   - a tool call the CLI refuses for lack of approval shows in the chat as a `tool_result`
@@ -73,13 +73,16 @@ run tools). This ADR decides how roundtable drives them.
 - Later: an `acp` adapter using the official `agent-client-protocol` crate, as one more
   `Participant`, once ACP v2 settles. It does not replace the JSON adapters.
 
-- **Open question for the owner: the single-writer guarantee is best effort.** CLI flags
-  cannot fully stop project-level hooks or config (also from parent directories), or
-  background processes a tool detaches into another process group, from writing to the
-  checkout. Options: (a) state the guarantee as best effort and stop here; (b) OS-level
-  containment per turn (macOS `sandbox-exec`, Linux Landlock/bubblewrap) that can confirm
-  all writers stopped; (c) a git worktree per agent so non-writers never share the
-  writer's files. (c) is planned anyway; (b) is the only full guarantee.
+- **Single-writer limit, decided by the owner 2026-11-24: git worktree per agent.** CLI
+  flags cannot fully stop project-level hooks or config (also from parent directories),
+  or background processes a tool detaches into another process group, from writing.
+  Considered: (a) accept best effort; (b) OS-level containment per turn (`sandbox-exec`,
+  Landlock/bubblewrap): the only full guarantee, but platform-specific and heavy;
+  (c) a git worktree per agent. Chosen: (c). Non-writers run in their own worktree, so
+  whatever escapes their flags writes there, never into the writer's files; the
+  writer's own leftovers stay covered by the fail-closed interlock in
+  [0003](0003-sqlite-event-log.adr). The worktree layout, sync and cleanup get their own
+  ADR before implementation; until then the read-only flags above are the safeguard.
 
 Consequences: works with today's CLIs and the user's existing subscriptions. Cost: two
 hand-written parsers to maintain against moving formats; pin and test versions.

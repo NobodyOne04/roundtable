@@ -22,9 +22,12 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
 - Review 7 of PR #1 was skipped (usage limit) and the PR is merged since. Review the
   merged commit: `codex review --commit eeec51a -c sandbox_mode="read-only"`.
   Report findings to Claude; Claude fixes them in a follow-up `docs/` PR.
+- Review the ADR 0004 decision change (worktree per agent), skipped for the same reason:
+  `codex review --commit <sha of "[ADR-0004.1]" on main> -c sandbox_mode="read-only"`.
 
 ## Notes
-- Open owner decision, ADR 0004: the single-writer guarantee is best effort (project hooks,
-  detached tools). Don't re-report it as a finding; comment on the three options instead.
+- ADR 0004: the owner chose a git worktree per agent for the single-writer limit
+  (2026-11-24); its own ADR comes later. Don't re-report project hooks or detached tools
+  as findings; review the worktree ADR when it exists.
 - Earlier passes converged on edge cases in writer recovery; the fail-closed confirm
   dialog in ADR 0003 is deliberate, not an omission.
