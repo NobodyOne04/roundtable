@@ -402,6 +402,16 @@ pub fn set_enabled(text: &str, id: &str, enabled: bool) -> Result<String, String
     Ok(doc.to_string())
 }
 
+/// Sets `[talk] enabled`, keeping comments and layout.
+pub fn set_talk_enabled(text: &str, enabled: bool) -> Result<String, String> {
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
+    if doc.get("talk").is_none() {
+        doc["talk"] = toml_edit::table();
+    }
+    doc["talk"]["enabled"] = toml_edit::value(enabled);
+    Ok(doc.to_string())
+}
+
 /// Sets the top-level `default`, keeping comments and layout.
 pub fn set_default(text: &str, id: &str) -> Result<String, String> {
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;

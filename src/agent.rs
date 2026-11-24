@@ -98,11 +98,43 @@ pub struct Turn {
     pub model: Option<String>,
     /// The writer's own turn: may edit files (ADR 0004). Every other turn is read-only.
     pub writable: bool,
+    /// Gives the turn the `ask` tool (ADR 0007): Claude only for now.
+    pub ask: Option<AskBridge>,
     /// The writer's configured mode; `None` means a safe explicit default, never whatever
     /// the user's own CLI config says (it could be bypass). The registry refuses bypass and
     /// full-access modes.
     pub permission_mode: Option<String>,
 }
+
+/// What a turn needs to reach roundtable's `ask` tool: the CLI launches `exe mcp`, which
+/// talks to `socket` as `caller`, proving it with `token` (one per turn).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AskBridge {
+    pub exe: PathBuf,
+    pub socket: PathBuf,
+    pub caller: String,
+    pub token: String,
+}
+
+impl AskBridge {
+    /// Claude's `--mcp-config` JSON: the roundtable server, and only it.
+    fn claude_config(&self) -> String {
+        json!({"mcpServers": {"roundtable": {
+            "command": self.exe,
+            "args": ["mcp"],
+            "env": {
+                crate::mcp::ENV_SOCKET: self.socket,
+                crate::mcp::ENV_CALLER: self.caller,
+                crate::mcp::ENV_TOKEN: self.token,
+            }
+        }}})
+        .to_string()
+    }
+}
+
+/// How long an `ask` may take before the CLI gives up on the tool call: the asked model
+/// may run a whole turn.
+const ASK_TIMEOUT_MS: &str = "900000";
 
 /// The command for a turn, plus what goes on its stdin. The prompt always travels on stdin:
 /// no quoting issues, no length limit, not visible in `ps`.
@@ -120,23 +152,36 @@ pub fn command(kind: Kind, turn: &Turn) -> (Command, Vec<u8>) {
                 "--include-partial-messages",
                 "--verbose",
             ]);
+            let servers = turn.ask.as_ref().map_or_else(
+                || r#"{"mcpServers":{}}"#.to_string(),
+                AskBridge::claude_config,
+            );
             if turn.writable {
                 // The writer runs with the user's own setup, but always with an explicit mode,
                 // so a bypass default in the user's settings can't apply.
                 let mode = turn.permission_mode.as_deref().unwrap_or("default");
                 cmd.args(["--permission-mode", mode]);
+                if turn.ask.is_some() {
+                    cmd.args(["--mcp-config", &servers]);
+                }
             } else {
                 // Read-only, and without the user's MCP servers, hooks and plugins, which
-                // could write despite plan mode.
+                // could write despite plan mode: only roundtable's own server, if any.
                 cmd.args([
                     "--permission-mode",
                     "plan",
                     "--strict-mcp-config",
                     "--mcp-config",
-                    r#"{"mcpServers":{}}"#,
+                    &servers,
                     "--setting-sources",
                     "",
                 ]);
+            }
+            if turn.ask.is_some() {
+                // Registering a server doesn't let a headless turn call it: grant exactly
+                // this tool; who may ask whom is the router's decision (ADR 0007).
+                cmd.args(["--allowedTools", "mcp__roundtable__ask"]);
+                cmd.env("MCP_TOOL_TIMEOUT", ASK_TIMEOUT_MS);
             }
             if let Some(session) = &turn.session {
                 cmd.args(["--resume", session]);
@@ -607,6 +652,7 @@ mod tests {
             model: Some("m1".into()),
             writable: false,
             permission_mode: Some("acceptEdits".into()),
+            ask: None,
         };
         let args = |kind| {
             let (cmd, _) = command(kind, &turn);
@@ -641,6 +687,7 @@ mod tests {
             model: None,
             writable: true,
             permission_mode: Some("acceptEdits".into()),
+            ask: None,
         };
         let args = |kind, turn: &Turn| {
             let (cmd, _) = command(kind, turn);
@@ -663,6 +710,44 @@ mod tests {
             "unset never falls back to the user's own config"
         );
         assert!(args(Kind::Claude, &turn).ends_with("--permission-mode default"));
+    }
+
+    #[test]
+    fn a_caller_gets_only_the_roundtable_server_and_only_the_ask_tool() {
+        let turn = Turn {
+            cmd: "claude".into(),
+            prompt: "hi".into(),
+            session: None,
+            cwd: ".".into(),
+            outside_repo: false,
+            model: None,
+            writable: false,
+            permission_mode: None,
+            ask: Some(AskBridge {
+                exe: "/bin/roundtable".into(),
+                socket: "/data/ask.sock".into(),
+                caller: "claude".into(),
+                token: "T1".into(),
+            }),
+        };
+        let (cmd, _) = command(Kind::Claude, &turn);
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let config = &args[args.iter().position(|a| a == "--mcp-config").unwrap() + 1];
+        let config: Value = serde_json::from_str(config).unwrap();
+        let servers = config["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.keys().collect::<Vec<_>>(), ["roundtable"]);
+        assert_eq!(servers["roundtable"]["args"][0], "mcp");
+        assert_eq!(servers["roundtable"]["env"][crate::mcp::ENV_TOKEN], "T1");
+        assert!(
+            args.contains(&"--strict-mcp-config".into()),
+            "still read-only isolation"
+        );
+        let allowed = &args[args.iter().position(|a| a == "--allowedTools").unwrap() + 1];
+        assert_eq!(allowed, "mcp__roundtable__ask");
     }
 
     async fn run_fake(script: &str, cancel: CancellationToken) -> Vec<PEvent> {

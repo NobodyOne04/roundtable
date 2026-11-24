@@ -24,6 +24,20 @@ pub enum Event {
     InputClosed(String),
     /// Output of a running turn of participant `id`.
     Agent(String, PEvent),
+    /// A participant called `ask` (ADR 0007); the loop has checked its token, so `caller`
+    /// is genuine. Answered with `Effect::Answer`.
+    Asked {
+        ask: u64,
+        caller: String,
+        to: String,
+        prompt: String,
+    },
+    /// A connection on roundtable's socket asking on behalf of `request.caller`. Handled by
+    /// the loop (it checks the token first), never by `update`.
+    AskIncoming {
+        request: crate::mcp::AskRequest,
+        reply: Responder,
+    },
     /// A chat turn resolved its API key: the loop adds it to the transcript redaction list.
     /// Handled by the loop, never by `update`.
     KeyResolved {
@@ -56,6 +70,15 @@ pub enum EditLock {
     OutsideGit,
 }
 
+/// Where an `ask`'s answer goes: the waiting `roundtable mcp` connection.
+pub struct Responder(pub tokio::sync::oneshot::Sender<crate::mcp::AskAnswer>);
+
+impl std::fmt::Debug for Responder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Responder")
+    }
+}
+
 /// A secret value whose `Debug` never shows it, so no event dump can leak a key.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(pub String);
@@ -69,8 +92,13 @@ impl std::fmt::Debug for Secret {
 /// A change to `models.toml` asked for by a command; the loop writes it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileEdit {
-    Enabled { id: String, enabled: bool },
+    Enabled {
+        id: String,
+        enabled: bool,
+    },
     Default(String),
+    /// `[talk] enabled`, the global switch for model-to-model talk.
+    Talk(bool),
 }
 
 /// What `update` asks the loop to do. The loop executes these; results come back as `Event`s.
@@ -102,6 +130,8 @@ pub enum Effect {
         /// The writer's own turn, which may edit files (ADR 0004).
         writable: bool,
         permission_mode: Option<String>,
+        /// Give this turn the `ask` tool (ADR 0007); the loop builds the bridge.
+        ask_tool: bool,
     },
     /// Cancel the running turn of one participant.
     CancelTurn(String),
@@ -119,6 +149,12 @@ pub enum Effect {
         session: String,
     },
     EditRegistry(FileEdit),
+    /// The answer to an `ask`, back to the calling model as its tool result.
+    Answer {
+        ask: u64,
+        text: String,
+        refused: bool,
+    },
     /// The user confirmed the checkout is quiet: remove the crash marker with this key
     /// (ADR 0012).
     ConfirmQuiet(String),
@@ -126,6 +162,8 @@ pub enum Effect {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
+    /// One participant asking another (ADR 0007): shown inline, with the prompt.
+    Handoff,
     User,
     Reply(Outcome),
     Streaming,
@@ -149,7 +187,12 @@ struct Seat {
     session: Option<String>,
     /// Direct messages waiting while busy (ADR 0007: queued, not dropped), each with
     /// whether it may edit.
-    queue: VecDeque<(String, bool)>,
+    queue: VecDeque<(String, bool, u64)>,
+    /// The user message the running turn descends from: limits count per origin.
+    origin: u64,
+    /// The `ask` this turn answers, and who asked.
+    answering: Option<u64>,
+    asked_by: Option<String>,
     /// The running turn may edit; its reply then ends the writer marker.
     writable: bool,
     /// The front of `queue` is an edit waiting for another writer to finish (ADR 0004: one
@@ -186,6 +229,11 @@ pub struct App {
     edit_lock: Option<EditLock>,
     /// Quitting: running turns are being cancelled and nothing new may start.
     quitting: bool,
+    /// The global talk switch (`[talk] enabled`, `/talk on|off`).
+    talk_on: bool,
+    /// Per user message: model-to-model turns started and tokens they used (ADR 0007).
+    origins: BTreeMap<u64, (u32, u64)>,
+    next_origin: u64,
     /// First Ctrl-C arms, the second quits.
     quit_armed: bool,
 }
@@ -215,6 +263,9 @@ impl App {
             seats: vec![],
             edit_lock: None,
             quitting: false,
+            talk_on: true,
+            origins: BTreeMap::new(),
+            next_origin: 1,
             quit_armed: false,
         };
         app.apply_registry(registry, checks, false);
@@ -284,12 +335,19 @@ impl App {
             | Event::Resize
             | Event::Tick
             | Event::RegistryFileChanged
-            | Event::KeyResolved { .. } => vec![],
+            | Event::KeyResolved { .. }
+            | Event::AskIncoming { .. } => vec![],
             Event::InputClosed(reason) => {
                 tracing::error!(%reason, "terminal input closed");
                 self.quit()
             }
             Event::Agent(id, event) => self.agent_event(&id, event),
+            Event::Asked {
+                ask,
+                caller,
+                to,
+                prompt,
+            } => self.asked(ask, caller, to, prompt),
             Event::Registry(Ok((registry, checks))) => self.apply_registry(registry, checks, true),
             Event::Registry(Err(why)) => {
                 self.push(
@@ -399,8 +457,10 @@ impl App {
             transcript::Kind::Msg,
             json!({ "text": prompt }),
         )];
+        let origin = self.next_origin;
+        self.next_origin += 1;
         for id in targets {
-            effects.extend(self.deliver(&id, prompt.clone(), writable));
+            effects.extend(self.deliver(&id, prompt.clone(), writable, origin));
         }
         effects
     }
@@ -417,6 +477,14 @@ impl App {
             ["/model", "enable", id] => self.set_enabled(id, true),
             ["/model", "disable", id] => self.set_enabled(id, false),
             ["/model", "use", id] => self.use_default(id),
+            ["/talk", state @ ("on" | "off")] => {
+                let on = *state == "on";
+                self.talk_on = on;
+                self.registry.talk.enabled = on;
+                let note = format!("talk between models is {state}");
+                self.push("roundtable", note.clone(), LineKind::Info);
+                vec![status(note), Effect::EditRegistry(FileEdit::Talk(on))]
+            }
             ["/quiet"] => match &self.edit_lock {
                 // Lifted only when `QuietDone` confirms the marker is gone from disk.
                 Some(EditLock::Crashed { key, .. }) => vec![Effect::ConfirmQuiet(key.clone())],
@@ -434,7 +502,8 @@ impl App {
             _ => {
                 self.push(
                     "roundtable",
-                    "commands so far: /models, /model enable|disable|use <id>, /quiet".into(),
+                    "commands so far: /models, /model enable|disable|use <id>, /talk on|off, /quiet"
+                        .into(),
                     LineKind::Error,
                 );
                 vec![]
@@ -580,6 +649,9 @@ impl App {
                     busy: false,
                     session: None,
                     queue: VecDeque::new(),
+                    origin: 0,
+                    answering: None,
+                    asked_by: None,
                     writable: false,
                     held: false,
                     reply: None,
@@ -591,6 +663,8 @@ impl App {
             }
         }
         let warnings = next.warnings.clone();
+        // The file is the truth for the talk switch too.
+        self.talk_on = next.talk.enabled;
         self.registry = next;
         self.checks = checks;
         if announce {
@@ -676,7 +750,7 @@ impl App {
         Ok((targets, prompt.into(), mentions > 1))
     }
 
-    fn deliver(&mut self, id: &str, prompt: String, writable: bool) -> Vec<Effect> {
+    fn deliver(&mut self, id: &str, prompt: String, writable: bool, origin: u64) -> Vec<Effect> {
         let participant = self.registry.get(id).expect("routed ids exist").clone();
         if !participant.enabled {
             self.push("roundtable", format!("`{id}` is disabled"), LineKind::Error);
@@ -692,14 +766,20 @@ impl App {
         }
         let seat = self.seat_mut(id).expect("every participant has a seat");
         if seat.busy || seat.held {
-            seat.queue.push_back((prompt, writable));
+            seat.queue.push_back((prompt, writable, origin));
             self.push("roundtable", format!("queued for {id}"), LineKind::Info);
             return vec![];
         }
-        self.start(&participant, prompt, writable)
+        self.start(&participant, prompt, writable, origin)
     }
 
-    fn start(&mut self, p: &Participant, prompt: String, writable: bool) -> Vec<Effect> {
+    fn start(
+        &mut self,
+        p: &Participant,
+        prompt: String,
+        writable: bool,
+        origin: u64,
+    ) -> Vec<Effect> {
         // Only a cli writer edits; the registry never makes an openai model the writer.
         let writable = writable && matches!(p.adapter, Adapter::Cli(_));
         // One writable turn per checkout (ADR 0004): if the writer changed while the old one
@@ -709,7 +789,7 @@ impl App {
         }
         if writable && self.seats.iter().any(|s| s.busy && s.writable) {
             let seat = self.seat_mut(&p.id).expect("seat");
-            seat.queue.push_front((prompt, true));
+            seat.queue.push_front((prompt, true, origin));
             seat.held = true;
             self.push(
                 "roundtable",
@@ -728,6 +808,9 @@ impl App {
         seat.busy = true;
         seat.writable = writable;
         seat.turn_identity = Some(p.identity.clone());
+        seat.origin = origin;
+        seat.answering = None;
+        seat.asked_by = None;
         seat.reply = Some(index);
         seat.usage = None;
         seat.prompt = Some(prompt.clone());
@@ -787,6 +870,7 @@ impl App {
                 session,
                 writable,
                 permission_mode: p.permission_mode.clone(),
+                ask_tool: self.may_ask(&p.id, kind),
             },
         ]
     }
@@ -929,9 +1013,14 @@ impl App {
             // Copies only if a turn still shares it; normally the runner is done with it.
             std::sync::Arc::make_mut(&mut seat.history).push((prompt, text.clone()));
         }
+        let asker = self
+            .seats
+            .iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.asked_by.clone());
         let mut reply = record(
             party,
-            vec![user()],
+            vec![asker.map_or_else(user, |a| self.party(&a))],
             transcript::Kind::Msg,
             // `writable` here closes the writer marker of the delivery (ADR 0010).
             json!({
@@ -951,13 +1040,14 @@ impl App {
             event.tokens_out = Some(tokens_out);
         }
         let mut effects = vec![reply];
+        effects.extend(self.end_ask(id, outcome, &text, usage.map(|u| u.0 + u.1)));
         let next = self.seat_mut(id).and_then(|s| s.queue.pop_front());
-        if let Some((prompt, writable)) = next
+        if let Some((prompt, writable, origin)) = next
             && let Some(p) = self.registry.get(id).cloned()
         {
             // Rechecked: the writer or the lock may have changed while it waited.
             let writable = writable && self.registry.writer() == Some(id) && !self.locked();
-            effects.extend(self.start(&p, prompt, writable));
+            effects.extend(self.start(&p, prompt, writable, origin));
         }
         if writable {
             effects.extend(self.release_held());
@@ -978,7 +1068,7 @@ impl App {
         for id in held {
             let seat = self.seat_mut(&id).expect("seat");
             seat.held = false;
-            let Some((prompt, writable)) = seat.queue.pop_front() else {
+            let Some((prompt, writable, origin)) = seat.queue.pop_front() else {
                 continue;
             };
             let Some(p) = self.registry.get(&id).cloned() else {
@@ -986,7 +1076,149 @@ impl App {
             };
             let writable =
                 writable && self.registry.writer() == Some(id.as_str()) && !self.locked();
-            effects.extend(self.start(&p, prompt, writable));
+            effects.extend(self.start(&p, prompt, writable, origin));
+        }
+        effects
+    }
+
+    /// Whether `id` gets the `ask` tool for its next turn: talk is on, the policy lets it
+    /// ask someone, and its CLI supports it (Claude; Codex can be asked, not ask, until its
+    /// MCP approval settings are verified).
+    fn may_ask(&self, id: &str, kind: agent::Kind) -> bool {
+        self.talk_on
+            && kind == agent::Kind::Claude
+            && self
+                .registry
+                .talk
+                .allow
+                .get(id)
+                .is_some_and(|targets| !targets.is_empty())
+    }
+
+    /// A participant asked another (ADR 0007). The checks run in the ADR's order; any
+    /// refusal is logged and answered at once, so the caller can carry on.
+    fn asked(&mut self, ask: u64, caller: String, to: String, prompt: String) -> Vec<Effect> {
+        let origin = self
+            .seats
+            .iter()
+            .find(|s| s.id == caller && s.busy)
+            .map(|s| s.origin);
+        let talk = self.registry.talk.clone();
+        let target = self.registry.get(&to).cloned();
+        let refusal = if self.quitting {
+            Some("roundtable is quitting".to_string())
+        } else if !self.talk_on {
+            Some("talk between models is off".into())
+        } else if origin.is_none() {
+            Some(format!("{caller} has no running turn"))
+        } else if to == caller {
+            Some("a model can't ask itself".into())
+        } else if let Some(why) = match &target {
+            None => Some(format!("no one called {to}")),
+            Some(p) if !p.enabled => Some(format!("{to} is disabled")),
+            Some(p) => self
+                .availability(p)
+                .err()
+                .map(|w| format!("{to} is unavailable: {w}")),
+        } {
+            Some(why)
+        } else if !talk.allow.get(&caller).is_some_and(|t| t.contains(&to)) {
+            Some(format!("the talk policy doesn't let {caller} ask {to}"))
+        } else if self.seats.iter().any(|s| s.id == to && (s.busy || s.held)) {
+            // One active turn per session: waiting would deadlock A -> B -> A.
+            Some(format!("busy: {to} is answering something else"))
+        } else {
+            let (turns, tokens) = *self.origins.get(&origin.unwrap_or(0)).unwrap_or(&(0, 0));
+            if turns >= talk.max_turns {
+                Some(format!(
+                    "turn limit reached ({} model-to-model turns per message)",
+                    talk.max_turns
+                ))
+            } else if tokens >= talk.budget_tokens {
+                Some(format!(
+                    "token budget used up ({} per message)",
+                    talk.budget_tokens
+                ))
+            } else {
+                None
+            }
+        };
+        let (from_party, to_party) = (self.party(&caller), self.party(&to));
+        let handoff = |status: &str, reason: Option<&str>| {
+            record(
+                from_party.clone(),
+                vec![to_party.clone()],
+                transcript::Kind::Handoff,
+                json!({ "ask": ask, "prompt": prompt, "status": status, "reason": reason, "origin": origin }),
+            )
+            .durable()
+        };
+        if let Some(why) = refusal {
+            let effects = vec![
+                handoff("blocked", Some(&why)),
+                Effect::Answer {
+                    ask,
+                    text: format!("blocked: {why}"),
+                    refused: true,
+                },
+            ];
+            self.push(
+                &format!("{caller} → {to}"),
+                format!("blocked: {why}"),
+                LineKind::Info,
+            );
+            return effects;
+        }
+        let origin = origin.unwrap_or(0);
+        self.origins.entry(origin).or_default().0 += 1;
+        let mut effects = vec![handoff("sent", None)];
+        self.push(
+            &format!("{caller} → {to}"),
+            prompt.clone(),
+            LineKind::Handoff,
+        );
+        let target = target.expect("checked above");
+        // An asked turn never writes, whoever it is (ADR 0004).
+        effects.extend(self.start(&target, prompt, false, origin));
+        if let Some(seat) = self.seat_mut(&to) {
+            seat.answering = Some(ask);
+            seat.asked_by = Some(caller.clone());
+        }
+        if let Some(i) = self.seats.iter().find(|s| s.id == to).and_then(|s| s.reply) {
+            self.lines[i].who = format!("{to} → {caller}");
+        }
+        effects
+    }
+
+    /// A turn ended: if it answered an `ask`, send the answer; cancel what it asked that is
+    /// still running (its chain dies with it); count its tokens against its message.
+    fn end_ask(
+        &mut self,
+        id: &str,
+        outcome: Outcome,
+        text: &str,
+        tokens: Option<u64>,
+    ) -> Vec<Effect> {
+        let mut effects = vec![];
+        let (origin, answering) = match self.seat_mut(id) {
+            Some(seat) => (seat.origin, seat.answering.take()),
+            None => return effects,
+        };
+        if let Some(tokens) = tokens {
+            self.origins.entry(origin).or_default().1 += tokens;
+        }
+        if let Some(ask) = answering {
+            let (text, refused) = match outcome {
+                Outcome::Complete => (text.to_string(), false),
+                Outcome::Interrupted => (format!("interrupted; partial answer: {text}"), true),
+                Outcome::Failed => (format!("failed; partial answer: {text}"), true),
+            };
+            effects.push(Effect::Answer { ask, text, refused });
+        }
+        for seat in &mut self.seats {
+            if seat.busy && seat.asked_by.as_deref() == Some(id) {
+                effects.push(Effect::CancelTurn(seat.id.clone()));
+            }
         }
         effects
     }
@@ -1817,5 +2049,177 @@ mod tests {
             panic!()
         };
         assert_eq!(event.payload["usage_estimated"], true);
+    }
+
+    fn ask(app: &mut App, ask: u64, caller: &str, to: &str) -> Vec<Effect> {
+        app.update(Event::Asked {
+            ask,
+            caller: caller.into(),
+            to: to.into(),
+            prompt: format!("question {ask}"),
+        })
+    }
+
+    fn answer(effects: &[Effect]) -> Option<(u64, String, bool)> {
+        effects.iter().find_map(|e| match e {
+            Effect::Answer { ask, text, refused } => Some((*ask, text.clone(), *refused)),
+            _ => None,
+        })
+    }
+
+    fn ask_tool(effects: &[Effect]) -> Option<bool> {
+        effects.iter().find_map(|e| match e {
+            Effect::StartTurn { ask_tool, .. } => Some(*ask_tool),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn claude_asks_codex_and_gets_its_answer() {
+        let mut app = App::default();
+        let effects = type_line(&mut app, "@claude review with codex");
+        assert_eq!(
+            ask_tool(&effects),
+            Some(true),
+            "the default policy lets claude ask codex"
+        );
+        let effects = ask(&mut app, 1, "claude", "codex");
+        assert_eq!(
+            writable(&effects),
+            [("codex".into(), false)],
+            "an asked turn never writes"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Record { event, .. }
+            if event.kind == transcript::Kind::Handoff && event.payload["status"] == "sent"))
+        );
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| l.who == "claude → codex" && l.kind == LineKind::Handoff)
+        );
+        app.update(agent("codex", PEvent::Message("looks fine".into())));
+        let effects = app.update(agent("codex", PEvent::Done(Outcome::Complete)));
+        assert_eq!(answer(&effects), Some((1, "looks fine".into(), false)));
+        let Effect::Record { event, .. } = &effects[0] else {
+            panic!()
+        };
+        assert_eq!(event.to[0].id, "claude", "the reply goes to the asker");
+        assert!(app.lines.iter().any(|l| l.who == "codex → claude"));
+    }
+
+    #[test]
+    fn every_refusal_is_answered_and_logged() {
+        let refused = |app: &mut App, caller: &str, to: &str| {
+            let effects = ask(app, 9, caller, to);
+            assert!(
+                started(&effects).is_empty(),
+                "{caller} -> {to} started a turn"
+            );
+            let (_, text, refused) = answer(&effects).expect("answered at once");
+            assert!(refused);
+            assert!(effects.iter().any(|e| matches!(e, Effect::Record { event, .. }
+                if event.kind == transcript::Kind::Handoff && event.payload["status"] == "blocked")));
+            text
+        };
+        let mut app = App::default();
+        type_line(&mut app, "@claude go");
+        assert!(refused(&mut app, "codex", "claude").contains("no running turn"));
+        type_line(&mut app, "@codex go");
+        assert!(refused(&mut app, "codex", "claude").contains("talk policy"));
+        assert!(refused(&mut app, "claude", "claude").contains("itself"));
+        assert!(refused(&mut app, "claude", "ghost").contains("no one called ghost"));
+        assert!(
+            refused(&mut app, "claude", "codex").contains("busy"),
+            "codex is mid-turn"
+        );
+
+        let mut app = App::default();
+        type_line(&mut app, "@claude go");
+        type_line(&mut app, "/model disable codex");
+        assert!(refused(&mut app, "claude", "codex").contains("disabled"));
+
+        let mut app = App::default();
+        type_line(&mut app, "@claude go");
+        type_line(&mut app, "/talk off");
+        assert!(refused(&mut app, "claude", "codex").contains("off"));
+    }
+
+    #[test]
+    fn limits_count_per_user_message() {
+        let file = DEFAULT_FILE.replace("max_turns = 6", "max_turns = 2");
+        let mut app = App::default();
+        reload(&mut app, &file);
+        type_line(&mut app, "@claude go");
+        for n in 1..=2 {
+            assert_eq!(started(&ask(&mut app, n, "claude", "codex")), ["codex"]);
+            app.update(agent("codex", PEvent::Done(Outcome::Complete)));
+        }
+        let (_, text, _) = answer(&ask(&mut app, 3, "claude", "codex")).unwrap();
+        assert!(text.contains("turn limit"), "{text}");
+        // A new message starts a fresh allowance.
+        app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        type_line(&mut app, "@claude again");
+        assert_eq!(started(&ask(&mut app, 4, "claude", "codex")), ["codex"]);
+
+        let file = DEFAULT_FILE.replace("budget_tokens = 50000", "budget_tokens = 100");
+        let mut app = App::default();
+        reload(&mut app, &file);
+        type_line(&mut app, "@claude go");
+        ask(&mut app, 1, "claude", "codex");
+        app.update(agent(
+            "codex",
+            PEvent::Usage {
+                input: 90,
+                output: 20,
+                cost_usd: None,
+                estimated: false,
+            },
+        ));
+        app.update(agent("codex", PEvent::Done(Outcome::Complete)));
+        let (_, text, _) = answer(&ask(&mut app, 2, "claude", "codex")).unwrap();
+        assert!(text.contains("budget"), "{text}");
+    }
+
+    #[test]
+    fn esc_and_a_finished_caller_end_the_chain() {
+        let mut app = App::default();
+        type_line(&mut app, "@claude go");
+        ask(&mut app, 1, "claude", "codex");
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        let (_, text, refused) =
+            answer(&app.update(agent("codex", PEvent::Done(Outcome::Interrupted)))).unwrap();
+        assert!(refused && text.starts_with("interrupted"));
+
+        let mut app = App::default();
+        type_line(&mut app, "@claude go");
+        ask(&mut app, 1, "claude", "codex");
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        assert!(
+            effects.contains(&Effect::CancelTurn("codex".into())),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn who_gets_the_ask_tool() {
+        let mut app = App::default();
+        assert_eq!(
+            ask_tool(&type_line(&mut app, "@codex hi")),
+            Some(false),
+            "codex may ask no one"
+        );
+        let effects = type_line(&mut app, "/talk off");
+        assert!(effects.contains(&Effect::EditRegistry(FileEdit::Talk(false))));
+        assert_eq!(
+            ask_tool(&type_line(&mut app, "@claude hi")),
+            Some(false),
+            "talk is off"
+        );
+        type_line(&mut app, "/talk on");
+        app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        assert_eq!(ask_tool(&type_line(&mut app, "@claude hi")), Some(true));
     }
 }

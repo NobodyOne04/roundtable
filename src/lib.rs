@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod app;
+pub mod mcp;
 pub mod openai;
 pub mod registry;
 pub mod transcript;

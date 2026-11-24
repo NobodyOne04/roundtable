@@ -23,8 +23,9 @@ use tracing_subscriber::EnvFilter;
 
 use notify_debouncer_mini::notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, DebouncedEventBatch, new_debouncer};
-use roundtable::agent::{self, Outcome, PEvent, Turn};
+use roundtable::agent::{self, AskBridge, Outcome, PEvent, Turn};
 use roundtable::app::{App, ChatLine, Checks, EditLock, Effect, Event, FileEdit, LineKind};
+use roundtable::mcp::{self, AskAnswer};
 use roundtable::openai;
 use roundtable::registry::{self, Adapter, Registry};
 use roundtable::transcript::{self, NewEvent, Store, Thread};
@@ -43,8 +44,20 @@ const USAGE: &str = "usage: roundtable [--outside-repo]
 
   --outside-repo   let Codex run outside a git repo (it refuses by default)";
 
+fn main() -> ExitCode {
+    // `roundtable mcp` is the `ask` tool's server, launched by an agent CLI: plain stdio, no
+    // terminal, no data lock (the running roundtable holds it).
+    if std::env::args().nth(1).as_deref() == Some("mcp") {
+        return match mcp::serve() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
+    tui_main()
+}
+
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn tui_main() -> ExitCode {
     match start().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -87,6 +100,10 @@ async fn start() -> Result<()> {
         writers: HashMap::new(),
         data_root: root.clone(),
         secrets: vec![],
+        ask_socket: root.join("ask.sock"),
+        ask_tokens: HashMap::new(),
+        pending_asks: HashMap::new(),
+        next_ask: 1,
         redactors: HashMap::new(),
         cwd,
         outside_repo,
@@ -162,6 +179,12 @@ struct Runtime {
     /// Resolved API keys with their references, redacted from everything shown or written
     /// (ADR 0010). Values only ever live in memory.
     secrets: Vec<(String, String)>,
+    /// `ask` (ADR 0007): the socket `roundtable mcp` connects to, the one-time token of each
+    /// running turn that may ask (token -> caller), and the connections waiting for answers.
+    ask_socket: PathBuf,
+    ask_tokens: HashMap<String, String>,
+    pending_asks: HashMap<u64, tokio::sync::oneshot::Sender<AskAnswer>>,
+    next_ask: u64,
     /// Per participant: streamed text held back while it could still be part of a key.
     redactors: HashMap<String, transcript::StreamRedactor>,
     outside_repo: bool,
@@ -266,6 +289,7 @@ impl Runtime {
         let text = match edit {
             FileEdit::Enabled { id, enabled } => registry::set_enabled(&text, id, *enabled),
             FileEdit::Default(id) => registry::set_default(&text, id),
+            FileEdit::Talk(on) => registry::set_talk_enabled(&text, *on),
         }
         .map_err(|e| format!("{e} (fix models.toml; the change applies in this session only)"))?;
         transcript::write_atomic(&self.models_path, text.as_bytes()).map_err(|e| e.to_string())?;
@@ -421,6 +445,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
     tokio::spawn(tick(tx.clone()));
     // Held for the whole run: dropping it stops the watch.
     let _watcher = watch_registry(&rt.models_path, tx.clone())?;
+    listen_for_asks(&rt.ask_socket, tx.clone())?;
 
     let mut quit_by: Option<tokio::time::Instant> = None;
     // Events the loop raises itself: handled before the channel, never dropped (a full
@@ -447,6 +472,25 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                 Some(result) => Event::Registry(result),
                 None => continue,
             },
+            Event::AskIncoming { request, reply } => {
+                // Only a live turn's own token may ask, as itself.
+                if rt.ask_tokens.get(&request.token) != Some(&request.caller) {
+                    let _ = reply.0.send(AskAnswer {
+                        text: "blocked: not a running roundtable turn".into(),
+                        refused: true,
+                    });
+                    continue;
+                }
+                let ask = rt.next_ask;
+                rt.next_ask += 1;
+                rt.pending_asks.insert(ask, reply.0);
+                Event::Asked {
+                    ask,
+                    caller: request.caller,
+                    to: request.to,
+                    prompt: request.prompt,
+                }
+            }
             Event::KeyResolved { reference, value } => {
                 if !rt.secrets.iter().any(|(v, _)| *v == value.0) {
                     rt.secrets.push((value.0, reference));
@@ -463,6 +507,8 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
         };
         if let Event::Agent(id, PEvent::Done(_)) = &event {
             rt.turns.remove(id);
+            // Its token dies with the turn: a late `ask` from it is refused.
+            rt.ask_tokens.retain(|_, caller| caller != id);
         }
         // Writable turns refused in this batch (lock, marker or transcript), with why.
         let mut refused: Vec<(String, String)> = vec![];
@@ -487,6 +533,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     session,
                     writable,
                     permission_mode,
+                    ask_tool,
                 } => {
                     if writable && let Some((_, why)) = refused.iter().find(|(r, _)| *r == id) {
                         // Fail closed (ADR 0012): an editable turn never starts without its
@@ -496,6 +543,16 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         local.push_back(Event::Agent(id, PEvent::Done(Outcome::Failed)));
                         continue;
                     }
+                    let ask = ask_tool.then(|| {
+                        let token = ulid::Ulid::generate().to_string();
+                        rt.ask_tokens.insert(token.clone(), id.clone());
+                        AskBridge {
+                            exe: std::env::current_exe().unwrap_or_else(|_| "roundtable".into()),
+                            socket: rt.ask_socket.clone(),
+                            caller: id.clone(),
+                            token,
+                        }
+                    });
                     let token = CancellationToken::new();
                     rt.turns.insert(id.clone(), token.clone());
                     let turn = Turn {
@@ -507,6 +564,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         model,
                         writable,
                         permission_mode,
+                        ask,
                     };
                     tokio::spawn(agent::run(id, kind, turn, tx.clone(), token));
                 }
@@ -547,6 +605,11 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     }
                 }
                 Effect::CancelTurns => rt.cancel_all(),
+                Effect::Answer { ask, text, refused } => {
+                    if let Some(reply) = rt.pending_asks.remove(&ask) {
+                        let _ = reply.send(AskAnswer { text, refused });
+                    }
+                }
                 Effect::ConfirmQuiet(marker) => {
                     let result = rt.confirm_quiet(&marker, &mut local);
                     local.push_back(result);
@@ -633,6 +696,55 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             return Ok(());
         }
     }
+}
+
+/// The socket `roundtable mcp` connects to (ADR 0007), in the owner-only data folder. Each
+/// connection carries one `ask` and waits for its answer.
+fn listen_for_asks(path: &Path, tx: mpsc::Sender<Event>) -> Result<()> {
+    // We hold the data lock, so a leftover socket file is from a dead run.
+    let _ = fs::remove_file(path);
+    let listener = tokio::net::UnixListener::bind(path)
+        .with_context(|| format!("listening on {}", path.display()))?;
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+                let (read, mut write) = stream.into_split();
+                let mut line = String::new();
+                // One request line, bounded: nothing else is spoken here.
+                let mut reader = BufReader::new(read.take(1024 * 1024));
+                if reader.read_line(&mut line).await.is_err() {
+                    return;
+                }
+                let answer = match serde_json::from_str::<mcp::AskRequest>(&line) {
+                    Ok(request) => {
+                        let (send, recv) = tokio::sync::oneshot::channel();
+                        let event = Event::AskIncoming {
+                            request,
+                            reply: roundtable::app::Responder(send),
+                        };
+                        if tx.send(event).await.is_err() {
+                            return;
+                        }
+                        recv.await.unwrap_or(AskAnswer {
+                            text: "blocked: roundtable is shutting down".into(),
+                            refused: true,
+                        })
+                    }
+                    Err(_) => AskAnswer {
+                        text: "blocked: malformed request".into(),
+                        refused: true,
+                    },
+                };
+                if let Ok(mut bytes) = serde_json::to_vec(&answer) {
+                    bytes.push(b'\n');
+                    let _ = write.write_all(&bytes).await;
+                }
+            });
+        }
+    });
+    Ok(())
 }
 
 /// Watches the folder of `models.toml` (editors save by rename, so the file itself can't be
