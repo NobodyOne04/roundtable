@@ -1,43 +1,88 @@
 //! roundtable: one terminal chat for Claude Code, Codex and other models.
-//! The stack and terminal rules are ADR 0001.
+//! Stack and terminal rules: ADR 0001. Event loop: ADR 0002.
+
+mod app;
 
 use std::fs::{self, OpenOptions};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event as TermEvent, EventStream};
+use futures_util::StreamExt;
 use ratatui::layout::Alignment;
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
+use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
-fn main() -> Result<()> {
+use app::{App, Effect, Event};
+
+/// Bounded so a flood of events slows its senders instead of growing memory (ADR 0002).
+const CHANNEL_CAPACITY: usize = 1024;
+/// ~30 fps redraw cap.
+const TICK: Duration = Duration::from_millis(33);
+
+#[tokio::main]
+async fn main() -> Result<()> {
     init_logging()?;
     // Enters raw mode and the alternate screen, and installs a panic hook that restores the
     // terminal first, so a crash never leaves the user's shell broken.
     let terminal = ratatui::init();
-    let result = run(terminal);
+    let result = run(terminal).await;
     ratatui::restore();
     result
 }
 
-// shortcut: blocking key reads, no async loop yet; ADR 0002 replaces this with the event loop.
-fn run(mut terminal: DefaultTerminal) -> Result<()> {
-    loop {
-        terminal.draw(draw)?;
-        if let Event::Key(key) = event::read()?
-            && is_quit(key)
-        {
-            tracing::info!("quit");
-            return Ok(());
+async fn run(mut terminal: DefaultTerminal) -> Result<()> {
+    let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+    tokio::spawn(read_terminal(tx.clone()));
+    tokio::spawn(tick(tx));
+
+    let mut app = App::default();
+    while let Some(event) = rx.recv().await {
+        for effect in app.update(event) {
+            match effect {
+                Effect::Redraw => {
+                    terminal.draw(draw)?;
+                }
+                Effect::Quit => {
+                    tracing::info!("quit");
+                    return Ok(());
+                }
+            }
         }
     }
+    Ok(())
 }
 
-fn is_quit(key: KeyEvent) -> bool {
-    key.kind == KeyEventKind::Press
-        && (key.code == KeyCode::Char('q')
-            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)))
+/// Keyboard and resize events from the terminal.
+async fn read_terminal(tx: mpsc::Sender<Event>) {
+    let mut input = EventStream::new();
+    let reason = loop {
+        let event = match input.next().await {
+            Some(Ok(TermEvent::Key(key))) => Event::Key(key),
+            Some(Ok(TermEvent::Resize(..))) => Event::Resize,
+            Some(Ok(_)) => continue,
+            Some(Err(err)) => break err.to_string(),
+            None => break "end of input".to_string(),
+        };
+        if tx.send(event).await.is_err() {
+            return; // the loop is gone: the app is exiting
+        }
+    };
+    let _ = tx.send(Event::InputClosed(reason)).await;
+}
+
+async fn tick(tx: mpsc::Sender<Event>) {
+    let mut interval = tokio::time::interval(TICK);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        if tx.send(Event::Tick).await.is_err() {
+            return;
+        }
+    }
 }
 
 fn draw(frame: &mut Frame) {
@@ -78,14 +123,5 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 7)).unwrap();
         terminal.draw(draw).unwrap();
         insta::assert_snapshot!(terminal.backend());
-    }
-
-    #[test]
-    fn quits_on_q_and_ctrl_c_only() {
-        let key = |code, mods| KeyEvent::new(code, mods);
-        assert!(is_quit(key(KeyCode::Char('q'), KeyModifiers::NONE)));
-        assert!(is_quit(key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
-        assert!(!is_quit(key(KeyCode::Char('c'), KeyModifiers::NONE)));
-        assert!(!is_quit(key(KeyCode::Esc, KeyModifiers::NONE)));
     }
 }
