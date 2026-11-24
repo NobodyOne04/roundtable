@@ -63,12 +63,13 @@ async fn start() -> Result<()> {
     let cwd = std::env::current_dir().context("reading the current directory")?;
 
     let models_path = config_root()?.join("models.toml");
+    let checkout = checkout_root(&cwd);
     let mut runtime = Runtime {
         store,
         thread: None,
         sessions: BTreeMap::new(),
         turns: HashMap::new(),
-        checkout: checkout_root(&cwd),
+        checkout: checkout.clone().unwrap_or_else(|_| cwd.clone()),
         cwd,
         outside_repo,
         models_path,
@@ -97,6 +98,9 @@ async fn start() -> Result<()> {
         .writer_locks(&runtime.checkout)
         .context("checking for unfinished writer turns")?;
     app.lock_edits(locks);
+    if let Err(why) = checkout {
+        app.lock_unknown_checkout(&why);
+    }
     if let Some(why) = load_error {
         app.note(
             format!("{} not applied: {why}", runtime.models_path.display()),
@@ -252,8 +256,11 @@ impl Runtime {
         let mut settled = vec![];
         let mut failed = vec![];
         for id in threads {
-            match self.settle_writer(id) {
-                Ok(()) => settled.push(id.clone()),
+            match self.store.settle_writer(id) {
+                Ok(()) => {
+                    tracing::info!(thread = %id, "writer turn settled after /quiet");
+                    settled.push(id.clone());
+                }
                 Err(err) => {
                     tracing::error!(thread = %id, %err, "settling the writer turn failed");
                     failed.push((id.clone(), format!("{err:#}")));
@@ -261,28 +268,6 @@ impl Runtime {
             }
         }
         Event::QuietDone { settled, failed }
-    }
-
-    fn settle_writer(&mut self, id: &str) -> Result<()> {
-        {
-            let mut thread = self.store.open_thread(id)?;
-            let settle = NewEvent {
-                turn: None,
-                parent: None,
-                from: transcript::Party {
-                    id: "user".into(),
-                    identity: None,
-                },
-                to: vec![],
-                kind: transcript::Kind::Settle,
-                payload: serde_json::json!({ "writable": true, "status": "interrupted" }),
-                tokens_in: None,
-                tokens_out: None,
-            };
-            thread.append(settle, true)?;
-            tracing::info!(thread = %id, "writer turn settled after /quiet");
-        }
-        Ok(())
     }
 
     fn cancel_all(&self) {
@@ -561,18 +546,28 @@ fn chat_lines(line: &ChatLine) -> Vec<Line<'static>> {
     out
 }
 
-/// The git worktree root around `cwd`, or `cwd` itself outside git (or without git).
-fn checkout_root(cwd: &Path) -> PathBuf {
-    std::process::Command::new("git")
+/// The git worktree root around `cwd`, or `cwd` itself when git says it isn't a repository.
+/// Any other failure (no git, a repo git refuses to read) is an error: falling back to
+/// `cwd` would make the writer lock narrower than the checkout.
+fn checkout_root(cwd: &Path) -> Result<PathBuf, String> {
+    let output = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(cwd)
+        // English messages, so "not a git repository" is recognised whatever the locale.
+        .env("LC_ALL", "C")
         .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map_err(|e| format!("running git: {e}"))?;
+    if output.status.success() {
+        let root = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
         // Only Git's line terminator: a repo name may itself end in spaces.
-        .map(|root| PathBuf::from(root.strip_suffix('\n').unwrap_or(&root)))
-        .unwrap_or_else(|| cwd.to_path_buf())
+        return Ok(PathBuf::from(root.strip_suffix('\n').unwrap_or(&root)));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("not a git repository") {
+        Ok(cwd.to_path_buf())
+    } else {
+        Err(stderr.trim().to_string())
+    }
 }
 
 /// `<config_dir>/roundtable`: `models.toml` (ADR 0011). Same folder as the data on macOS.
@@ -635,10 +630,13 @@ mod tests {
             .status()
             .unwrap();
         assert!(ok.success());
-        let root = checkout_root(&repo.join("src")).canonicalize().unwrap();
+        let root = checkout_root(&repo.join("src"))
+            .unwrap()
+            .canonicalize()
+            .unwrap();
         assert_eq!(root, repo.canonicalize().unwrap(), "trailing space kept");
         let outside = tempfile::tempdir().unwrap();
-        assert_eq!(checkout_root(outside.path()), outside.path());
+        assert_eq!(checkout_root(outside.path()).unwrap(), outside.path());
     }
 
     #[test]

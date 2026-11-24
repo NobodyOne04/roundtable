@@ -223,12 +223,26 @@ impl App {
         }
     }
 
+    /// Git couldn't name the checkout root, so a crashed writer elsewhere in the checkout
+    /// could be missed: fail closed.
+    pub fn lock_unknown_checkout(&mut self, why: &str) {
+        self.unreadable.push(("checkout".into(), why.into()));
+        self.push(
+            "roundtable",
+            format!(
+                "edits are locked: git can't tell this checkout's root ({why}), so a writer \
+                 that crashed elsewhere in it could be missed. Fix git, then restart."
+            ),
+            LineKind::Error,
+        );
+    }
+
     /// How to lift the lock, for messages: `/quiet` can't fix unreadable history.
     fn unlock_hint(&self) -> &'static str {
         if self.unreadable.is_empty() {
             "until /quiet"
         } else {
-            "until the unreadable thread is repaired or moved"
+            "until the problem shown above is fixed and roundtable restarted"
         }
     }
 
@@ -1484,7 +1498,7 @@ mod tests {
         );
         assert!(
             app.lines.iter().any(|l| l.text
-                == "read-only: edits are locked until the unreadable thread is repaired or moved"),
+                == "read-only: edits are locked until the problem shown above is fixed and roundtable restarted"),
             "the hint names the real way out"
         );
     }
@@ -1503,6 +1517,17 @@ mod tests {
             },
         ]);
         assert!(last_text(&app).contains("never finished in /outer and /outer/nested"));
+    }
+
+    #[test]
+    fn an_unknown_checkout_locks_edits() {
+        let mut app = App::default();
+        app.lock_unknown_checkout("fatal: detected dubious ownership");
+        assert!(last_text(&app).starts_with("edits are locked: git can't tell"));
+        assert_eq!(
+            writable(&type_line(&mut app, "fix")),
+            [("claude".into(), false)]
+        );
     }
 
     #[test]

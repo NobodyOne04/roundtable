@@ -196,13 +196,23 @@ impl Store {
         let mut locks = vec![];
         for entry in fs::read_dir(self.root.join("threads"))? {
             let dir = entry?.path();
-            if !dir.is_dir() {
-                continue;
-            }
             let id = dir
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            // `is_dir()` would also say no when the lookup fails; only a confirmed
+            // non-folder is skipped.
+            match fs::metadata(&dir) {
+                Ok(m) if !m.is_dir() => continue,
+                Ok(_) => {}
+                Err(e) => {
+                    locks.push(Lock::Unreadable {
+                        id,
+                        why: format!("folder: {e}"),
+                    });
+                    continue;
+                }
+            }
             let unreadable = |why: String| Lock::Unreadable {
                 id: id.clone(),
                 why,
@@ -232,6 +242,31 @@ impl Store {
         }
         locks.sort_by(|a, b| a.id().cmp(b.id()));
         Ok(locks)
+    }
+
+    /// Closes thread `id`'s unfinished writer turn with a durable `settle` (ADR 0010), after
+    /// the user confirmed the checkout is quiet. Never recreates a missing transcript: that
+    /// would "settle" a history that no longer exists.
+    pub fn settle_writer(&self, id: &str) -> Result<()> {
+        if !self.thread_dir(id).join("events.jsonl").is_file() {
+            return Err(Error::NoThread(format!("{id} (events.jsonl is missing)")));
+        }
+        let mut thread = self.open_thread(id)?;
+        let settle = NewEvent {
+            turn: None,
+            parent: None,
+            from: Party {
+                id: "user".into(),
+                identity: None,
+            },
+            to: vec![],
+            kind: Kind::Settle,
+            payload: serde_json::json!({ "writable": true, "status": "interrupted" }),
+            tokens_in: None,
+            tokens_out: None,
+        };
+        thread.append(settle, true)?;
+        Ok(())
     }
 
     /// All threads, newest first. A folder without a readable `meta.json` is skipped.
@@ -378,10 +413,12 @@ fn writer_open_in(path: &Path) -> std::result::Result<bool, String> {
             return Ok(open);
         }
         number += 1;
-        let complete = line.ends_with(b"\n");
+        if !line.ends_with(b"\n") {
+            // Torn last line, even if it parses: reopening truncates it, so it never happened.
+            return Ok(open);
+        }
         match serde_json::from_slice::<EventLine>(&line) {
             Ok(event) => open = writer_step(open, &event),
-            Err(_) if !complete => return Ok(open), // torn last line
             Err(e) => return Err(format!("events.jsonl line {number}: {e}")),
         }
     }
@@ -604,6 +641,17 @@ mod tests {
             "torn last line is fine"
         );
 
+        // An open delivery, then a complete but unterminated reply: torn, so still open,
+        // exactly as reopening would see it.
+        let open = r#"{"seq":1,"ts":1,"from":{"id":"router"},"kind":"delivery","payload":{"writable":true}}"#;
+        let reply =
+            r#"{"seq":2,"ts":1,"from":{"id":"claude"},"kind":"msg","payload":{"writable":true}}"#;
+        fs::write(&events, format!("{good}{open}\n{reply}")).unwrap();
+        assert!(matches!(
+            &store.writer_locks(dir.path()).unwrap()[..],
+            [Lock::Open { .. }]
+        ));
+
         fs::write(&events, format!("not json\n{good}")).unwrap();
         let locks = store.writer_locks(dir.path()).unwrap();
         assert!(matches!(&locks[..], [Lock::Unreadable { why, .. }] if why.contains("line 1")));
@@ -613,6 +661,11 @@ mod tests {
             &store.writer_locks(dir.path()).unwrap()[..],
             [Lock::Unreadable { .. }]
         ));
+        assert!(
+            store.settle_writer(&thread.meta.id).is_err(),
+            "settling never recreates a missing transcript"
+        );
+        assert!(!events.exists());
 
         fs::write(tdir.join("meta.json"), "{").unwrap();
         let other = tempfile::tempdir().unwrap();
