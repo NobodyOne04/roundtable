@@ -305,6 +305,8 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
         if let Event::Agent(id, PEvent::Done(_)) = &event {
             rt.turns.remove(id);
         }
+        // Writable turns whose writer marker failed to reach the disk in this batch.
+        let mut unmarked: Vec<String> = vec![];
         for effect in app.update(event) {
             match effect {
                 Effect::Redraw => {
@@ -327,6 +329,14 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     writable,
                     permission_mode,
                 } => {
+                    if writable && unmarked.contains(&id) {
+                        // Fail closed (ADR 0010): an editable turn never starts unrecorded,
+                        // or a crash during it would leave no lock behind.
+                        let why = "not started: the writer marker could not be written".into();
+                        let _ = tx.try_send(Event::Agent(id.clone(), PEvent::Error(why)));
+                        let _ = tx.try_send(Event::Agent(id, PEvent::Done(Outcome::Failed)));
+                        continue;
+                    }
                     let token = CancellationToken::new();
                     rt.turns.insert(id.clone(), token.clone());
                     let turn = Turn {
@@ -360,7 +370,12 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     }
                 }
                 Effect::Record { event, durable } => {
+                    let marker = (event.kind == transcript::Kind::Delivery
+                        && event.payload["writable"] == true)
+                        .then(|| event.to.first().map(|p| p.id.clone()))
+                        .flatten();
                     if let Err(err) = rt.record(event, durable) {
+                        unmarked.extend(marker);
                         tracing::error!(%err, "transcript write failed");
                         let _ = tx.try_send(Event::Notice(format!("transcript: {err:#}")));
                     }

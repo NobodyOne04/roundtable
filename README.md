@@ -118,8 +118,8 @@ cancels running replies.
 **Who may edit.** Only the `writer` from `models.toml` (default `claude`), and only when a
 message goes to it alone: the chat shows `you → claude (may edit)`. It runs with your own
 setup and the `permission_mode` you give it (`acceptEdits` lets Claude edit without asking;
-unset keeps the CLI's own default: Claude then refuses edits it can't ask about, Codex
-uses the sandbox from your own Codex config). Everyone else, and the
+unset means a safe explicit default, never what your own CLI config says: Claude
+`default`, which refuses edits it can't ask about, and Codex `workspace-write`). Everyone else, and the
 writer itself when reached through `@all` or several mentions, is read-only: plan mode for
 Claude, the read-only sandbox for Codex, both without your own MCP servers, hooks and
 plugins.
