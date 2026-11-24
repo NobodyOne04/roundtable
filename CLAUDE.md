@@ -8,6 +8,7 @@ None yet: no code. Planned (ADR 0001): `cargo build`, `cargo nextest run`, `carg
 ## Layout
 - `docs/adr/`: architecture decisions (`NNNN-title.adr`), index and statuses in `docs/adr/README.md`.
 - `README.md`: user-facing overview, config preview, roadmap.
+- `AGENTS.md`: Codex context (its role here, state, pending tasks); keep "Pending for Codex" current.
 
 ## Conventions
 - ADR first: no code for a feature until its ADR is Accepted by the owner. All of 0001-0009 are Proposed.
