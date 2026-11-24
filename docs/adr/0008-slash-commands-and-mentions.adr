@@ -1,6 +1,6 @@
 # 0008. Slash commands and @mentions
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-24
 
 The console should feel like Claude Code: type to chat, `/` for commands, `@` to address.

@@ -1,6 +1,8 @@
 # 0006. Model registry in TOML, enable/disable, keys in the OS keychain
 
-- Status: Proposed
+- Status: Rejected (owner, 2026-11-24): the registry must live in memory and change hot,
+  without restart, with the file only as its persisted copy. Replaced by
+  [0011](0011-hot-model-registry.adr).
 - Date: 2026-11-24
 
 Participants come and go: new free models, a model the owner wants silenced. This ADR

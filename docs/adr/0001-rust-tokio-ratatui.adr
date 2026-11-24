@@ -1,6 +1,6 @@
 # 0001. Rust, tokio and ratatui as the stack
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-24
 
 roundtable is a terminal app that streams several agents at once. This ADR picks the

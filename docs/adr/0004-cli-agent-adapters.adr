@@ -1,6 +1,6 @@
 # 0004. CLI agents through their JSON streaming modes, ACP later
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-24
 
 Claude Code and Codex are the main participants and they do the real work (edit files,

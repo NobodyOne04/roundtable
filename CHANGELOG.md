@@ -5,6 +5,8 @@
 ### Added
 - Proposed ADRs 0001-0009 (stack, event loop, event log, adapters, model registry, model-to-model talk, commands, layout) and the README
 - AGENTS.md: Codex context with its role, state and pending review
+- Proposed ADR 0010 (JSONL files as the transcript) and 0011 (hot in-memory model registry)
 
 ### Changed
+- ADRs 0001, 0002, 0004, 0005, 0007, 0008, 0009 accepted; 0003 (SQLite) and 0006 (registry) rejected
 - ADR 0004: single-writer limit decided, git worktree per agent

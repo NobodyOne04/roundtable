@@ -1,6 +1,6 @@
 # 0009. Three-pane layout: threads, conversation, context
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-24
 
 The user must see the conversation and each participant's state at once. This ADR fixes

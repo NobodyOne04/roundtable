@@ -35,13 +35,15 @@ the reply, and the tokens it cost.
 - Slash commands like Claude Code: `/help`, `/usage`, `/context`, `/status`, `/models`,
   `/model enable|disable|use|test`, `/talk on|off|allow|deny|show`, `/budget`, `/turns`,
   `/resume`, `/clear`. Full list: [ADR 0008](docs/adr/0008-slash-commands-and-mentions.adr).
-- Add any free model with a few lines of config, no rebuild.
+- Add any free model with a few lines of config, no rebuild, no restart: the registry is
+  hot, so edits to the file or `/model …` commands apply at once.
 - Disable a model at any time: it stops receiving messages, keeps its history.
 - Model-to-model talk with a policy matrix (who may ask whom), turn and token limits, and
   a global off switch.
 - One writer per checkout: only the `writer` agent edits files, one turn at a time; everyone else is read-only.
   Read-only turns also run without your own MCP servers and hooks, which could write.
-- Every message, handoff and blocked call is kept in a local SQLite log: replay, resume,
+- Every message, handoff and blocked call is kept as plain JSONL files, one folder per
+  thread (`tail -f` it to watch live): replay, resume,
   usage per model.
 
 ## Config preview
@@ -92,7 +94,8 @@ API keys are never written here: use `key = "keyring:<name>"` (OS keychain) or
 
 ## Privacy
 
-Prompts and replies are stored locally in `roundtable.db` in your data dir, because the
+Prompts and replies are stored locally as JSONL files under `roundtable/threads/` in your
+data dir, because the
 transcript is the product. Configured API keys are redacted before anything is written;
 secrets you paste into the chat yourself are not detected. Content goes only to the
 participants you address **and** to those they are allowed to `ask` under `[talk]`, which
@@ -100,7 +103,7 @@ may be hosted models. `/talk off` stops all indirect delivery.
 
 ## Stack
 
-Rust, tokio, ratatui, SQLite (bundled), MCP for the `ask` tool. Why each:
+Rust, tokio, ratatui, plain JSONL files for the transcript, MCP for the `ask` tool. Why each:
 [`docs/adr/`](docs/adr/README.md).
 
 ## Roadmap
