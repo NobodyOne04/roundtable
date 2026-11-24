@@ -3,4 +3,5 @@
 
 pub mod agent;
 pub mod app;
+pub mod registry;
 pub mod transcript;

@@ -84,19 +84,23 @@ impl Outcome {
 /// One turn for one agent.
 #[derive(Debug, Clone)]
 pub struct Turn {
+    /// The CLI to run, as configured (a name on `PATH` or a full path).
+    pub cmd: String,
     pub prompt: String,
     /// Native session to resume; `None` starts a new one.
     pub session: Option<String>,
     pub cwd: PathBuf,
     /// The user confirmed running Codex outside a git repo (`--outside-repo`).
     pub outside_repo: bool,
+    /// From the registry; `None` lets the CLI pick.
+    pub model: Option<String>,
 }
 
 /// The command for a turn, plus what goes on its stdin. The prompt always travels on stdin:
 /// no quoting issues, no length limit, not visible in `ps`.
 // shortcut: every turn is read-only; ADR 0011 brings the `writer` that may edit.
 pub fn command(kind: Kind, turn: &Turn) -> (Command, Vec<u8>) {
-    let mut cmd = Command::new(kind.cmd());
+    let mut cmd = Command::new(&turn.cmd);
     cmd.current_dir(&turn.cwd);
     match kind {
         Kind::Claude => {
@@ -121,6 +125,9 @@ pub fn command(kind: Kind, turn: &Turn) -> (Command, Vec<u8>) {
             if let Some(session) = &turn.session {
                 cmd.args(["--resume", session]);
             }
+            if let Some(model) = &turn.model {
+                cmd.args(["--model", model]);
+            }
             let line = json!({"type": "user", "message": {"role": "user", "content": turn.prompt}});
             (cmd, format!("{line}\n").into_bytes())
         }
@@ -139,6 +146,9 @@ pub fn command(kind: Kind, turn: &Turn) -> (Command, Vec<u8>) {
             ]);
             if turn.outside_repo {
                 cmd.arg("--skip-git-repo-check");
+            }
+            if let Some(model) = &turn.model {
+                cmd.args(["-m", model]);
             }
             cmd.arg("-");
             (cmd, turn.prompt.clone().into_bytes())
@@ -252,14 +262,22 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Runs one turn of `kind` and reports through `tx`. Ends with exactly one `Done`.
-pub async fn run(kind: Kind, turn: Turn, tx: mpsc::Sender<Event>, cancel: CancellationToken) {
+/// Runs one turn of participant `id` (a `kind` CLI) and reports through `tx` under that id.
+/// Ends with exactly one `Done`.
+pub async fn run(
+    id: String,
+    kind: Kind,
+    turn: Turn,
+    tx: mpsc::Sender<Event>,
+    cancel: CancellationToken,
+) {
     let (cmd, input) = command(kind, &turn);
-    run_command(kind, cmd, input, tx, cancel).await;
+    run_command(id, kind, cmd, input, tx, cancel).await;
 }
 
 /// The runner, separate from `command` so tests can drive it with a fake CLI.
 pub async fn run_command(
+    id: String,
     kind: Kind,
     mut cmd: Command,
     input: Vec<u8>,
@@ -268,9 +286,10 @@ pub async fn run_command(
 ) {
     let emit = |event| {
         let tx = tx.clone();
+        let id = id.clone();
         async move {
             // The loop is gone only when the app is exiting; nothing left to report to.
-            let _ = tx.send(Event::Agent(kind, event)).await;
+            let _ = tx.send(Event::Agent(id, event)).await;
         }
     };
     cmd.stdin(Stdio::piped())
@@ -355,11 +374,16 @@ fn signal_group(pgid: Option<u32>, signal: libc::c_int) {
 }
 
 /// Startup check of one agent: its CLI version, or why it can't take turns.
-pub fn preflight(kind: Kind, cwd: &std::path::Path, outside_repo: bool) -> Result<String, String> {
-    let output = std::process::Command::new(kind.cmd())
+pub fn preflight(
+    kind: Kind,
+    cmd: &str,
+    cwd: &std::path::Path,
+    outside_repo: bool,
+) -> Result<String, String> {
+    let output = std::process::Command::new(cmd)
         .arg("--version")
         .output()
-        .map_err(|err| format!("`{}` not found: {err}", kind.cmd()))?;
+        .map_err(|err| format!("`{cmd}` not found: {err}"))?;
     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if kind == Kind::Codex {
         let in_repo = std::process::Command::new("git")
@@ -503,10 +527,12 @@ mod tests {
     #[test]
     fn commands_are_read_only_and_resume() {
         let turn = Turn {
+            cmd: "claude".into(),
             prompt: "hi".into(),
             session: Some("S1".into()),
             cwd: ".".into(),
             outside_repo: false,
+            model: Some("m1".into()),
         };
         let args = |kind| {
             let (cmd, _) = command(kind, &turn);
@@ -518,11 +544,12 @@ mod tests {
         };
         let claude = args(Kind::Claude);
         assert!(claude.contains("--permission-mode plan --strict-mcp-config"));
-        assert!(claude.ends_with("--resume S1"));
+        assert!(claude.ends_with("--resume S1 --model m1"));
         let codex = args(Kind::Codex);
         assert!(codex.starts_with("exec resume S1 --json --ignore-user-config"));
         assert!(codex.contains(r#"sandbox_mode="read-only""#));
         assert!(!codex.contains("--skip-git-repo-check"));
+        assert!(codex.ends_with("-m m1 -"));
     }
 
     async fn run_fake(script: &str, cancel: CancellationToken) -> Vec<PEvent> {
@@ -530,6 +557,7 @@ mod tests {
         cmd.args(["-c", script]);
         let (tx, mut rx) = mpsc::channel(64);
         tokio::spawn(run_command(
+            "codex".into(),
             Kind::Codex,
             cmd,
             b"prompt".to_vec(),
