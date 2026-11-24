@@ -570,7 +570,8 @@ fn checkout_root(cwd: &Path) -> PathBuf {
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|root| PathBuf::from(root.trim()))
+        // Only Git's line terminator: a repo name may itself end in spaces.
+        .map(|root| PathBuf::from(root.strip_suffix('\n').unwrap_or(&root)))
         .unwrap_or_else(|| cwd.to_path_buf())
 }
 
@@ -621,6 +622,23 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
         terminal.backend().clone()
+    }
+
+    #[test]
+    fn checkout_root_is_the_git_root_with_its_exact_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo ");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let root = checkout_root(&repo.join("src")).canonicalize().unwrap();
+        assert_eq!(root, repo.canonicalize().unwrap(), "trailing space kept");
+        let outside = tempfile::tempdir().unwrap();
+        assert_eq!(checkout_root(outside.path()), outside.path());
     }
 
     #[test]

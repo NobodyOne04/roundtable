@@ -110,6 +110,10 @@ struct Seat {
     queue: VecDeque<(String, bool)>,
     /// The running turn may edit; its reply then ends the writer marker.
     writable: bool,
+    /// The front of `queue` is an edit waiting for another writer to finish (ADR 0004: one
+    /// writable turn at a time). The seat counts as occupied, so later messages queue
+    /// behind the edit instead of overtaking it.
+    held: bool,
     /// Index of the reply being streamed in `lines`.
     reply: Option<usize>,
     usage: (u64, u64, Option<f64>),
@@ -129,8 +133,8 @@ pub struct App {
     /// Threads whose history can't be read: writer state unknown, so edits stay locked
     /// until the folder is moved away (fail closed, ADR 0010).
     unreadable: Vec<(String, String)>,
-    /// A writable turn waiting for another writer to finish (ADR 0004: one at a time).
-    waiting_writer: Option<(String, String)>,
+    /// Quitting: running turns are being cancelled and nothing new may start.
+    quitting: bool,
     /// First Ctrl-C arms, the second quits.
     quit_armed: bool,
 }
@@ -160,7 +164,7 @@ impl App {
             seats: vec![],
             edits_locked: vec![],
             unreadable: vec![],
-            waiting_writer: None,
+            quitting: false,
             quit_armed: false,
         };
         app.apply_registry(registry, checks, false);
@@ -228,7 +232,7 @@ impl App {
             Event::Key(_) | Event::Resize | Event::Tick | Event::RegistryFileChanged => vec![],
             Event::InputClosed(reason) => {
                 tracing::error!(%reason, "terminal input closed");
-                vec![Effect::Quit]
+                self.quit()
             }
             Event::Agent(id, event) => self.agent_event(&id, event),
             Event::Registry(Ok((registry, checks))) => self.apply_registry(registry, checks, true),
@@ -268,7 +272,7 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             if self.quit_armed {
-                return vec![Effect::Quit];
+                return self.quit();
             }
             self.quit_armed = true;
             self.push("roundtable", "Ctrl-C again to quit".into(), LineKind::Info);
@@ -276,7 +280,7 @@ impl App {
         }
         self.quit_armed = false;
         match key.code {
-            KeyCode::Char('d') if ctrl && self.input.is_empty() => vec![Effect::Quit],
+            KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit(),
             KeyCode::Char(c) if !ctrl => {
                 self.input.push(c);
                 vec![]
@@ -289,6 +293,17 @@ impl App {
             KeyCode::Esc => self.cancel_all(),
             _ => vec![],
         }
+    }
+
+    /// From here on nothing new starts: queued and waiting work is dropped while the loop
+    /// cancels what runs.
+    fn quit(&mut self) -> Vec<Effect> {
+        self.quitting = true;
+        for seat in &mut self.seats {
+            seat.queue.clear();
+            seat.held = false;
+        }
+        vec![Effect::Quit]
     }
 
     fn submit(&mut self) -> Vec<Effect> {
@@ -508,6 +523,7 @@ impl App {
                     session: None,
                     queue: VecDeque::new(),
                     writable: false,
+                    held: false,
                     reply: None,
                     usage: (0, 0, None),
                 });
@@ -534,11 +550,8 @@ impl App {
             return vec![];
         };
         seat.queue.clear();
-        let busy = seat.busy;
-        if self.waiting_writer.as_ref().is_some_and(|(w, _)| w == id) {
-            self.waiting_writer = None;
-        }
-        if busy {
+        seat.held = false;
+        if seat.busy {
             vec![Effect::CancelTurn(id.into())]
         } else {
             vec![]
@@ -616,7 +629,7 @@ impl App {
             return vec![];
         }
         let seat = self.seat_mut(id).expect("every participant has a seat");
-        if seat.busy {
+        if seat.busy || seat.held {
             seat.queue.push_back((prompt, writable));
             self.push("roundtable", format!("queued for {id}"), LineKind::Info);
             return vec![];
@@ -630,16 +643,13 @@ impl App {
         };
         // One writable turn per checkout (ADR 0004): if the writer changed while the old one
         // is still editing, the new turn waits until it is done.
+        if self.quitting {
+            return vec![];
+        }
         if writable && self.seats.iter().any(|s| s.busy && s.writable) {
-            match &self.waiting_writer {
-                None => self.waiting_writer = Some((p.id.clone(), prompt)),
-                // Already one waiting for this seat: the rest queue behind it.
-                Some(_) => self
-                    .seat_mut(&p.id)
-                    .expect("seat")
-                    .queue
-                    .push_back((prompt, true)),
-            }
+            let seat = self.seat_mut(&p.id).expect("seat");
+            seat.queue.push_front((prompt, true));
+            seat.held = true;
             self.push(
                 "roundtable",
                 format!("{}: waiting, another writer is still editing", p.id),
@@ -685,6 +695,7 @@ impl App {
         let mut any = false;
         for seat in &mut self.seats {
             seat.queue.clear();
+            seat.held = false;
             any |= seat.busy;
         }
         if any {
@@ -810,17 +821,34 @@ impl App {
             let writable = writable && self.registry.writer() == Some(id) && !self.locked();
             effects.extend(self.start(&p, prompt, writable));
         }
-        if writable
-            && let Some((waiting, prompt)) = self.waiting_writer.take()
-            && let Some(p) = self.registry.get(&waiting).cloned()
-        {
-            let writable = self.registry.writer() == Some(waiting.as_str()) && !self.locked();
-            if self.seat_mut(&waiting).is_some_and(|s| s.busy) {
-                let seat = self.seat_mut(&waiting).expect("seat");
-                seat.queue.push_front((prompt, writable));
-            } else {
-                effects.extend(self.start(&p, prompt, writable));
-            }
+        if writable {
+            effects.extend(self.release_held());
+        }
+        effects
+    }
+
+    /// A writer finished: every held seat gets its turn again. The first one that is still
+    /// the writer starts editing; any other one is held again by `start`'s own check.
+    fn release_held(&mut self) -> Vec<Effect> {
+        let held: Vec<String> = self
+            .seats
+            .iter()
+            .filter(|s| s.held && !s.busy)
+            .map(|s| s.id.clone())
+            .collect();
+        let mut effects = vec![];
+        for id in held {
+            let seat = self.seat_mut(&id).expect("seat");
+            seat.held = false;
+            let Some((prompt, writable)) = seat.queue.pop_front() else {
+                continue;
+            };
+            let Some(p) = self.registry.get(&id).cloned() else {
+                continue;
+            };
+            let writable =
+                writable && self.registry.writer() == Some(id.as_str()) && !self.locked();
+            effects.extend(self.start(&p, prompt, writable));
         }
         effects
     }
@@ -1329,6 +1357,73 @@ mod tests {
             writable(&effects),
             [("codex".into(), true)],
             "the waiting writer starts, still writable"
+        );
+    }
+
+    /// Claude is editing; then the writer becomes `new` and `@new edit` waits.
+    fn waiting_edit(new: &str, extra: &str) -> App {
+        let file = format!("{DEFAULT_FILE}{extra}");
+        let mut app = App::default();
+        reload(&mut app, &file);
+        type_line(&mut app, "claude edits");
+        reload(
+            &mut app,
+            &file.replace("writer = \"claude\"", &format!("writer = \"{new}\"")),
+        );
+        assert!(started(&type_line(&mut app, &format!("@{new} edit"))).is_empty());
+        app
+    }
+
+    #[test]
+    fn esc_and_quit_discard_a_waiting_edit() {
+        let mut app = waiting_edit("codex", "");
+        assert_eq!(
+            app.update(key(KeyCode::Esc, KeyModifiers::NONE)),
+            [Effect::CancelTurns]
+        );
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Interrupted)));
+        assert!(started(&effects).is_empty(), "Esc dropped the waiting edit");
+
+        let mut app = waiting_edit("codex", "");
+        app.update(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Interrupted)));
+        assert!(
+            started(&effects).is_empty(),
+            "nothing starts while quitting"
+        );
+    }
+
+    #[test]
+    fn every_waiting_seat_gets_its_turn() {
+        let third = "\n[[model]]\nid = \"claude2\"\nkind = \"cli\"\ncmd = \"claude\"\n";
+        let mut app = waiting_edit("codex", third);
+        // The writer moves on again to claude2, which also asks to edit.
+        let file =
+            format!("{DEFAULT_FILE}{third}").replace("writer = \"claude\"", "writer = \"claude2\"");
+        reload(&mut app, &file);
+        assert!(started(&type_line(&mut app, "@claude2 edit")).is_empty());
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        assert_eq!(
+            writable(&effects),
+            [("codex".into(), false), ("claude2".into(), true)],
+            "codex is no longer the writer; claude2 edits"
+        );
+    }
+
+    #[test]
+    fn a_waiting_edit_keeps_its_place_in_line() {
+        let mut app = waiting_edit("codex", "");
+        let effects = type_line(&mut app, "@all status?");
+        assert!(
+            started(&effects).is_empty(),
+            "both seats are occupied: claude busy, codex held"
+        );
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        let order: Vec<_> = writable(&effects);
+        assert_eq!(
+            order,
+            [("claude".into(), false), ("codex".into(), true)],
+            "codex runs its edit first; its @all reply waits behind it"
         );
     }
 
