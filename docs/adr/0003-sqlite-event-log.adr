@@ -1,6 +1,7 @@
 # 0003. Append-only SQLite event log is the transcript
 
-- Status: Proposed
+- Status: Rejected (owner, 2026-11-24): no database; keep the transcript as plain files on
+  the filesystem. Replaced by [0010](0010-filesystem-event-log.adr).
 - Date: 2026-11-24
 
 The point of roundtable is seeing who said what to whom. This ADR makes one append-only

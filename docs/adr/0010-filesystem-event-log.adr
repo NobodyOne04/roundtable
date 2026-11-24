@@ -1,0 +1,76 @@
+# 0010. Append-only JSONL files are the transcript
+
+- Status: Proposed
+- Date: 2026-11-24
+
+Replaces the rejected [0003](0003-sqlite-event-log.adr): the owner wants no database. The
+transcript lives as plain files on the filesystem, append-only, one folder per thread. The
+chat view, `/usage`, `/context`, resume and replay all read these files. Every accepted ADR
+that cites 0003 (0001, 0002, 0004, 0005, 0007, 0008) means this ADR from now on;
+0001's "SQLite is compiled in" no longer applies (no storage dependency at all).
+
+## Technical details
+- Root: `<data_dir>/roundtable/` (`dirs::data_dir()`: `~/Library/Application Support` on
+  macOS, `~/.local/share` on Linux).
+  ```
+  roundtable/
+    roundtable.lock                 # single-instance flock
+    threads/
+      <thread-id>/                  # ULID: sorts by creation time
+        meta.json                   # title, checkout, created_at, parent_id, fork_event
+        events.jsonl                # the transcript, append-only, one event per line
+        sessions.json               # native CLI session per (participant, identity)
+  ```
+- Event line (one JSON object, `\n`-terminated):
+  ```json
+  {"seq":42,"ts":1764000000000,"turn":40,"parent":41,
+   "from":{"id":"claude","identity":"9f2c…"},
+   "to":[{"id":"codex","identity":"a71e…"}],
+   "kind":"handoff","payload":{…},"tokens_in":812,"tokens_out":0}
+  ```
+  `seq` is the line's sequence number in its thread; `turn` is the user message it
+  descends from, `parent` the event that caused it. Kinds: `msg | tool_call |
+  tool_result | handoff | delivery | settle | approval | error | status`.
+- Append-only, no line is ever rewritten. What 0003 did with row updates is a later line:
+  - `settle {ref, status}` closes an in-flight `msg` or `handoff`
+    (`complete | blocked | interrupted | failed`, reason in `payload`);
+  - `delivery {ref, to, status}` tracks each recipient (`queued | sent | blocked |
+    cancelled`). History builders ([0005](0005-openai-compatible-models.adr)) use only
+    events with a `sent` delivery to that model.
+  The current state of a thread is a fold over its lines, done once on open and then kept
+  in memory ([0002](0002-single-owner-event-loop.adr)).
+- Durability: one writer task per open thread holds the file in append mode. Lines that
+  gate an action (a handoff intent before dispatch, a writable turn before spawn, a
+  `settle`) are followed by `sync_data()` and only then acknowledged to the event loop.
+  Text deltas are not written one by one: a reply is written once as its `settle`.
+  A write error is reported as a failure `Event` (0007's commit-failure path).
+- Crash safety: a crash can leave a torn last line. Readers skip a last line that does
+  not parse, and the writer truncates it before its first append.
+- Small mutable files (`meta.json`, `sessions.json`) are written atomically: write
+  `*.tmp`, `sync_data()`, `rename`.
+- Single instance: exclusive `flock` on `roundtable.lock`; a second instance exits with
+  "roundtable is already running (pid N)".
+- Unclean writer exit, fail closed (carried over from 0003): a writable turn's intent line
+  is synced before its CLI is spawned. On start, a writable turn with no `settle` keeps
+  the checkout locked for writes until the user confirms it is quiet; only then is
+  `settle interrupted` appended.
+- Checkout binding, identities, transcript-only resume from another checkout, native
+  fork, key redaction before write, and `payload.raw` only behind a debug flag: as in
+  0003, unchanged.
+- Usage across threads (`/usage all`): each thread folder also keeps `usage.json`
+  (totals per participant and day), rewritten atomically on every `settle`, so `/usage`
+  reads one small file per thread instead of every transcript.
+- Readable by design: `tail -f …/events.jsonl | jq` shows the conversation live, and
+  `grep` searches all threads. The README says so.
+- Git: roundtable never runs git in this folder. The user may put it under git for
+  backup or sync themselves; the format (append-only text) makes that cheap.
+
+Consequences: no database dependency, files a human can read, a crash loses at most an
+unsynced text reply. Cost: queries are scans (fine at personal scale; the `usage.json`
+cache covers the one cross-thread view); no transactions across files, so every multi-file
+change is ordered: event line first, derived files second, derived files rebuildable from
+the events.
+
+## Technologies and alternatives
+- Involved: serde_json, std::fs (append, `sync_data`, `rename`), fs2 or rustix for `flock`, ulid, dirs
+- Alternatives: SQLite ([0003](0003-sqlite-event-log.adr)): rejected by the owner; a git commit per event: real history, but a commit per line is slow and noisy, and the JSONL file is already an append-only history; one file per event: easy writes, slow reads and huge folder counts

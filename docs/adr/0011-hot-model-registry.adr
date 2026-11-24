@@ -1,0 +1,59 @@
+# 0011. Model registry lives in memory, changes hot, persists to TOML
+
+- Status: Proposed
+- Date: 2026-11-24
+
+Replaces the rejected [0006](0006-model-registry-config.adr): the owner wants the registry
+hot. The live registry is in memory; enabling, disabling, adding or editing a model takes
+effect at once, from a command or from an edit to the file, never needing a restart. The
+file is only its persisted copy. Accepted ADRs that cite 0006 (0004, 0005, 0007, 0008)
+mean this ADR from now on.
+
+## Technical details
+- Source of truth at runtime: `Registry` in `App` state
+  ([0002](0002-single-owner-event-loop.adr)): participants, `default`, `writer`, `[talk]`
+  policy. Every routing decision reads it from memory.
+- Persisted copy: `<config_dir>/roundtable/models.toml`. Same format as 0006 proposed
+  (`default`, `writer`, `[[model]]` entries, `[talk]`), TOML because it is hand-edited and
+  keeps comments. Created with `claude` and `codex` on first run if missing.
+- Two ways in, one path through:
+  - **Commands** (`/model enable|disable|use`, `/talk …`, [0008](0008-slash-commands-and-mentions.adr))
+    change memory immediately, then write the file back (`toml_edit`, so comments and
+    order survive; atomic `*.tmp` + `rename`).
+  - **File edits**: a watcher (`notify`, watching the *directory*, since editors save by
+    rename) sends a `RegistryFileChanged` event, debounced 200 ms. The loop re-reads and
+    validates the whole file.
+  - Own writes are not reloaded: the app keeps the hash of the last content it wrote and
+    ignores a change event whose file content matches it.
+- All or nothing: a file that fails validation is not applied, not even partly. The old
+  registry stays live and the chat shows the error with the line. Fixing the file applies
+  it.
+- Applying a new registry is a diff against the live one:
+  - added: available at once (completion, `@mention`, `@all`);
+  - disabled or removed: same as `/model disable`: running reply cancelled and settled
+    `interrupted`, queued deliveries cancelled, `@id` answers "`id` is disabled", history
+    kept;
+  - identity changed (`kind`, `base_url`/`cmd`, `model`): treated as a new destination,
+    empty history ([0005](0005-openai-compatible-models.adr)); a running reply to the old
+    identity is cancelled;
+  - other fields (`role`, `context_window`, timeouts): used from the next request;
+  - `[talk]` policy: checked on the next `ask`; handoffs already committed get the
+    recheck 0007 defines, so a pair just denied sends nothing more.
+  Every applied change is logged as a `status` event ([0010](0010-filesystem-event-log.adr)).
+- Secrets: as 0006 proposed. `key` is a reference (`keyring:<name>` or `env:<VAR>`), never
+  a value; a literal key is refused. Keys are resolved per request, so a key changed in
+  the keychain is used on the next request, no reload needed.
+- Validation (unchanged from 0006): unique ids `[a-z0-9-]+`, reserved names (`all`,
+  `user`, `router`, `you`) refused, required fields per `kind`, `https://` or loopback
+  `http://` only for entries with a key, `writer` names one enabled `cli` entry or there
+  is no writer (fail closed), `default` checked after filtering.
+- The default model cannot be disabled while it is default; `/model use` another first.
+  A file edit that does it anyway leaves no default (messages need an `@mention`).
+
+Consequences: models come and go while agents are mid-conversation, from either the
+command line or an editor. Cost: a file watcher dependency, and edits that race a command
+resolve as last write wins (the command writes the file; the next file edit reloads it).
+
+## Technologies and alternatives
+- Involved: toml, toml_edit, serde, notify (+ notify-debouncer-mini), keyring, dirs
+- Alternatives: restart to apply (0006 as rejected): not hot; memory only, no file: hot, but every change is lost on exit; polling the file every second: no dependency, but slower to react and wakes the app for nothing

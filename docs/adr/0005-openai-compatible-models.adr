@@ -1,6 +1,6 @@
 # 0005. Free and side models through one OpenAI-compatible adapter
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-24
 
 The owner wants to plug in new free models. Almost every local runner and free provider
