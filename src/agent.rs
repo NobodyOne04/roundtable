@@ -96,8 +96,9 @@ pub struct Turn {
     pub model: Option<String>,
     /// The writer's own turn: may edit files (ADR 0004). Every other turn is read-only.
     pub writable: bool,
-    /// The writer's configured mode; `None` keeps the CLI's own default. The registry
-    /// refuses bypass and full-access modes.
+    /// The writer's configured mode; `None` means a safe explicit default, never whatever
+    /// the user's own CLI config says (it could be bypass). The registry refuses bypass and
+    /// full-access modes.
     pub permission_mode: Option<String>,
 }
 
@@ -118,10 +119,10 @@ pub fn command(kind: Kind, turn: &Turn) -> (Command, Vec<u8>) {
                 "--verbose",
             ]);
             if turn.writable {
-                // The writer runs with the user's own setup and its configured mode.
-                if let Some(mode) = &turn.permission_mode {
-                    cmd.args(["--permission-mode", mode]);
-                }
+                // The writer runs with the user's own setup, but always with an explicit mode,
+                // so a bypass default in the user's settings can't apply.
+                let mode = turn.permission_mode.as_deref().unwrap_or("default");
+                cmd.args(["--permission-mode", mode]);
             } else {
                 // Read-only, and without the user's MCP servers, hooks and plugins, which
                 // could write despite plan mode.
@@ -152,9 +153,9 @@ pub fn command(kind: Kind, turn: &Turn) -> (Command, Vec<u8>) {
             cmd.arg("--json");
             // The sandbox is set through `-c` because `exec resume` has no `-s`.
             if turn.writable {
-                if let Some(mode) = &turn.permission_mode {
-                    cmd.args(["-c", &format!("sandbox_mode=\"{mode}\"")]);
-                }
+                // Always explicit, so a full-access sandbox in the user's config can't apply.
+                let mode = turn.permission_mode.as_deref().unwrap_or("workspace-write");
+                cmd.args(["-c", &format!("sandbox_mode=\"{mode}\"")]);
             } else {
                 // `--ignore-user-config` drops the user's MCP servers (auth still works).
                 cmd.args(["--ignore-user-config", "-c", r#"sandbox_mode="read-only""#]);
@@ -602,9 +603,10 @@ mod tests {
         turn.permission_mode = None;
         assert_eq!(
             args(Kind::Codex, &turn),
-            "exec --json -",
-            "the CLI's own default"
+            r#"exec --json -c sandbox_mode="workspace-write" -"#,
+            "unset never falls back to the user's own config"
         );
+        assert!(args(Kind::Claude, &turn).ends_with("--permission-mode default"));
     }
 
     async fn run_fake(script: &str, cancel: CancellationToken) -> Vec<PEvent> {

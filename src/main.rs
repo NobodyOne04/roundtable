@@ -1,7 +1,7 @@
 //! roundtable: one terminal chat for Claude Code, Codex and other models.
 //! Stack: ADR 0001. Event loop: ADR 0002. Transcript files: ADR 0010. CLI agents: ADR 0004.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -63,11 +63,13 @@ async fn start() -> Result<()> {
     let cwd = std::env::current_dir().context("reading the current directory")?;
 
     let models_path = config_root()?.join("models.toml");
+    let checkout = checkout_root(&cwd);
     let mut runtime = Runtime {
         store,
         thread: None,
         sessions: BTreeMap::new(),
         turns: HashMap::new(),
+        checkout: checkout.clone().unwrap_or_else(|_| cwd.clone()),
         cwd,
         outside_repo,
         models_path,
@@ -91,14 +93,14 @@ async fn start() -> Result<()> {
             Err(why) => app.note(format!("{id}: unavailable: {why}"), true),
         }
     }
-    let unfinished = runtime
+    let locks = runtime
         .store
-        .unfinished_writers(&runtime.cwd)
+        .writer_locks(&runtime.checkout)
         .context("checking for unfinished writer turns")?;
-    app.lock_edits(
-        unfinished.into_iter().map(|m| m.id).collect(),
-        &runtime.cwd.display().to_string(),
-    );
+    app.lock_edits(locks);
+    if let Err(why) = checkout {
+        app.lock_unknown_checkout(&why);
+    }
     if let Some(why) = load_error {
         app.note(
             format!("{} not applied: {why}", runtime.models_path.display()),
@@ -136,6 +138,9 @@ struct Runtime {
     sessions: BTreeMap<String, String>,
     turns: HashMap<String, CancellationToken>,
     cwd: PathBuf,
+    /// The git worktree root around `cwd` (or `cwd` outside git): threads and the writer
+    /// lock belong to the checkout, wherever in it roundtable was started.
+    checkout: PathBuf,
     outside_repo: bool,
     models_path: PathBuf,
     /// Fingerprint of the `models.toml` text last applied or written, so own writes and
@@ -163,7 +168,7 @@ impl Runtime {
                     .chars()
                     .take(60)
                     .collect();
-                let thread = self.store.create_thread(&title, &self.cwd)?;
+                let thread = self.store.create_thread(&title, &self.checkout)?;
                 tracing::info!(thread = %thread.meta.id, "thread opened");
                 self.thread.insert(thread)
             }
@@ -244,28 +249,25 @@ impl Runtime {
         Ok(())
     }
 
-    /// Closes each thread's unfinished writer turn with a `settle`, after the user confirmed
-    /// the checkout is quiet (ADR 0010).
-    fn confirm_quiet(&mut self, threads: &[String]) -> Result<()> {
+    /// Closes each thread's unfinished writer turn with a durable `settle`, after the user
+    /// confirmed the checkout is quiet (ADR 0010). Reports which succeeded, so the app only
+    /// unlocks what is really on disk.
+    fn confirm_quiet(&mut self, threads: &[String]) -> Event {
+        let mut settled = vec![];
+        let mut failed = vec![];
         for id in threads {
-            let mut thread = self.store.open_thread(id)?;
-            let settle = NewEvent {
-                turn: None,
-                parent: None,
-                from: transcript::Party {
-                    id: "user".into(),
-                    identity: None,
-                },
-                to: vec![],
-                kind: transcript::Kind::Settle,
-                payload: serde_json::json!({ "writable": true, "status": "interrupted" }),
-                tokens_in: None,
-                tokens_out: None,
-            };
-            thread.append(settle, true)?;
-            tracing::info!(thread = %id, "writer turn settled after /quiet");
+            match self.store.settle_writer(id) {
+                Ok(()) => {
+                    tracing::info!(thread = %id, "writer turn settled after /quiet");
+                    settled.push(id.clone());
+                }
+                Err(err) => {
+                    tracing::error!(thread = %id, %err, "settling the writer turn failed");
+                    failed.push((id.clone(), format!("{err:#}")));
+                }
+            }
         }
-        Ok(())
+        Event::QuietDone { settled, failed }
     }
 
     fn cancel_all(&self) {
@@ -283,9 +285,15 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
     let _watcher = watch_registry(&rt.models_path, tx.clone())?;
 
     let mut quit_by: Option<tokio::time::Instant> = None;
+    // Events the loop raises itself: handled before the channel, never dropped (a full
+    // channel must not lose, say, the `Done` of a turn that never started).
+    let mut local: VecDeque<Event> = VecDeque::new();
     loop {
         let deadline = quit_by.unwrap_or_else(tokio::time::Instant::now);
-        let event = tokio::select! {
+        let event = if let Some(event) = local.pop_front() {
+            event
+        } else {
+            tokio::select! {
             event = rx.recv() => match event {
                 Some(event) => event,
                 None => return Ok(()),
@@ -293,6 +301,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             _ = tokio::time::sleep_until(deadline), if quit_by.is_some() => {
                 tracing::warn!(left = rt.turns.len(), "turns did not stop in time");
                 return Ok(());
+            }
             }
         };
         let event = match event {
@@ -305,6 +314,8 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
         if let Event::Agent(id, PEvent::Done(_)) = &event {
             rt.turns.remove(id);
         }
+        // Writable turns whose writer marker failed to reach the disk in this batch.
+        let mut unmarked: Vec<String> = vec![];
         for effect in app.update(event) {
             match effect {
                 Effect::Redraw => {
@@ -327,6 +338,14 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     writable,
                     permission_mode,
                 } => {
+                    if writable && unmarked.contains(&id) {
+                        // Fail closed (ADR 0010): an editable turn never starts unrecorded,
+                        // or a crash during it would leave no lock behind.
+                        let why = "not started: the writer marker could not be written".into();
+                        local.push_back(Event::Agent(id.clone(), PEvent::Error(why)));
+                        local.push_back(Event::Agent(id, PEvent::Done(Outcome::Failed)));
+                        continue;
+                    }
                     let token = CancellationToken::new();
                     rt.turns.insert(id.clone(), token.clone());
                     let turn = Turn {
@@ -347,22 +366,22 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     }
                 }
                 Effect::CancelTurns => rt.cancel_all(),
-                Effect::ConfirmQuiet(threads) => {
-                    if let Err(err) = rt.confirm_quiet(&threads) {
-                        tracing::error!(%err, "closing unfinished writer turns failed");
-                        let _ = tx.try_send(Event::Notice(format!("transcript: {err:#}")));
-                    }
-                }
+                Effect::ConfirmQuiet(threads) => local.push_back(rt.confirm_quiet(&threads)),
                 Effect::EditRegistry(edit) => {
                     if let Err(err) = rt.edit_registry(&edit) {
                         tracing::error!(%err, "editing models.toml failed");
-                        let _ = tx.try_send(Event::Notice(format!("models.toml: {err}")));
+                        local.push_back(Event::Notice(format!("models.toml: {err}")));
                     }
                 }
                 Effect::Record { event, durable } => {
+                    let marker = (event.kind == transcript::Kind::Delivery
+                        && event.payload["writable"] == true)
+                        .then(|| event.to.first().map(|p| p.id.clone()))
+                        .flatten();
                     if let Err(err) = rt.record(event, durable) {
+                        unmarked.extend(marker);
                         tracing::error!(%err, "transcript write failed");
-                        let _ = tx.try_send(Event::Notice(format!("transcript: {err:#}")));
+                        local.push_back(Event::Notice(format!("transcript: {err:#}")));
                     }
                 }
                 Effect::SaveSession {
@@ -372,7 +391,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                 } => {
                     if let Err(err) = rt.save_session(&id, &identity, session) {
                         tracing::error!(%err, "saving the session failed");
-                        let _ = tx.try_send(Event::Notice(format!("sessions: {err:#}")));
+                        local.push_back(Event::Notice(format!("sessions: {err:#}")));
                     }
                 }
             }
@@ -527,6 +546,45 @@ fn chat_lines(line: &ChatLine) -> Vec<Line<'static>> {
     out
 }
 
+/// The git worktree root around `cwd`, or `cwd` itself when git says it isn't a repository.
+/// Any other failure (no git, a repo git refuses to read) is an error: falling back to
+/// `cwd` would make the writer lock narrower than the checkout.
+fn checkout_root(cwd: &Path) -> Result<PathBuf, String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        // English messages, so "not a git repository" is recognised whatever the locale.
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|e| format!("running git: {e}"))?;
+    if output.status.success() {
+        let root = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+        // Only Git's line terminator: a repo name may itself end in spaces.
+        let root = PathBuf::from(root.strip_suffix('\n').unwrap_or(&root));
+        // An inherited GIT_WORK_TREE can name an unrelated tree; the lock must cover the
+        // folder the agents actually run in.
+        let (canon_root, canon_cwd) = (root.canonicalize(), cwd.canonicalize());
+        return match (canon_root, canon_cwd) {
+            (Ok(r), Ok(c)) if c.starts_with(&r) => Ok(root),
+            _ => Err(format!(
+                "git names {} as the checkout, which doesn't contain {}",
+                root.display(),
+                cwd.display()
+            )),
+        };
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Exactly git's "no repository here or above" (also when it stops at a mount point);
+    // a broken worktree says "not a git repository: <gitdir>" and must not count.
+    if stderr.contains("not a git repository (or any of the parent directories)")
+        || stderr.contains("not a git repository (or any parent up to mount point")
+    {
+        Ok(cwd.to_path_buf())
+    } else {
+        Err(stderr.trim().to_string())
+    }
+}
+
 /// `<config_dir>/roundtable`: `models.toml` (ADR 0011). Same folder as the data on macOS.
 fn config_root() -> Result<PathBuf> {
     let dir = dirs::config_dir()
@@ -574,6 +632,53 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
         terminal.backend().clone()
+    }
+
+    #[test]
+    fn checkout_root_is_the_git_root_with_its_exact_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo ");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let root = checkout_root(&repo.join("src"))
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        assert_eq!(root, repo.canonicalize().unwrap(), "trailing space kept");
+        let outside = tempfile::tempdir().unwrap();
+        assert_eq!(checkout_root(outside.path()).unwrap(), outside.path());
+
+        // A linked worktree whose gitdir is gone: broken, not "outside a repo".
+        let broken = dir.path().join("broken");
+        fs::create_dir(&broken).unwrap();
+        fs::write(broken.join(".git"), "gitdir: /nonexistent/worktrees/x\n").unwrap();
+        assert!(checkout_root(&broken).is_err());
+
+        // GIT_WORK_TREE pointing elsewhere is refused, not trusted.
+        let elsewhere = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(&repo)
+            .env("GIT_DIR", repo.join(".git"))
+            .env("GIT_WORK_TREE", outside.path())
+            .output()
+            .unwrap();
+        assert!(elsewhere.status.success(), "git accepts the override");
+        // SAFETY: tests in this binary don't read these vars concurrently.
+        unsafe {
+            std::env::set_var("GIT_DIR", repo.join(".git"));
+            std::env::set_var("GIT_WORK_TREE", outside.path());
+        }
+        let result = checkout_root(&repo.join("src"));
+        unsafe {
+            std::env::remove_var("GIT_DIR");
+            std::env::remove_var("GIT_WORK_TREE");
+        }
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]

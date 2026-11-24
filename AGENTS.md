@@ -39,10 +39,14 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
   record a real two-turn Codex fixture: `tests/fixtures/codex-0.171.0-turn1.jsonl` was cut
   from one turn, and resume was never recorded.
 - Review the ADR 0011 PR (`feature/adr-0011-hot-registry`), skipped for the same reason.
-- Review the writer PR (`feature/adr-0011-writer`): the first PR that lets an agent edit.
-  Check that no path makes a non-writer, `@all` or locked turn writable.
+- Writer PR #13: reviewed five times on 2026-11-25; every finding fixed except the
+  owner decision below. Re-review only if the owner changes the lock design.
 
 ## Notes
+- Open owner decision (writer lock): the crash lock lives in the data folder and matches
+  checkouts by path, so a renamed checkout or another data root (`XDG_DATA_HOME`) can miss
+  an unfinished writer. The fix would be a lock inside the checkout (e.g. under `.git/`),
+  which changes ADR 0010. Don't re-report it until the owner decides.
 - ADR 0004: the owner chose a git worktree per agent for the single-writer limit
   (2026-11-24); its own ADR comes later. Don't re-report project hooks or detached tools
   as findings; review the worktree ADR when it exists.

@@ -14,6 +14,7 @@
 - Proposed ADR 0010 (JSONL files as the transcript) and 0011 (hot in-memory model registry)
 
 ### Fixed
+- Writer safety after Codex review: broadcasts never write, explicit safe default modes, waiting writers keep order, the crash lock covers the whole git checkout and fails closed on unreadable history or git errors, `/quiet` unlocks only after the settle is on disk
 - Transcript, sessions and logs are readable by the owner only (data folder 0700, files 0600)
 
 ### Changed

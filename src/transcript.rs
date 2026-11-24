@@ -187,17 +187,86 @@ impl Store {
         Thread::open(dir, meta)
     }
 
-    /// Threads of `checkout` whose last writable turn never finished: its CLI may still be
-    /// editing after a crash, so edits stay locked until the user confirms (ADR 0010).
-    pub fn unfinished_writers(&self, checkout: &Path) -> Result<Vec<Meta>> {
+    /// Threads that keep edits locked in `checkout` (ADR 0010): those whose last writable
+    /// turn never finished, and, failing closed, any whose history can't be read. A thread
+    /// counts when its checkout is `checkout` or inside it, or the other way round, so
+    /// restarting from a subfolder still finds a crash at the repo root.
+    pub fn writer_locks(&self, checkout: &Path) -> Result<Vec<Lock>> {
         let checkout = checkout.canonicalize()?;
-        let mut found = vec![];
-        for meta in self.list_threads()? {
-            if meta.checkout == checkout && writer_open(&self.open_thread(&meta.id)?.events()?) {
-                found.push(meta);
+        let mut locks = vec![];
+        for entry in fs::read_dir(self.root.join("threads"))? {
+            let dir = entry?.path();
+            let id = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // `is_dir()` would also say no when the lookup fails; only a confirmed
+            // non-folder is skipped.
+            match fs::metadata(&dir) {
+                Ok(m) if !m.is_dir() => continue,
+                Ok(_) => {}
+                Err(e) => {
+                    locks.push(Lock::Unreadable {
+                        id,
+                        why: format!("folder: {e}"),
+                    });
+                    continue;
+                }
+            }
+            let unreadable = |why: String| Lock::Unreadable {
+                id: id.clone(),
+                why,
+            };
+            let meta: Meta = match fs::read(dir.join("meta.json"))
+                .map_err(|e| e.to_string())
+                .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
+            {
+                Ok(meta) => meta,
+                // Its checkout is unknown, so it may be this one.
+                Err(why) => {
+                    locks.push(unreadable(format!("meta.json: {why}")));
+                    continue;
+                }
+            };
+            if !(meta.checkout.starts_with(&checkout) || checkout.starts_with(&meta.checkout)) {
+                continue;
+            }
+            match writer_open_in(&dir.join("events.jsonl")) {
+                Ok(true) => locks.push(Lock::Open {
+                    id,
+                    checkout: meta.checkout,
+                }),
+                Ok(false) => {}
+                Err(why) => locks.push(unreadable(why)),
             }
         }
-        Ok(found)
+        locks.sort_by(|a, b| a.id().cmp(b.id()));
+        Ok(locks)
+    }
+
+    /// Closes thread `id`'s unfinished writer turn with a durable `settle` (ADR 0010), after
+    /// the user confirmed the checkout is quiet. Never recreates a missing transcript: that
+    /// would "settle" a history that no longer exists.
+    pub fn settle_writer(&self, id: &str) -> Result<()> {
+        if !self.thread_dir(id).join("events.jsonl").is_file() {
+            return Err(Error::NoThread(format!("{id} (events.jsonl is missing)")));
+        }
+        let mut thread = self.open_thread(id)?;
+        let settle = NewEvent {
+            turn: None,
+            parent: None,
+            from: Party {
+                id: "user".into(),
+                identity: None,
+            },
+            to: vec![],
+            kind: Kind::Settle,
+            payload: serde_json::json!({ "writable": true, "status": "interrupted" }),
+            tokens_in: None,
+            tokens_out: None,
+        };
+        thread.append(settle, true)?;
+        Ok(())
     }
 
     /// All threads, newest first. A folder without a readable `meta.json` is skipped.
@@ -308,40 +377,89 @@ impl Thread {
     }
 }
 
+/// A thread that keeps edits locked (see `Store::writer_locks`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lock {
+    /// Its last writable turn never finished; `/quiet` settles it.
+    Open { id: String, checkout: PathBuf },
+    /// Its history can't be read, so its writer state is unknown. Only moving the thread
+    /// folder out of the way (or repairing it) unlocks.
+    Unreadable { id: String, why: String },
+}
+
+impl Lock {
+    pub fn id(&self) -> &str {
+        match self {
+            Lock::Open { id, .. } | Lock::Unreadable { id, .. } => id,
+        }
+    }
+}
+
+/// `writer_open` over a file, one line at a time, so a long transcript never sits in memory.
+/// A torn last line (no newline) is ignored like `Thread::open` does; any other bad or
+/// missing data is an error, never "finished".
+fn writer_open_in(path: &Path) -> std::result::Result<bool, String> {
+    let file = File::open(path).map_err(|e| format!("events.jsonl: {e}"))?;
+    let mut reader = BufReader::new(file);
+    let mut open = false;
+    let mut line = Vec::new();
+    let mut number = 0;
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| format!("events.jsonl: {e}"))?;
+        if read == 0 {
+            return Ok(open);
+        }
+        number += 1;
+        if !line.ends_with(b"\n") {
+            // Torn last line, even if it parses: reopening truncates it, so it never happened.
+            return Ok(open);
+        }
+        match serde_json::from_slice::<EventLine>(&line) {
+            Ok(event) => open = writer_step(open, &event),
+            Err(e) => return Err(format!("events.jsonl line {number}: {e}")),
+        }
+    }
+}
+
+fn writer_step(open: bool, e: &EventLine) -> bool {
+    let writable = e.payload.get("writable") == Some(&serde_json::Value::Bool(true));
+    match e.kind {
+        Kind::Delivery if writable => true,
+        Kind::Msg if e.from.id != "user" && writable => false,
+        Kind::Settle if writable => false,
+        _ => open,
+    }
+}
+
 /// Whether the last writable turn in `events` started and never ended. A writable turn
 /// starts with a `delivery` marked `writable`, and ends with the writer's reply marked
 /// `writable` or a `settle` marked `writable` (the user confirmed the checkout is quiet).
 pub fn writer_open(events: &[EventLine]) -> bool {
-    let writable =
-        |e: &EventLine| e.payload.get("writable") == Some(&serde_json::Value::Bool(true));
-    events.iter().fold(false, |open, e| match e.kind {
-        Kind::Delivery if writable(e) => true,
-        Kind::Msg if e.from.id != "user" && writable(e) => false,
-        Kind::Settle if writable(e) => false,
-        _ => open,
-    })
+    events.iter().fold(false, writer_step)
 }
 
 /// Returns the byte length of the valid prefix and how many lines it holds. Only the last
 /// line may be torn; a bad line before it is corruption and an error.
 fn scan(file: &mut File, path: &Path) -> Result<(u64, u64)> {
     file.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let mut good_len = 0;
-    let mut count = 0;
-    let mut rest = bytes.as_slice();
-    while !rest.is_empty() {
-        let Some(end) = rest.iter().position(|&b| b == b'\n') else {
-            break; // no newline: torn
-        };
-        match serde_json::from_slice::<EventLine>(&rest[..end]) {
+    // Line by line, so reopening a long transcript never loads it whole.
+    let mut reader = BufReader::new(&mut *file);
+    let mut line = Vec::new();
+    let (mut good_len, mut count) = (0, 0);
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 || !line.ends_with(b"\n") {
+            break; // end, or a torn last line (no newline)
+        }
+        match serde_json::from_slice::<EventLine>(&line) {
             Ok(_) => {
-                good_len += end as u64 + 1;
+                good_len += read as u64;
                 count += 1;
-                rest = &rest[end + 1..];
             }
-            Err(_) if rest[end + 1..].is_empty() => break, // torn last line
             Err(source) => {
                 return Err(Error::Corrupt {
                     path: path.into(),
@@ -480,18 +598,81 @@ mod tests {
         crashed
             .append(event(Kind::Msg, "codex", false), true)
             .unwrap();
-        let found = store.unfinished_writers(dir.path()).unwrap();
-        assert_eq!(found, [crashed.meta.clone()]);
+        let found = store.writer_locks(dir.path()).unwrap();
+        assert_eq!(
+            found,
+            [Lock::Open {
+                id: crashed.meta.id.clone(),
+                checkout: dir.path().canonicalize().unwrap()
+            }]
+        );
+        let sub = dir.path().join("src");
+        fs::create_dir(&sub).unwrap();
+        assert_eq!(
+            store.writer_locks(&sub).unwrap(),
+            found,
+            "found from a subfolder of the checkout"
+        );
         let other = tempfile::tempdir().unwrap();
         assert!(
-            store.unfinished_writers(other.path()).unwrap().is_empty(),
+            store.writer_locks(other.path()).unwrap().is_empty(),
             "other checkout"
         );
 
         crashed
             .append(event(Kind::Settle, "user", true), true)
             .unwrap();
-        assert!(store.unfinished_writers(dir.path()).unwrap().is_empty());
+        assert!(store.writer_locks(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unreadable_history_locks_instead_of_unlocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let mut thread = store.create_thread("t", dir.path()).unwrap();
+        thread.append(user_msg("a"), true).unwrap();
+        let tdir = dir.path().join("threads").join(&thread.meta.id);
+        let events = tdir.join("events.jsonl");
+        let good = fs::read_to_string(&events).unwrap();
+
+        fs::write(&events, format!("{good}{{\"seq\":1,\"to")).unwrap();
+        assert!(
+            store.writer_locks(dir.path()).unwrap().is_empty(),
+            "torn last line is fine"
+        );
+
+        // An open delivery, then a complete but unterminated reply: torn, so still open,
+        // exactly as reopening would see it.
+        let open = r#"{"seq":1,"ts":1,"from":{"id":"router"},"kind":"delivery","payload":{"writable":true}}"#;
+        let reply =
+            r#"{"seq":2,"ts":1,"from":{"id":"claude"},"kind":"msg","payload":{"writable":true}}"#;
+        fs::write(&events, format!("{good}{open}\n{reply}")).unwrap();
+        assert!(matches!(
+            &store.writer_locks(dir.path()).unwrap()[..],
+            [Lock::Open { .. }]
+        ));
+
+        fs::write(&events, format!("not json\n{good}")).unwrap();
+        let locks = store.writer_locks(dir.path()).unwrap();
+        assert!(matches!(&locks[..], [Lock::Unreadable { why, .. }] if why.contains("line 1")));
+
+        fs::remove_file(&events).unwrap();
+        assert!(matches!(
+            &store.writer_locks(dir.path()).unwrap()[..],
+            [Lock::Unreadable { .. }]
+        ));
+        assert!(
+            store.settle_writer(&thread.meta.id).is_err(),
+            "settling never recreates a missing transcript"
+        );
+        assert!(!events.exists());
+
+        fs::write(tdir.join("meta.json"), "{").unwrap();
+        let other = tempfile::tempdir().unwrap();
+        assert!(
+            matches!(&store.writer_locks(other.path()).unwrap()[..], [Lock::Unreadable { why, .. }] if why.starts_with("meta.json")),
+            "unknown checkout locks everywhere"
+        );
     }
 
     #[test]

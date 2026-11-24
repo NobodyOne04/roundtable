@@ -8,7 +8,7 @@ use serde_json::json;
 
 use crate::agent::{self, Outcome, PEvent};
 use crate::registry::{Adapter, Participant, Registry};
-use crate::transcript::{self, NewEvent, Party};
+use crate::transcript::{self, Lock, NewEvent, Party};
 
 /// Preflight result per participant id: the CLI version, or why it can't take turns.
 pub type Checks = BTreeMap<String, Result<String, String>>;
@@ -31,6 +31,11 @@ pub enum Event {
     Registry(Result<(Registry, Checks), String>),
     /// Something the loop failed to do, shown in the chat.
     Notice(String),
+    /// After `/quiet`: threads whose `settle` reached the disk, and those that failed.
+    QuietDone {
+        settled: Vec<String>,
+        failed: Vec<(String, String)>,
+    },
 }
 
 /// A change to `models.toml` asked for by a command; the loop writes it.
@@ -105,6 +110,10 @@ struct Seat {
     queue: VecDeque<(String, bool)>,
     /// The running turn may edit; its reply then ends the writer marker.
     writable: bool,
+    /// The front of `queue` is an edit waiting for another writer to finish (ADR 0004: one
+    /// writable turn at a time). The seat counts as occupied, so later messages queue
+    /// behind the edit instead of overtaking it.
+    held: bool,
     /// Index of the reply being streamed in `lines`.
     reply: Option<usize>,
     usage: (u64, u64, Option<f64>),
@@ -121,6 +130,11 @@ pub struct App {
     seats: Vec<Seat>,
     /// Threads whose writer turn never finished (a crash): edits stay locked until `/quiet`.
     edits_locked: Vec<String>,
+    /// Threads whose history can't be read: writer state unknown, so edits stay locked
+    /// until the folder is moved away (fail closed, ADR 0010).
+    unreadable: Vec<(String, String)>,
+    /// Quitting: running turns are being cancelled and nothing new may start.
+    quitting: bool,
     /// First Ctrl-C arms, the second quits.
     quit_armed: bool,
 }
@@ -149,6 +163,8 @@ impl App {
             checks: Checks::new(),
             seats: vec![],
             edits_locked: vec![],
+            unreadable: vec![],
+            quitting: false,
             quit_armed: false,
         };
         app.apply_registry(registry, checks, false);
@@ -166,20 +182,72 @@ impl App {
     }
 
     /// At startup: a previous writer in this checkout may still be running (ADR 0010).
-    pub fn lock_edits(&mut self, threads: Vec<String>, checkout: &str) {
-        if threads.is_empty() {
-            return;
+    pub fn lock_edits(&mut self, locks: Vec<Lock>) {
+        let mut checkouts = vec![];
+        for lock in locks {
+            match lock {
+                Lock::Open { id, checkout } => {
+                    self.edits_locked.push(id);
+                    let checkout = checkout.display().to_string();
+                    if !checkouts.contains(&checkout) {
+                        checkouts.push(checkout);
+                    }
+                }
+                Lock::Unreadable { id, why } => self.unreadable.push((id, why)),
+            }
         }
+        if !checkouts.is_empty() {
+            // Every checkout is named: `/quiet` confirms all of them, so the user must know
+            // which (e.g. an outer repo around a nested one).
+            self.push(
+                "roundtable",
+                format!(
+                    "edits are locked: a writer from an earlier run never finished in {}, and \
+                     may still be running. Check nothing is editing there, then type /quiet. \
+                     Until then every turn is read-only.",
+                    checkouts.join(" and ")
+                ),
+                LineKind::Error,
+            );
+        }
+        for (id, why) in self.unreadable.clone() {
+            self.push(
+                "roundtable",
+                format!(
+                    "edits are locked: thread {id} can't be read ({why}), so whether its writer \
+                     finished is unknown. Repair it or move its folder out of threads/, then \
+                     restart."
+                ),
+                LineKind::Error,
+            );
+        }
+    }
+
+    /// Git couldn't name the checkout root, so a crashed writer elsewhere in the checkout
+    /// could be missed: fail closed.
+    pub fn lock_unknown_checkout(&mut self, why: &str) {
+        self.unreadable.push(("checkout".into(), why.into()));
         self.push(
             "roundtable",
             format!(
-                "edits are locked: a writer from an earlier run never finished in {checkout} and \
-                 may still be running. Check nothing is editing there, then type /quiet. \
-                 Until then every turn is read-only."
+                "edits are locked: git can't tell this checkout's root ({why}), so a writer \
+                 that crashed elsewhere in it could be missed. Fix git, then restart."
             ),
             LineKind::Error,
         );
-        self.edits_locked = threads;
+    }
+
+    /// How to lift the lock, for messages: `/quiet` can't fix unreadable history.
+    fn unlock_hint(&self) -> &'static str {
+        if self.unreadable.is_empty() {
+            "until /quiet"
+        } else {
+            "until the problem shown above is fixed and roundtable restarted"
+        }
+    }
+
+    fn locked(&self) -> bool {
+        !self.edits_locked.is_empty() || !self.unreadable.is_empty()
     }
 
     /// The only place state changes. No I/O here, so it is testable without a terminal.
@@ -197,7 +265,7 @@ impl App {
             Event::Key(_) | Event::Resize | Event::Tick | Event::RegistryFileChanged => vec![],
             Event::InputClosed(reason) => {
                 tracing::error!(%reason, "terminal input closed");
-                vec![Effect::Quit]
+                self.quit()
             }
             Event::Agent(id, event) => self.agent_event(&id, event),
             Event::Registry(Ok((registry, checks))) => self.apply_registry(registry, checks, true),
@@ -207,6 +275,23 @@ impl App {
                     format!("models.toml not applied, the previous registry stays: {why}"),
                     LineKind::Error,
                 );
+                vec![]
+            }
+            Event::QuietDone { settled, failed } => {
+                self.edits_locked.retain(|id| !settled.contains(id));
+                for (id, why) in failed {
+                    self.push(
+                        "roundtable",
+                        format!("thread {id} could not be settled ({why}); /quiet to retry"),
+                        LineKind::Error,
+                    );
+                }
+                let note = if self.locked() {
+                    "edits are still locked"
+                } else {
+                    "edits unlocked"
+                };
+                self.push("roundtable", note.into(), LineKind::Info);
                 vec![]
             }
             Event::Notice(text) => {
@@ -220,7 +305,7 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             if self.quit_armed {
-                return vec![Effect::Quit];
+                return self.quit();
             }
             self.quit_armed = true;
             self.push("roundtable", "Ctrl-C again to quit".into(), LineKind::Info);
@@ -228,7 +313,7 @@ impl App {
         }
         self.quit_armed = false;
         match key.code {
-            KeyCode::Char('d') if ctrl && self.input.is_empty() => vec![Effect::Quit],
+            KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit(),
             KeyCode::Char(c) if !ctrl => {
                 self.input.push(c);
                 vec![]
@@ -243,12 +328,23 @@ impl App {
         }
     }
 
+    /// From here on nothing new starts: queued and waiting work is dropped while the loop
+    /// cancels what runs.
+    fn quit(&mut self) -> Vec<Effect> {
+        self.quitting = true;
+        for seat in &mut self.seats {
+            seat.queue.clear();
+            seat.held = false;
+        }
+        vec![Effect::Quit]
+    }
+
     fn submit(&mut self) -> Vec<Effect> {
         let input = std::mem::take(&mut self.input);
         if input.trim_start().starts_with('/') {
             return self.command(input.trim());
         }
-        let (targets, prompt) = match self.route(&input) {
+        let (targets, prompt, broadcast) = match self.route(&input) {
             Ok(routed) => routed,
             Err(why) => {
                 self.input = input; // keep what was typed, so it can be fixed
@@ -258,8 +354,9 @@ impl App {
         };
         // Only a message to the writer alone may edit: `@all` and several mentions are
         // read-only for everyone (ADR 0004).
-        let to_writer = targets.len() == 1 && self.registry.writer() == Some(targets[0].as_str());
-        let writable = to_writer && self.edits_locked.is_empty();
+        let to_writer =
+            !broadcast && targets.len() == 1 && self.registry.writer() == Some(targets[0].as_str());
+        let writable = to_writer && !self.locked();
         let edits = if writable { " (may edit)" } else { "" };
         self.push(
             &format!("you → {}{edits}", targets.join(", ")),
@@ -269,7 +366,7 @@ impl App {
         if to_writer && !writable {
             self.push(
                 "roundtable",
-                "read-only: edits are locked until /quiet".into(),
+                format!("read-only: edits are locked {}", self.unlock_hint()),
                 LineKind::Info,
             );
         }
@@ -298,9 +395,18 @@ impl App {
             ["/model", "enable", id] => self.set_enabled(id, true),
             ["/model", "disable", id] => self.set_enabled(id, false),
             ["/model", "use", id] => self.use_default(id),
+            // The lock is lifted only when `QuietDone` confirms the settles are on disk.
             ["/quiet"] if !self.edits_locked.is_empty() => {
-                self.push("roundtable", "edits unlocked".into(), LineKind::Info);
-                vec![Effect::ConfirmQuiet(std::mem::take(&mut self.edits_locked))]
+                vec![Effect::ConfirmQuiet(self.edits_locked.clone())]
+            }
+            ["/quiet"] if !self.unreadable.is_empty() => {
+                self.push(
+                    "roundtable",
+                    "/quiet can't unlock unreadable threads: repair or move them, then restart"
+                        .into(),
+                    LineKind::Error,
+                );
+                vec![]
             }
             ["/quiet"] => {
                 self.push("roundtable", "edits are not locked".into(), LineKind::Info);
@@ -325,10 +431,10 @@ impl App {
                 tags.push("default");
             }
             if self.registry.writer() == Some(p.id.as_str()) {
-                tags.push(if self.edits_locked.is_empty() {
+                tags.push(if !self.locked() {
                     "writer"
                 } else {
-                    "writer, locked until /quiet"
+                    "writer, locked"
                 });
             }
             let state = match (p.enabled, self.availability(p)) {
@@ -450,6 +556,7 @@ impl App {
                     session: None,
                     queue: VecDeque::new(),
                     writable: false,
+                    held: false,
                     reply: None,
                     usage: (0, 0, None),
                 });
@@ -476,6 +583,7 @@ impl App {
             return vec![];
         };
         seat.queue.clear();
+        seat.held = false;
         if seat.busy {
             vec![Effect::CancelTurn(id.into())]
         } else {
@@ -494,13 +602,17 @@ impl App {
         }
     }
 
-    /// `@id` and `@all` at the start pick recipients; none means the default.
-    fn route(&self, input: &str) -> Result<(Vec<String>, String), String> {
+    /// `@id` and `@all` at the start pick recipients; none means the default. The flag says
+    /// it was a broadcast (`@all` or several mentions), whatever it expanded to: broadcasts
+    /// are read-only even if only the writer is left (ADR 0004).
+    fn route(&self, input: &str) -> Result<(Vec<String>, String, bool), String> {
         let mut targets: Vec<String> = vec![];
+        let mut mentions = 0;
         let mut rest = input.trim_start();
         while let Some(mention) = rest.strip_prefix('@') {
             let end = mention.find(char::is_whitespace).unwrap_or(mention.len());
             let name = &mention[..end];
+            mentions += if name == "all" { 2 } else { 1 };
             if name == "all" {
                 targets.extend(
                     self.registry
@@ -532,7 +644,7 @@ impl App {
             seen.push(id.clone());
             new
         });
-        Ok((targets, prompt.into()))
+        Ok((targets, prompt.into(), mentions > 1))
     }
 
     fn deliver(&mut self, id: &str, prompt: String, writable: bool) -> Vec<Effect> {
@@ -550,7 +662,7 @@ impl App {
             return vec![];
         }
         let seat = self.seat_mut(id).expect("every participant has a seat");
-        if seat.busy {
+        if seat.busy || seat.held {
             seat.queue.push_back((prompt, writable));
             self.push("roundtable", format!("queued for {id}"), LineKind::Info);
             return vec![];
@@ -563,18 +675,21 @@ impl App {
             unreachable!("availability() refuses non-cli participants for now");
         };
         // One writable turn per checkout (ADR 0004): if the writer changed while the old one
-        // is still editing, the new turn waits its turn as read-only instead of overlapping.
-        let overlap = self.seats.iter().any(|s| s.busy && s.writable);
-        let writable = if writable && overlap {
+        // is still editing, the new turn waits until it is done.
+        if self.quitting {
+            return vec![];
+        }
+        if writable && self.seats.iter().any(|s| s.busy && s.writable) {
+            let seat = self.seat_mut(&p.id).expect("seat");
+            seat.queue.push_front((prompt, true));
+            seat.held = true;
             self.push(
                 "roundtable",
-                format!("{}: read-only, another writer is still editing", p.id),
+                format!("{}: waiting, another writer is still editing", p.id),
                 LineKind::Info,
             );
-            false
-        } else {
-            writable
-        };
+            return vec![];
+        }
         let index = self.lines.len();
         self.lines.push(ChatLine {
             who: p.id.clone(),
@@ -613,6 +728,7 @@ impl App {
         let mut any = false;
         for seat in &mut self.seats {
             seat.queue.clear();
+            seat.held = false;
             any |= seat.busy;
         }
         if any {
@@ -735,8 +851,36 @@ impl App {
             && let Some(p) = self.registry.get(id).cloned()
         {
             // Rechecked: the writer or the lock may have changed while it waited.
+            let writable = writable && self.registry.writer() == Some(id) && !self.locked();
+            effects.extend(self.start(&p, prompt, writable));
+        }
+        if writable {
+            effects.extend(self.release_held());
+        }
+        effects
+    }
+
+    /// A writer finished: every held seat gets its turn again. The first one that is still
+    /// the writer starts editing; any other one is held again by `start`'s own check.
+    fn release_held(&mut self) -> Vec<Effect> {
+        let held: Vec<String> = self
+            .seats
+            .iter()
+            .filter(|s| s.held && !s.busy)
+            .map(|s| s.id.clone())
+            .collect();
+        let mut effects = vec![];
+        for id in held {
+            let seat = self.seat_mut(&id).expect("seat");
+            seat.held = false;
+            let Some((prompt, writable)) = seat.queue.pop_front() else {
+                continue;
+            };
+            let Some(p) = self.registry.get(&id).cloned() else {
+                continue;
+            };
             let writable =
-                writable && self.registry.writer() == Some(id) && self.edits_locked.is_empty();
+                writable && self.registry.writer() == Some(id.as_str()) && !self.locked();
             effects.extend(self.start(&p, prompt, writable));
         }
         effects
@@ -1177,7 +1321,10 @@ mod tests {
     #[test]
     fn locked_edits_run_read_only_until_quiet() {
         let mut app = App::default();
-        app.lock_edits(vec!["T1".into()], "/repo");
+        app.lock_edits(vec![Lock::Open {
+            id: "T1".into(),
+            checkout: "/repo".into(),
+        }]);
         assert!(last_text(&app).starts_with("edits are locked"));
         let effects = type_line(&mut app, "fix");
         assert_eq!(writable(&effects), [("claude".into(), false)]);
@@ -1192,6 +1339,27 @@ mod tests {
             type_line(&mut app, "/quiet"),
             [Effect::ConfirmQuiet(vec!["T1".into()])]
         );
+        // Not unlocked until the settle is confirmed on disk.
+        assert_eq!(
+            writable(&type_line(&mut app, "fix")),
+            [("claude".into(), false)]
+        );
+        app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        app.update(Event::QuietDone {
+            settled: vec![],
+            failed: vec![("T1".into(), "disk full".into())],
+        });
+        assert_eq!(last_text(&app), "edits are still locked");
+        assert_eq!(
+            type_line(&mut app, "/quiet"),
+            [Effect::ConfirmQuiet(vec!["T1".into()])],
+            "a failed settle can be retried"
+        );
+        app.update(Event::QuietDone {
+            settled: vec!["T1".into()],
+            failed: vec![],
+        });
+        assert_eq!(last_text(&app), "edits unlocked");
         assert_eq!(
             writable(&type_line(&mut app, "fix")),
             [("claude".into(), true)]
@@ -1212,11 +1380,153 @@ mod tests {
             &DEFAULT_FILE.replace("writer = \"claude\"", "writer = \"codex\""),
         );
         let effects = type_line(&mut app, "@codex edit too");
-        assert_eq!(writable(&effects), [("codex".into(), false)]);
         assert!(
-            app.lines
-                .iter()
-                .any(|l| l.text == "codex: read-only, another writer is still editing")
+            writable(&effects).is_empty(),
+            "codex waits instead of overlapping"
+        );
+        assert_eq!(
+            last_text(&app),
+            "codex: waiting, another writer is still editing"
+        );
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        assert_eq!(
+            writable(&effects),
+            [("codex".into(), true)],
+            "the waiting writer starts, still writable"
+        );
+    }
+
+    /// Claude is editing; then the writer becomes `new` and `@new edit` waits.
+    fn waiting_edit(new: &str, extra: &str) -> App {
+        let file = format!("{DEFAULT_FILE}{extra}");
+        let mut app = App::default();
+        reload(&mut app, &file);
+        type_line(&mut app, "claude edits");
+        reload(
+            &mut app,
+            &file.replace("writer = \"claude\"", &format!("writer = \"{new}\"")),
+        );
+        assert!(started(&type_line(&mut app, &format!("@{new} edit"))).is_empty());
+        app
+    }
+
+    #[test]
+    fn esc_and_quit_discard_a_waiting_edit() {
+        let mut app = waiting_edit("codex", "");
+        assert_eq!(
+            app.update(key(KeyCode::Esc, KeyModifiers::NONE)),
+            [Effect::CancelTurns]
+        );
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Interrupted)));
+        assert!(started(&effects).is_empty(), "Esc dropped the waiting edit");
+
+        let mut app = waiting_edit("codex", "");
+        app.update(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Interrupted)));
+        assert!(
+            started(&effects).is_empty(),
+            "nothing starts while quitting"
+        );
+    }
+
+    #[test]
+    fn every_waiting_seat_gets_its_turn() {
+        let third = "\n[[model]]\nid = \"claude2\"\nkind = \"cli\"\ncmd = \"claude\"\n";
+        let mut app = waiting_edit("codex", third);
+        // The writer moves on again to claude2, which also asks to edit.
+        let file =
+            format!("{DEFAULT_FILE}{third}").replace("writer = \"claude\"", "writer = \"claude2\"");
+        reload(&mut app, &file);
+        assert!(started(&type_line(&mut app, "@claude2 edit")).is_empty());
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        assert_eq!(
+            writable(&effects),
+            [("codex".into(), false), ("claude2".into(), true)],
+            "codex is no longer the writer; claude2 edits"
+        );
+    }
+
+    #[test]
+    fn a_waiting_edit_keeps_its_place_in_line() {
+        let mut app = waiting_edit("codex", "");
+        let effects = type_line(&mut app, "@all status?");
+        assert!(
+            started(&effects).is_empty(),
+            "both seats are occupied: claude busy, codex held"
+        );
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        let order: Vec<_> = writable(&effects);
+        assert_eq!(
+            order,
+            [("claude".into(), false), ("codex".into(), true)],
+            "codex runs its edit first; its @all reply waits behind it"
+        );
+    }
+
+    #[test]
+    fn a_broadcast_stays_read_only_even_when_only_the_writer_is_left() {
+        let registry = Registry::parse(DEFAULT_FILE).unwrap();
+        let checks = Checks::from([
+            ("claude".into(), Ok("v".into())),
+            ("codex".into(), Err("unavailable".into())),
+        ]);
+        let mut app = App::new(registry, checks);
+        assert_eq!(
+            writable(&type_line(&mut app, "@all fix this")),
+            [("claude".into(), false)]
+        );
+        let mut app = App::default();
+        assert_eq!(
+            writable(&type_line(&mut app, "@claude @claude fix")),
+            [("claude".into(), false)],
+            "two mentions are a broadcast even if they name the same one"
+        );
+    }
+
+    #[test]
+    fn unreadable_threads_lock_and_quiet_cannot_lift_it() {
+        let mut app = App::default();
+        app.lock_edits(vec![Lock::Unreadable {
+            id: "T9".into(),
+            why: "meta.json: eof".into(),
+        }]);
+        assert!(last_text(&app).contains("thread T9 can't be read"));
+        assert!(type_line(&mut app, "/quiet").is_empty());
+        assert_eq!(
+            writable(&type_line(&mut app, "fix")),
+            [("claude".into(), false)]
+        );
+        assert!(
+            app.lines.iter().any(|l| l.text
+                == "read-only: edits are locked until the problem shown above is fixed and roundtable restarted"),
+            "the hint names the real way out"
+        );
+    }
+
+    #[test]
+    fn the_lock_names_every_checkout_it_covers() {
+        let mut app = App::default();
+        app.lock_edits(vec![
+            Lock::Open {
+                id: "T1".into(),
+                checkout: "/outer".into(),
+            },
+            Lock::Open {
+                id: "T2".into(),
+                checkout: "/outer/nested".into(),
+            },
+        ]);
+        assert!(last_text(&app).contains("never finished in /outer and /outer/nested"));
+    }
+
+    #[test]
+    fn an_unknown_checkout_locks_edits() {
+        let mut app = App::default();
+        app.lock_unknown_checkout("fatal: detected dubious ownership");
+        assert!(last_text(&app).starts_with("edits are locked: git can't tell"));
+        assert_eq!(
+            writable(&type_line(&mut app, "fix")),
+            [("claude".into(), false)]
         );
     }
 
