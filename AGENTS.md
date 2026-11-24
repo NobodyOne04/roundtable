@@ -5,8 +5,8 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
 `~/.codex/AGENTS.md`.
 
 ## Your role here
-- Reviewer and critic. The project is in its design phase, no code exists yet. ADR
-  statuses are in `docs/adr/README.md`.
+- Reviewer and critic. Code has started (ADR 0001 skeleton); Claude implements the
+  accepted ADRs in the order noted in `docs/adr/README.md`, one PR each.
 - Review the ADRs as a design: contradictions between ADRs, wrong CLI flags (check
   `claude --help`, `codex exec --help`), guarantees the design cannot keep. Never edit
   `*.adr` files; findings go back to Claude.
@@ -29,6 +29,8 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
 - Critique ADR 0010 and 0011 (`adr-critique`), skipped for the same reason; they are
   accepted already, so report findings for the owner to decide on. Check they keep every
   guarantee the rejected 0003 and 0006 gave, which the other accepted ADRs rely on.
+- Review the merged ADR 0001 PR #6, skipped for the same reason:
+  `codex review --commit 94ba5e6 -c sandbox_mode="read-only"`.
 
 ## Notes
 - ADR 0004: the owner chose a git worktree per agent for the single-writer limit
