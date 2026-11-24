@@ -25,6 +25,7 @@ use notify_debouncer_mini::notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, DebouncedEventBatch, new_debouncer};
 use roundtable::agent::{self, Outcome, PEvent, Turn};
 use roundtable::app::{App, ChatLine, Checks, EditLock, Effect, Event, FileEdit, LineKind};
+use roundtable::openai;
 use roundtable::registry::{self, Adapter, Registry};
 use roundtable::transcript::{self, NewEvent, Store, Thread};
 use roundtable::writer_lock::{
@@ -85,6 +86,7 @@ async fn start() -> Result<()> {
         lock,
         writers: HashMap::new(),
         data_root: root.clone(),
+        secrets: vec![],
         cwd,
         outside_repo,
         models_path,
@@ -156,6 +158,9 @@ struct Runtime {
     /// The running writable turn's lock and marker, by participant id.
     writers: HashMap<String, WriterGuard>,
     data_root: PathBuf,
+    /// Resolved API keys with their references, redacted from every transcript write
+    /// (ADR 0010). Values only ever live in memory.
+    secrets: Vec<(String, String)>,
     outside_repo: bool,
     models_path: PathBuf,
     /// Fingerprint of the `models.toml` text last applied or written, so own writes and
@@ -168,7 +173,8 @@ struct Runtime {
 impl Runtime {
     // shortcut: appends run on the loop task, not a writer task with acks (ADR 0010);
     // fine while writes are small, move them off the loop when fsync latency shows.
-    fn record(&mut self, event: NewEvent, durable: bool) -> Result<()> {
+    fn record(&mut self, mut event: NewEvent, durable: bool) -> Result<()> {
+        transcript::redact(&mut event.payload, &self.secrets);
         let thread = match &mut self.thread {
             Some(thread) => thread,
             // Only a message opens a thread; registry notes before it go to the log only.
@@ -452,6 +458,45 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         permission_mode,
                     };
                     tokio::spawn(agent::run(id, kind, turn, tx.clone(), token));
+                }
+                Effect::StartChat {
+                    id,
+                    base_url,
+                    model,
+                    key_ref,
+                    system,
+                    history,
+                    prompt,
+                    context_window,
+                    max_output,
+                } => {
+                    // Resolved per request (ADR 0011): a changed key is used at once.
+                    let key = match key_ref.as_deref().map(openai::resolve_key).transpose() {
+                        Ok(key) => key,
+                        Err(why) => {
+                            local.push_back(Event::Agent(id.clone(), PEvent::Error(why)));
+                            local.push_back(Event::Agent(id, PEvent::Done(Outcome::Failed)));
+                            continue;
+                        }
+                    };
+                    if let (Some(value), Some(reference)) = (&key, &key_ref)
+                        && !rt.secrets.iter().any(|(v, _)| v == value)
+                    {
+                        rt.secrets.push((value.clone(), reference.clone()));
+                    }
+                    let token = CancellationToken::new();
+                    rt.turns.insert(id.clone(), token.clone());
+                    let chat = openai::Chat {
+                        base_url,
+                        model,
+                        key,
+                        system,
+                        history,
+                        prompt,
+                        context_window,
+                        max_output,
+                    };
+                    tokio::spawn(openai::run(id, chat, tx.clone(), token));
                 }
                 Effect::CancelTurn(id) => {
                     if let Some(token) = rt.turns.get(&id) {

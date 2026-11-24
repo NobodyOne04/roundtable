@@ -14,6 +14,7 @@ Rust TUI console that runs Claude Code, Codex and OpenAI-compatible models in on
 - `src/agent.rs`: Claude Code and Codex adapters (command + JSON parser) and the process runner: process group, cancel, reap (ADR 0004).
 - `tests/fixtures/`: recorded CLI output per version (`claude-<ver>-turnN.jsonl`, `codex-<ver>-turnN.jsonl`), stripped of paths and account fields.
 - `src/registry.rs`: `models.toml` parsing and validation (all or nothing), default file, identities (FNV-1a), comment-keeping edits (ADR 0011).
+- `src/openai.rs`: OpenAI-compatible chat: streaming SSE, history fitting, retries, key resolution (ADR 0005).
 - `src/writer_lock.rs`: checkout resolution (git root, git dir) and the writer lock and crash marker (ADR 0012).
 - `src/transcript.rs`: transcript files, single-instance lock, atomic writes (ADR 0010).
 - `src/app.rs`: `App` state, `Event`, `Effect` and `App::update`, the only place state changes (ADR 0002).
@@ -24,6 +25,7 @@ Rust TUI console that runs Claude Code, Codex and OpenAI-compatible models in on
 - `AGENTS.md`: Codex context (its role here, state, pending tasks); keep "Pending for Codex" current.
 
 ## Conventions
+- Resolved API keys live only in `Runtime::secrets` and are redacted by `Runtime::record`; never log or show a key value, only its reference.
 - Events the loop raises itself go into its `local` queue, never `try_send` on its own channel (a full channel would drop them).
 - Each ADR implementation PR marks its row `done` in the README roadmap and the next one `next`.
 - New CLI version: record a fresh two-turn fixture (sanitize: no paths, account or credential fields, no request ids such as `api_message_id`, `msg_…`, `uuid`, thinking `signature`), keep the old one, and update the tested versions in the README.

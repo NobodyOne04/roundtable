@@ -329,6 +329,24 @@ impl Thread {
     }
 }
 
+/// Replaces every resolved key value in `value` with `[redacted:<reference>]`, before
+/// anything is written (ADR 0010): a key can come back inside a provider error or a reply.
+pub fn redact(value: &mut serde_json::Value, secrets: &[(String, String)]) {
+    match value {
+        serde_json::Value::String(text) => {
+            for (secret, reference) in secrets {
+                // Very short values would redact ordinary words; real keys are long.
+                if secret.len() >= 8 && text.contains(secret.as_str()) {
+                    *text = text.replace(secret.as_str(), &format!("[redacted:{reference}]"));
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|v| redact(v, secrets)),
+        serde_json::Value::Object(map) => map.values_mut().for_each(|v| redact(v, secrets)),
+        _ => {}
+    }
+}
+
 /// The `settle` that closes a crashed writer turn after `/quiet`.
 pub fn settle_event() -> NewEvent {
     NewEvent {
@@ -482,6 +500,20 @@ mod tests {
             assert_eq!(mode(&tdir.join(file)), 0o600, "{file}");
         }
         assert_eq!(mode(&root.join("roundtable.lock")), 0o600);
+    }
+
+    #[test]
+    fn resolved_keys_never_reach_the_transcript() {
+        let secrets = vec![("sk-live-1234567890".to_string(), "env:K".to_string())];
+        let mut payload = json!({
+            "text": "error: invalid key sk-live-1234567890",
+            "nested": [{"echo": "sk-live-1234567890"}],
+            "short": "abc"
+        });
+        redact(&mut payload, &secrets);
+        assert_eq!(payload["text"], "error: invalid key [redacted:env:K]");
+        assert_eq!(payload["nested"][0]["echo"], "[redacted:env:K]");
+        assert_eq!(payload["short"], "abc");
     }
 
     #[test]

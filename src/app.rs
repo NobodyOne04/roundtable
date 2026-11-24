@@ -62,6 +62,18 @@ pub enum FileEdit {
 pub enum Effect {
     Redraw,
     Quit,
+    /// A chat turn for an OpenAI-compatible model (ADR 0005); the loop resolves the key.
+    StartChat {
+        id: String,
+        base_url: String,
+        model: String,
+        key_ref: Option<String>,
+        system: String,
+        history: Vec<(String, String)>,
+        prompt: String,
+        context_window: u64,
+        max_output: u64,
+    },
     StartTurn {
         id: String,
         kind: agent::Kind,
@@ -128,7 +140,15 @@ struct Seat {
     held: bool,
     /// Index of the reply being streamed in `lines`.
     reply: Option<usize>,
-    usage: (u64, u64, Option<f64>),
+    /// Input and output tokens, cost, and whether roundtable estimated them (ADR 0005).
+    usage: (u64, u64, Option<f64>, bool),
+    /// An OpenAI-compatible model's own history, as prompt/reply pairs (ADR 0005); it
+    /// starts empty for a new destination.
+    // shortcut: kept in memory for the open thread; `/resume` (ADR 0008) rebuilds it from
+    // the transcript.
+    history: Vec<(String, String)>,
+    /// The running turn's prompt, added to `history` when the reply completes.
+    prompt: Option<String>,
     /// The identity the running turn was sent to. Its events belong to that destination,
     /// even if the registry changed meanwhile (ADR 0011).
     turn_identity: Option<String>,
@@ -511,6 +531,7 @@ impl App {
             }
             if identity_changed && let Some(seat) = self.seat_mut(&p.id) {
                 seat.session = None;
+                seat.history.clear();
             }
         }
         let gone: Vec<String> = self
@@ -526,6 +547,7 @@ impl App {
             // Coming back later is a fresh start, whatever it points to then.
             if let Some(seat) = self.seat_mut(&id) {
                 seat.session = None;
+                seat.history.clear();
             }
         }
         for p in &next.participants {
@@ -538,7 +560,9 @@ impl App {
                     writable: false,
                     held: false,
                     reply: None,
-                    usage: (0, 0, None),
+                    usage: (0, 0, None, false),
+                    history: vec![],
+                    prompt: None,
                     turn_identity: None,
                 });
             }
@@ -573,8 +597,9 @@ impl App {
     }
 
     fn availability(&self, p: &Participant) -> Result<(), String> {
+        // No preflight for HTTP models: a dead endpoint shows up as the turn's error.
         if p.adapter == Adapter::OpenAi {
-            return Err("OpenAI-compatible models answer from ADR 0005 on".into());
+            return Ok(());
         }
         match self.checks.get(&p.id) {
             Some(Ok(_)) => Ok(()),
@@ -652,9 +677,8 @@ impl App {
     }
 
     fn start(&mut self, p: &Participant, prompt: String, writable: bool) -> Vec<Effect> {
-        let Adapter::Cli(kind) = p.adapter else {
-            unreachable!("availability() refuses non-cli participants for now");
-        };
+        // Only a cli writer edits; the registry never makes an openai model the writer.
+        let writable = writable && matches!(p.adapter, Adapter::Cli(_));
         // One writable turn per checkout (ADR 0004): if the writer changed while the old one
         // is still editing, the new turn waits until it is done.
         if self.quitting {
@@ -682,17 +706,49 @@ impl App {
         seat.writable = writable;
         seat.turn_identity = Some(p.identity.clone());
         seat.reply = Some(index);
-        seat.usage = (0, 0, None);
+        seat.usage = (0, 0, None, false);
+        seat.prompt = Some(prompt.clone());
         let session = seat.session.clone();
+        let history = seat.history.clone();
+        let delivery = record(
+            router(),
+            vec![self.party(&p.id)],
+            transcript::Kind::Delivery,
+            // A writable delivery is the writer marker: synced before the CLI starts.
+            json!({ "status": "sent", "text": prompt, "writable": writable }),
+        )
+        .durable();
+        let Adapter::Cli(kind) = p.adapter else {
+            let role = p
+                .role
+                .as_deref()
+                .map(|r| format!(" Your role: {r}."))
+                .unwrap_or_default();
+            return vec![
+                delivery,
+                Effect::StartChat {
+                    id: p.id.clone(),
+                    base_url: p.base_url.clone().unwrap_or_default(),
+                    model: p.model.clone().unwrap_or_default(),
+                    key_ref: p.key.clone(),
+                    system: format!(
+                        "You are `{}`, one participant in a group chat with a human and other AI \
+                         models, run by roundtable.{role} Answer the human's message.",
+                        p.id
+                    ),
+                    history,
+                    prompt,
+                    context_window: p
+                        .context_window
+                        .unwrap_or(crate::openai::DEFAULT_CONTEXT_WINDOW),
+                    max_output: p
+                        .max_output_tokens
+                        .unwrap_or(crate::openai::DEFAULT_MAX_OUTPUT),
+                },
+            ];
+        };
         vec![
-            record(
-                router(),
-                vec![self.party(&p.id)],
-                transcript::Kind::Delivery,
-                // A writable delivery is the writer marker: synced before the CLI starts.
-                json!({ "status": "sent", "text": prompt, "writable": writable }),
-            )
-            .durable(),
+            delivery,
             Effect::StartTurn {
                 id: p.id.clone(),
                 kind,
@@ -793,8 +849,9 @@ impl App {
                 input,
                 output,
                 cost_usd,
+                estimated,
             } => {
-                seat.usage = (input, output, cost_usd);
+                seat.usage = (input, output, cost_usd, estimated);
                 vec![]
             }
             PEvent::Error(text) => {
@@ -809,8 +866,9 @@ impl App {
         let party = self.turn_party(id);
         let seat = self.seat_mut(id).expect("seat");
         seat.busy = false;
-        let (tokens_in, tokens_out, cost) = seat.usage;
+        let (tokens_in, tokens_out, cost, estimated) = seat.usage;
         let writable = std::mem::take(&mut seat.writable);
+        let prompt = seat.prompt.take();
         let text = match seat.reply.take() {
             Some(i) => {
                 self.lines[i].kind = LineKind::Reply(outcome);
@@ -818,12 +876,29 @@ impl App {
             }
             None => String::new(),
         };
+        // A complete exchange becomes the model's own history for its next turn.
+        if outcome == Outcome::Complete
+            && self
+                .registry
+                .get(id)
+                .is_some_and(|p| p.adapter == Adapter::OpenAi)
+            && let Some(prompt) = prompt
+        {
+            let seat = self.seat_mut(id).expect("seat");
+            seat.history.push((prompt, text.clone()));
+        }
         let mut reply = record(
             party,
             vec![user()],
             transcript::Kind::Msg,
             // `writable` here closes the writer marker of the delivery (ADR 0010).
-            json!({ "text": text, "status": outcome.as_str(), "cost_usd": cost, "writable": writable }),
+            json!({
+                "text": text,
+                "status": outcome.as_str(),
+                "cost_usd": cost,
+                "usage_estimated": estimated,
+                "writable": writable,
+            }),
         )
         .durable();
         if let Effect::Record { event, .. } = &mut reply {
@@ -1127,6 +1202,7 @@ mod tests {
                 input: 10,
                 output: 2,
                 cost_usd: Some(0.01),
+                estimated: false,
             },
         ));
         let effects = app.update(agent("claude", PEvent::Done(Outcome::Complete)));
@@ -1570,20 +1646,115 @@ mod tests {
         assert_eq!(started(&type_line(&mut app, "@codex hi")), ["codex"]);
     }
 
+    const LLAMA: &str = "\n[[model]]\nid = \"llama\"\nkind = \"openai\"\nbase_url = \"http://localhost:11434/v1\"\nmodel = \"llama3.3\"\nkey = \"env:LLAMA_KEY\"\n";
+
+    /// A chat start: participant id, history sent, prompt.
+    type ChatStart = (String, Vec<(String, String)>, String);
+
+    fn chats(effects: &[Effect]) -> Vec<ChatStart> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::StartChat {
+                    id,
+                    history,
+                    prompt,
+                    ..
+                } => Some((id.clone(), history.clone(), prompt.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn openai_models_are_listed_but_not_yet_served() {
-        let text = format!(
-            "{DEFAULT_FILE}\n[[model]]\nid = \"llama\"\nkind = \"openai\"\nbase_url = \"http://localhost:11434/v1\"\nmodel = \"llama3.3\"\n"
-        );
+    fn openai_models_chat_with_their_own_history() {
         let mut app = App::default();
-        reload(&mut app, &text);
+        reload(&mut app, &format!("{DEFAULT_FILE}{LLAMA}"));
         type_line(&mut app, "/models");
-        assert!(last_text(&app).contains(
-            "llama (openai, llama3.3) unavailable: OpenAI-compatible models answer from ADR 0005 on"
-        ));
+        assert!(last_text(&app).contains("llama (openai, llama3.3) ready"));
+
+        let effects = type_line(&mut app, "@llama hi");
+        match &effects[..] {
+            [
+                Effect::Record { .. },
+                Effect::Record { .. },
+                Effect::StartChat {
+                    key_ref,
+                    system,
+                    context_window,
+                    max_output,
+                    ..
+                },
+            ] => {
+                assert_eq!(
+                    key_ref.as_deref(),
+                    Some("env:LLAMA_KEY"),
+                    "a reference, resolved by the loop"
+                );
+                assert!(system.contains("`llama`"));
+                assert_eq!((*context_window, *max_output), (8_192, 4_096), "defaults");
+            }
+            other => panic!("{other:?}"),
+        }
+        app.update(agent("llama", PEvent::TextDelta("hello".into())));
+        app.update(agent("llama", PEvent::Done(Outcome::Complete)));
+        let effects = type_line(&mut app, "@llama again");
         assert_eq!(
-            started(&type_line(&mut app, "@all hi")),
-            ["claude", "codex"]
+            chats(&effects),
+            [(
+                "llama".into(),
+                vec![("hi".into(), "hello".into())],
+                "again".into()
+            )]
         );
+
+        // `@all` reaches it too; a failed turn adds nothing to its history.
+        let effects = app.update(agent("llama", PEvent::Done(Outcome::Failed)));
+        assert!(chats(&effects).is_empty());
+        let effects = type_line(&mut app, "@all status");
+        assert_eq!(started(&effects), ["claude", "codex"]);
+        assert_eq!(chats(&effects).len(), 1);
+        assert_eq!(chats(&effects)[0].1.len(), 1, "only the completed exchange");
+    }
+
+    #[test]
+    fn a_new_endpoint_starts_with_empty_history() {
+        let mut app = App::default();
+        reload(&mut app, &format!("{DEFAULT_FILE}{LLAMA}"));
+        type_line(&mut app, "@llama hi");
+        app.update(agent("llama", PEvent::Done(Outcome::Complete)));
+        let hosted = LLAMA.replace("http://localhost:11434/v1", "https://openrouter.ai/api/v1");
+        reload(&mut app, &format!("{DEFAULT_FILE}{hosted}"));
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| l.text.starts_with("llama now points to a new destination"))
+        );
+        let effects = type_line(&mut app, "@llama hi again");
+        assert!(
+            chats(&effects)[0].1.is_empty(),
+            "history not carried to a hosted API"
+        );
+    }
+
+    #[test]
+    fn usage_estimates_are_marked_in_the_transcript() {
+        let mut app = App::default();
+        reload(&mut app, &format!("{DEFAULT_FILE}{LLAMA}"));
+        type_line(&mut app, "@llama hi");
+        app.update(agent(
+            "llama",
+            PEvent::Usage {
+                input: 5,
+                output: 1,
+                cost_usd: None,
+                estimated: true,
+            },
+        ));
+        let effects = app.update(agent("llama", PEvent::Done(Outcome::Complete)));
+        let Effect::Record { event, .. } = &effects[0] else {
+            panic!()
+        };
+        assert_eq!(event.payload["usage_estimated"], true);
     }
 }
