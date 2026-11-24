@@ -1,6 +1,6 @@
 # 0010. Append-only JSONL files are the transcript
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-24
 
 Replaces the rejected [0003](0003-sqlite-event-log.adr): the owner wants no database. The

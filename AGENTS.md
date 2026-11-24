@@ -15,7 +15,8 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
 - Repo `NobodyOne04/roundtable`, private, so no "protect main" ruleset.
 - The owner accepted 0001, 0002, 0004, 0005, 0007, 0008, 0009 and rejected 0003 (SQLite:
   no database wanted) and 0006 (registry: must be hot, in memory). Their replacements,
-  0010 (JSONL files) and 0011 (hot registry), are *Proposed*.
+  0010 (JSONL files) and 0011 (hot registry), are accepted too (2026-11-24), without a
+  Codex critique (usage limit).
 - Your earlier findings and what Claude did with each are in PR #1's body under
   `## Codex review`.
 
@@ -25,13 +26,14 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
   Report findings to Claude; Claude fixes them in a follow-up `docs/` PR.
 - Review the ADR 0004 decision change (worktree per agent), skipped for the same reason:
   `codex review --commit 9491219 -c sandbox_mode="read-only"`.
-- Critique the drafts of ADR 0010 and 0011 (`adr-critique`), skipped for the same reason.
-  Check they keep every guarantee the rejected 0003 and 0006 gave, which the accepted ADRs
-  rely on.
-- Review the ADR 0001 PR (`feature/adr-0001-scaffold`), skipped for the same reason:
+- Critique ADR 0010 and 0011 (`adr-critique`), skipped for the same reason; they are
+  accepted already, so report findings for the owner to decide on. Check they keep every
+  guarantee the rejected 0003 and 0006 gave, which the other accepted ADRs rely on.
+- Review the merged ADR 0001 PR #6, skipped for the same reason:
+  `codex review --commit 94ba5e6 -c sandbox_mode="read-only"`.
+- Review the ADR 0002 PR #7 (`feature/adr-0002-event-loop`), skipped for the same reason:
   `codex review --base origin/main -c sandbox_mode="read-only"` on that branch, or
   `--commit <its squash sha>` once merged.
-- Review the ADR 0002 PR (`feature/adr-0002-event-loop`), skipped for the same reason.
 
 ## Notes
 - ADR 0004: the owner chose a git worktree per agent for the single-writer limit
