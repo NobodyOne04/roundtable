@@ -308,13 +308,45 @@ impl Runtime {
         match lock.clear(confirmed) {
             Ok(Cleared::Removed(marker)) => {
                 tracing::info!(?marker, "crash marker removed after /quiet");
-                // History: close the crashed turn in its thread when it is ours.
-                if let Some(m) = marker
-                    && m.data_root == self.data_root
-                    && !m.thread.is_empty()
-                    && let Err(err) = self.store.settle_writer(&m.thread)
-                {
-                    tracing::warn!(thread = %m.thread, %err, "settle after /quiet failed");
+                // History: close the crashed turn in its own thread when it is in this data
+                // folder (through the live handle if it is the open thread, so sequence
+                // numbers stay unique); otherwise note the recovery in the current thread.
+                let active = self.thread.as_ref().map(|t| t.meta.id.clone());
+                let result = match &marker {
+                    Some(m)
+                        if m.data_root == self.data_root && active.as_ref() == Some(&m.thread) =>
+                    {
+                        self.record(transcript::settle_event(), true)
+                    }
+                    Some(m) if m.data_root == self.data_root && !m.thread.is_empty() => self
+                        .store
+                        .settle_writer(&m.thread)
+                        .map_err(anyhow::Error::from),
+                    _ => {
+                        let note = serde_json::json!({
+                            "recovered": "crash marker cleared by /quiet",
+                            "marker": marker,
+                        });
+                        self.record(
+                            NewEvent {
+                                turn: None,
+                                parent: None,
+                                from: transcript::Party {
+                                    id: "user".into(),
+                                    identity: None,
+                                },
+                                to: vec![],
+                                kind: transcript::Kind::Status,
+                                payload: note,
+                                tokens_in: None,
+                                tokens_out: None,
+                            },
+                            true,
+                        )
+                    }
+                };
+                if let Err(err) = result {
+                    tracing::warn!(%err, "recording the recovery after /quiet failed");
                 }
                 Event::QuietDone(Ok(()))
             }

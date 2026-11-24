@@ -28,8 +28,32 @@ pub fn resolve(cwd: &Path) -> Result<Checkout, String> {
             return Err(format!("{var} is set; unset it to let the writer edit"));
         }
     }
+    let root = match git_path(cwd, "--show-toplevel")? {
+        Some(root) => root,
+        None => return Ok(Checkout::Outside),
+    };
+    let git_dir = git_path(cwd, "--absolute-git-dir")?
+        .ok_or_else(|| "git found a worktree but no git dir".to_string())?;
+    match (root.canonicalize(), cwd.canonicalize()) {
+        (Ok(r), Ok(c)) if c.starts_with(&r) => Ok(Checkout::Git {
+            root,
+            lock: CheckoutLock {
+                dir: git_dir.join("roundtable"),
+            },
+        }),
+        _ => Err(format!(
+            "git names {} as the checkout, which doesn't contain {}",
+            root.display(),
+            cwd.display()
+        )),
+    }
+}
+
+/// One path from `git rev-parse <flag>`, asked for alone so a path holding a newline can't
+/// be split; only git's final line terminator is stripped. `None`: not a git repository.
+fn git_path(cwd: &Path, flag: &str) -> Result<Option<PathBuf>, String> {
     let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel", "--absolute-git-dir"])
+        .args(["rev-parse", flag])
         .current_dir(cwd)
         // English messages, so "not a git repository" is recognised whatever the locale.
         .env("LC_ALL", "C")
@@ -42,30 +66,16 @@ pub fn resolve(cwd: &Path) -> Result<Checkout, String> {
         if stderr.contains("not a git repository (or any of the parent directories)")
             || stderr.contains("not a git repository (or any parent up to mount point")
         {
-            return Ok(Checkout::Outside);
+            return Ok(None);
         }
         return Err(stderr.trim().to_string());
     }
-    let stdout = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
-    // One path per line; only the line terminator is stripped, a name may end in spaces.
-    let mut lines = stdout.split('\n');
-    let (Some(root), Some(git_dir)) = (lines.next(), lines.next()) else {
-        return Err(format!("unexpected git output: {stdout:?}"));
-    };
-    let root = PathBuf::from(root);
-    match (root.canonicalize(), cwd.canonicalize()) {
-        (Ok(r), Ok(c)) if c.starts_with(&r) => Ok(Checkout::Git {
-            root,
-            lock: CheckoutLock {
-                dir: PathBuf::from(git_dir).join("roundtable"),
-            },
-        }),
-        _ => Err(format!(
-            "git names {} as the checkout, which doesn't contain {}",
-            root.display(),
-            cwd.display()
-        )),
+    let mut bytes = output.stdout;
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
     }
+    use std::os::unix::ffi::OsStringExt;
+    Ok(Some(PathBuf::from(std::ffi::OsString::from_vec(bytes))))
 }
 
 /// What a crash marker records, to show the user who left it.
@@ -137,11 +147,9 @@ impl CheckoutLock {
         self.dir.join("writer.json")
     }
 
-    /// Creates the folder (owner-only) and makes its entry durable the first time.
+    /// Creates the folder (owner-only) and makes its entry durable. The parent is synced
+    /// every time: an existing folder proves nothing if its creator died before syncing.
     fn ensure_dir(&self) -> io::Result<()> {
-        if self.dir.is_dir() {
-            return Ok(());
-        }
         crate::transcript::private_dir(&self.dir)?;
         sync_dir(self.dir.parent().unwrap_or(&self.dir))
     }
@@ -175,14 +183,18 @@ impl CheckoutLock {
 
     /// At startup: a marker while nobody holds the lock means a writer crashed.
     pub fn crashed(&self) -> Option<MarkerState> {
-        match self.marker() {
-            MarkerState::Absent => None,
-            state => match self.try_lock() {
-                // Someone holds it: a live writer, not a crash; its turn will clear it.
-                Ok(None) => None,
-                Ok(Some(_released_on_drop)) => Some(state),
-                Err(e) => Some(MarkerState::Unreadable(format!("writer.lock: {e}"))),
+        if self.marker() == MarkerState::Absent {
+            return None;
+        }
+        match self.try_lock() {
+            // Someone holds it: a live writer, not a crash; its turn will clear it.
+            Ok(None) => None,
+            // Read again under the lock: a writer that finished in between left nothing.
+            Ok(Some(_released_on_drop)) => match self.marker() {
+                MarkerState::Absent => None,
+                state => Some(state),
             },
+            Err(e) => Some(MarkerState::Unreadable(format!("writer.lock: {e}"))),
         }
     }
 

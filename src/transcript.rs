@@ -200,20 +200,7 @@ impl Store {
             return Err(Error::NoThread(format!("{id} (events.jsonl is missing)")));
         }
         let mut thread = self.open_thread(id)?;
-        let settle = NewEvent {
-            turn: None,
-            parent: None,
-            from: Party {
-                id: "user".into(),
-                identity: None,
-            },
-            to: vec![],
-            kind: Kind::Settle,
-            payload: serde_json::json!({ "writable": true, "status": "interrupted" }),
-            tokens_in: None,
-            tokens_out: None,
-        };
-        thread.append(settle, true)?;
+        thread.append(settle_event(), true)?;
         Ok(())
     }
 
@@ -339,6 +326,23 @@ impl Thread {
             events.push(event);
         }
         Ok(events)
+    }
+}
+
+/// The `settle` that closes a crashed writer turn after `/quiet`.
+pub fn settle_event() -> NewEvent {
+    NewEvent {
+        turn: None,
+        parent: None,
+        from: Party {
+            id: "user".into(),
+            identity: None,
+        },
+        to: vec![],
+        kind: Kind::Settle,
+        payload: serde_json::json!({ "writable": true, "status": "interrupted" }),
+        tokens_in: None,
+        tokens_out: None,
     }
 }
 
