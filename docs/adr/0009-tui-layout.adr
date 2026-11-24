@@ -1,0 +1,41 @@
+# 0009. Three-pane layout: threads, conversation, context
+
+- Status: Proposed
+- Date: 2026-11-24
+
+The user must see the conversation and each participant's state at once. This ADR fixes
+the screen layout.
+
+## Technical details
+```
+┌ threads ─┬ conversation ──────────────────────────────┬ context ────────┐
+│ #auth    │ you    › fix the login bug                 │ claude  ? 41k ↑ │
+│ #review  │ claude › plan…                             │ codex   ? 12k ↑ │
+│          │   ↳ claude → codex  [handoff ▸]            │ llama ██░ ~38%  │
+│          │ claude › applying fix  [tool: edit ▸]      │ (disabled)      │
+├──────────┴────────────────────────────────────────────┴─────────────────┤
+│ > @codex review this                                    talk:on 2/6 turns│
+└─────────────────────────────────────────────────────────────────────────┘
+```
+- Center: the chat, Claude Code look: speaker label, Markdown body, tool calls and
+  handoffs as collapsed one-liners that expand on `Enter`. Each participant has a stable
+  color; the user is neutral.
+- Left (toggle `Ctrl-B`): threads from the log, newest first.
+- Right (toggle `Ctrl-K`): per participant: state (idle, streaming, unavailable,
+  disabled), role, and two separate numbers:
+  - context fill: a bar only when it is knowable. For chat-only models roundtable builds
+    the request itself, so it shows `~NN%` (estimate). For CLI agents it shows `?`,
+    because their own compaction hides what they keep;
+  - tokens sent and received this thread (`41k ↑`), cumulative, from the log.
+- Bottom: input with completion popup; status line with talk switch, turns and budget used.
+- Narrow terminals (< 100 cols) hide side panes by default; the chat never shrinks below
+  60 cols.
+- Colors follow the terminal palette (16 ANSI colors), so light and dark themes both work;
+  no hard-coded RGB.
+
+Consequences: everything the product promises is visible without a command. Cost: three
+panes are cramped on small terminals, handled by the toggles.
+
+## Technologies and alternatives
+- Involved: ratatui layout, Paragraph, List, Gauge
+- Alternatives: chat only, info via commands: cleaner, but hides exactly what the tool is for; tmux split per agent (claude-squad style): shows agents, not their conversation

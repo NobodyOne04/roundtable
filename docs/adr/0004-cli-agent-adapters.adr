@@ -1,0 +1,89 @@
+# 0004. CLI agents through their JSON streaming modes, ACP later
+
+- Status: Proposed
+- Date: 2026-11-24
+
+Claude Code and Codex are the main participants and they do the real work (edit files,
+run tools). This ADR decides how roundtable drives them.
+
+## Technical details
+- Each agent is a subprocess of its official CLI, using its structured output, never a
+  scraped PTY:
+  - Claude Code: `claude -p --output-format stream-json --input-format stream-json
+    --include-partial-messages --verbose` (without `--include-partial-messages` there are
+    no incremental text chunks); next turns add `--resume <session_id>`.
+  - Codex: first turn `codex exec --json -`, next turns `codex exec resume --json
+    <thread_id> -`; the prompt always goes on stdin, never as an argument (no quoting
+    issues, no length limit, not visible in `ps`).
+  - Both formats are verified per pinned CLI version by a recorded two-turn transcript
+    used as a parser test fixture.
+- One trait, all participants implement it:
+  ```rust
+  trait Participant {
+      fn id(&self) -> &str;
+      fn kind(&self) -> Kind;            // Agent | Model
+      fn send(&self, req: Turn, cancel: CancellationToken) -> BoxStream<'static, PEvent>;
+  }
+  enum PEvent { TextDelta(String), ToolCall{..}, ToolResult{..}, Usage{..}, Done{session_id}, Error(String) }
+  ```
+- Each adapter maps its CLI's events to `PEvent`; unknown event types are logged at
+  `debug` and skipped, never fatal, because CLI formats change between versions.
+- The adapter stores the CLI's own session/thread id per roundtable thread, so the agent
+  keeps its own context and roundtable does not resend history.
+- Version check on start: `claude --version`, `codex --version`; the README lists the
+  tested versions and `/status` warns on others.
+- Auth: roundtable never reads or reuses the CLIs' credentials; each CLI uses its own
+  login. Not logged in shows as `unavailable` in `/status`.
+- Working directory: the directory roundtable was started in. Preflight at start: if it
+  is not inside a git repo, warn and pass `--skip-git-repo-check` to Codex only when the
+  user confirms; otherwise Codex would fail on its first turn. Per-agent git worktrees
+  are a later ADR.
+- One writer per checkout: two agents editing the same files at once is the main risk
+  of `@all` and handoffs. So:
+  - exactly one participant is the writer: the top-level `writer = "<id>"` in config
+    ([0006](0006-model-registry-config.adr)), default `claude`. Until 0006 is
+    implemented, the adapters run with a built-in interim config: `claude` and `codex`
+    only, no writer (every turn read-only), CLI default models;
+  - the checkout is a lock: at most one writable turn at a time, across all threads.
+    Another writable turn (e.g. the writer in a second thread) waits in a queue shown
+    in the status line, and starts only after the adapter confirms the first process
+    and its tools have stopped;
+  - every other agent, and any agent reached through a handoff or `@all`, runs read-only
+    and without the user's own tools, because a write-capable MCP server or hook would
+    bypass any permission mode:
+    - Claude: `--permission-mode plan --strict-mcp-config --mcp-config <roundtable only>`
+      and `--setting-sources` limited so user hooks are not loaded;
+    - Codex: `-s read-only --ignore-user-config` (auth still works), with only the
+      roundtable MCP server added through `-c`. `--ignore-user-config` does not skip a
+      trusted project config, so if the checkout has a `.codex/config.toml` declaring
+      MCP servers, read-only Codex turns are refused with that reason (fail closed)
+      until an effective server allowlist is available.
+    A test runs read-only turns, first launch and resume, with a write-capable MCP server
+    and a writing hook in a throwaway user config and in a project config, and checks the
+    checkout is untouched. Real filesystem isolation
+    for non-writers comes with the worktree ADR;
+  - the writer runs with the permission mode set in its config entry, the CLI's own
+    default if unset; roundtable never passes a bypass flag;
+  - a tool call the CLI refuses for lack of approval shows in the chat as a `tool_result`
+    with the refusal, so the user can rerun it in the agent's own CLI.
+- Cancellation and shutdown belong to the adapter: it kills the CLI's process group (the
+  CLI and the tools it spawned), fails any pending `ask` calls of that turn, and reaps the
+  child before reporting `Done(interrupted)`. Dropping a tokio `Child` does not kill it,
+  so this is explicit (`kill_on_drop(true)` as a backstop).
+- Later: an `acp` adapter using the official `agent-client-protocol` crate, as one more
+  `Participant`, once ACP v2 settles. It does not replace the JSON adapters.
+
+- **Open question for the owner: the single-writer guarantee is best effort.** CLI flags
+  cannot fully stop project-level hooks or config (also from parent directories), or
+  background processes a tool detaches into another process group, from writing to the
+  checkout. Options: (a) state the guarantee as best effort and stop here; (b) OS-level
+  containment per turn (macOS `sandbox-exec`, Linux Landlock/bubblewrap) that can confirm
+  all writers stopped; (c) a git worktree per agent so non-writers never share the
+  writer's files. (c) is planned anyway; (b) is the only full guarantee.
+
+Consequences: works with today's CLIs and the user's existing subscriptions. Cost: two
+hand-written parsers to maintain against moving formats; pin and test versions.
+
+## Technologies and alternatives
+- Involved: claude CLI (stream-json), codex CLI (exec --json), tokio::process, serde_json; later agent-client-protocol
+- Alternatives: ACP only from day one: one integration for all, but v2 is a draft and adds a dependency layer; PTY scraping: breaks on every UI change; calling the vendor APIs directly: loses the agents' tools and may break the CLIs' terms

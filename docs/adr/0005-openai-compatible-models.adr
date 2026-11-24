@@ -1,0 +1,49 @@
+# 0005. Free and side models through one OpenAI-compatible adapter
+
+- Status: Proposed
+- Date: 2026-11-24
+
+The owner wants to plug in new free models. Almost every local runner and free provider
+speaks the OpenAI chat completions API, so one adapter covers them all.
+
+## Technical details
+- Adapter `openai` implements `Participant` ([0004](0004-cli-agent-adapters.adr)) with
+  `POST {base_url}/chat/completions`, `stream: true`, server-sent events.
+- Known to work this way (to verify per release): Ollama (`http://localhost:11434/v1`),
+  LM Studio (`http://localhost:1234/v1`), OpenRouter (`https://openrouter.ai/api/v1`,
+  `:free` models), Groq, Google Gemini's OpenAI-compatible endpoint.
+- Adding a model is a config entry ([0006](0006-model-registry-config.adr)), no code.
+- These are chat-only participants (`Kind::Model`): no file edits, no shell. They answer,
+  review and give second opinions. Tool use for them is out of scope for now.
+- History: unlike CLI agents, they are stateless, so roundtable builds the message list
+  from the event log ([0003](0003-sqlite-event-log.adr)): the thread's messages whose
+  `to_ids` include that model, as `user` role, plus that model's own completed replies,
+  as `assistant` role, in order. Exchanges between other participants are not included.
+  Only events whose recipient or author is the model's *current identity* (hash of
+  `kind`, `base_url`, `model`, see [0003](0003-sqlite-event-log.adr)) are included: if a config edit points an id at a new destination, e.g. from a
+  local runner to a hosted API, the new destination starts with empty history and the
+  chat shows "llama now points to a new endpoint; history not carried over".
+  Fitting it:
+  1. reserve output space first (`max_output_tokens` from config, default 4096);
+  2. always keep the system hint and the current prompt;
+  3. drop whole older turns, oldest first, until the rest fits;
+  4. if the current prompt alone does not fit, do not send; show the error with sizes.
+  Token counts: estimated over the whole candidate message list each time (chars/3, plus
+  1 per non-ASCII char, so CJK and emoji are not undercounted), never carried over from
+  the previous request's usage. Labelled as estimates in `/context`.
+  5. if the provider still rejects the request as too long (context-length error), drop
+     the oldest quarter of the kept history and retry once; a second rejection is shown
+     as an error with the sizes.
+- Usage: read `usage` from the final stream chunk when present
+  (`stream_options.include_usage`), else estimate and mark the number as estimated.
+- Errors: 429 and 5xx are shown in the chat as an `error` event with the provider's
+  message; one retry with backoff for 5xx, none for 429 (free tiers).
+- Timeouts: connect 10 s, idle stream 120 s, both configurable.
+
+Consequences: any new free model is minutes of config. Cost: estimated context and usage
+for providers that do not report them; free models disappear without notice, hence
+`/model test`.
+
+## Technologies and alternatives
+- Involved: reqwest (rustls), reqwest-eventsource, serde_json
+- Alternatives: `async-openai` crate: typed, but tracks OpenAI's own API and lags provider quirks; one adapter per provider: more accurate, far more code for little gain

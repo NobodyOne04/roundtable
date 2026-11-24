@@ -1,0 +1,36 @@
+# 0001. Rust, tokio and ratatui as the stack
+
+- Status: Proposed
+- Date: 2026-11-24
+
+roundtable is a terminal app that streams several agents at once. This ADR picks the
+language, async runtime and TUI library everything else builds on.
+
+## Technical details
+- Language: Rust, stable toolchain, edition 2024, pinned in `rust-toolchain.toml`.
+- One crate at first (`roundtable`), binary command `roundtable`, short alias `rt`
+  documented in the README for users to add themselves. Split into a workspace only when
+  a second binary or a library consumer appears.
+- Async runtime: `tokio` (multi-thread). Agent subprocesses run through `tokio::process`,
+  HTTP models through `reqwest`; every participant streams into the app over channels
+  (see [0002](0002-single-owner-event-loop.adr)).
+- TUI: `ratatui` with the `crossterm` backend; `tui-textarea` for the input box;
+  `pulldown-cmark` to render Markdown replies into ratatui spans.
+- Errors: `thiserror` in modules, `anyhow` at the binary edge. Logs: `tracing` to a file
+  under the data dir, never stdout (the TUI owns the terminal).
+- Terminal safety: a panic hook restores the terminal (leave alternate screen, disable raw
+  mode) before printing the panic, so a crash never leaves the user's shell broken.
+- Quality gates in CI: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo nextest run`. UI tests use ratatui's `TestBackend` with `insta` snapshots.
+- Distribution: a single static-ish binary per platform (macOS arm64/x86_64, Linux
+  x86_64). SQLite is compiled in ([0003](0003-sqlite-event-log.adr)), so no runtime deps
+  beyond the agent CLIs themselves.
+
+Consequences: no GC pauses while several streams render; the official ACP crate is Rust
+([0004](0004-cli-agent-adapters.adr)); Codex itself is Rust, so its source is readable
+when its JSON format changes. Cost: slower early development than Go or TypeScript, and
+async plus borrow-checker friction in the UI loop, contained by 0002.
+
+## Technologies and alternatives
+- Involved: Rust stable, tokio, ratatui, crossterm, tui-textarea, pulldown-cmark, thiserror, anyhow, tracing, insta, cargo-nextest
+- Alternatives: Go + Bubble Tea: faster to write, but ACP SDK is community-only and the owner chose Rust; TypeScript + Ink: what Claude Code uses, but needs Node and starts slower

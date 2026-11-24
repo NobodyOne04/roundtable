@@ -1,0 +1,36 @@
+# 0002. One task owns the state; everything else sends events
+
+- Status: Proposed
+- Date: 2026-11-24
+
+Several agents stream at once while the user types. This ADR fixes how concurrent input
+reaches the app state without shared locks.
+
+## Technical details
+- One app task owns `App` (all state: threads, participants, input, scroll, limits). No
+  `Arc<Mutex<App>>` anywhere.
+- Every source sends an `Event` into one `tokio::sync::mpsc` channel:
+  - keyboard and resize events (a crossterm `EventStream` task),
+  - participant output (one task per running participant, see
+    [0004](0004-cli-agent-adapters.adr) and [0005](0005-openai-compatible-models.adr)),
+  - router decisions ([0007](0007-model-to-model-communication.adr)),
+  - a tick (~30 fps cap) for spinners and redraw throttling.
+- The loop: `recv event → app.update(event) → effects`; `update` is a plain function
+  (state in, state + list of `Effect`s out), so it is unit-testable without a terminal.
+- `Effect`s are executed by the loop: spawn or cancel a participant task, append to the
+  event log ([0003](0003-sqlite-event-log.adr)), write config. Their results come back as
+  new `Event`s.
+- Redraw only when state changed and at most once per tick.
+- Cancellation: each participant task holds a `CancellationToken`; disabling a model or
+  `Esc` on a running reply cancels it. The reply is stored as `interrupted` only after
+  the adapter confirms its subprocess and tools are gone
+  ([0004](0004-cli-agent-adapters.adr)), never on the token alone.
+- Backpressure: the channel is bounded (e.g. 1024); participant tasks coalesce text deltas
+  when it is full rather than block the subprocess pipe.
+
+Consequences: no lock ordering bugs, deterministic tests of `update`, one place to read to
+understand behaviour. Cost: every new capability needs an `Event`/`Effect` variant.
+
+## Technologies and alternatives
+- Involved: tokio mpsc, tokio-util `CancellationToken`, crossterm `EventStream`
+- Alternatives: shared `Arc<Mutex<State>>` across tasks: simpler at first, but lock contention and redraw races with several streams; an actor framework (actix, ractor): more machinery than one loop needs
