@@ -130,6 +130,14 @@ cargo build --release
 Type to talk to Claude; start a line with `@codex` or `@all` to address others. `Esc`
 cancels running replies.
 
+**The screen.** Threads on the left (`Ctrl-B` hides it; pick one and `Enter` to resume),
+the conversation in the middle (replies rendered as Markdown; tool calls and handoffs as
+one-liners that `Enter` expands), each participant on the right (`Ctrl-K`): state, role,
+how full its window is (`~NN%` for free models, `?` for CLI agents, which keep their own
+context) and tokens this thread. The status line shows the talk switch and the latest
+message's model-to-model turns and tokens against their limits. `Tab` completes, or moves
+between input, chat and threads. Under 100 columns the side panes hide.
+
 **Who may edit.** Only the `writer` from `models.toml` (default `claude`), and only when a
 message goes to it alone: the chat shows `you → claude (may edit)`. It runs with your own
 setup and the `permission_mode` you give it (`acceptEdits` lets Claude edit without asking;
@@ -199,7 +207,7 @@ Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
 | 6 | [0005](docs/adr/0005-openai-compatible-models.adr) | Free models over the OpenAI-compatible API | done |
 | 7 | [0007](docs/adr/0007-model-to-model-communication.adr) | Model-to-model `ask`, talk policy, limits, `/talk on\|off` | done |
 | 8 | [0008](docs/adr/0008-slash-commands-and-mentions.adr) | Full command set and completion | done |
-| 9 | [0009](docs/adr/0009-tui-layout.adr) | Three-pane layout | next |
+| 9 | [0009](docs/adr/0009-tui-layout.adr) | Three-pane layout | done |
 
 Later, each with its own ADR first: git worktree per agent, `/model add` (guided),
 `/compact`, `/handoff`, `/fork`, approvals, an ACP adapter.

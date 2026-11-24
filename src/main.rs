@@ -1,6 +1,8 @@
 //! roundtable: one terminal chat for Claude Code, Codex and other models.
 //! Stack: ADR 0001. Event loop: ADR 0002. Transcript files: ADR 0010. CLI agents: ADR 0004.
 
+mod ui;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
@@ -12,11 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::{Event as TermEvent, EventStream};
 use futures_util::StreamExt;
-use ratatui::layout::{Constraint, Layout, Position};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Paragraph, Wrap};
-use ratatui::{DefaultTerminal, Frame};
+use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -24,9 +22,7 @@ use tracing_subscriber::EnvFilter;
 use notify_debouncer_mini::notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, DebouncedEventBatch, new_debouncer};
 use roundtable::agent::{self, AskBridge, Outcome, PEvent, Turn};
-use roundtable::app::{
-    App, ChatLine, Checks, EditLock, Effect, Event, FileEdit, LineKind, TestTarget,
-};
+use roundtable::app::{App, Checks, EditLock, Effect, Event, FileEdit, TestTarget};
 use roundtable::mcp::{self, AskAnswer};
 use roundtable::openai;
 use roundtable::registry::{self, Adapter, Registry};
@@ -108,6 +104,7 @@ async fn start() -> Result<()> {
         pending_asks: HashMap::new(),
         next_ask: 1,
         redactors: HashMap::new(),
+        threads_changed: true,
         cwd,
         outside_repo,
         models_path,
@@ -190,6 +187,8 @@ struct Runtime {
     ask_files: HashMap<String, PathBuf>,
     pending_asks: HashMap<u64, tokio::sync::oneshot::Sender<AskAnswer>>,
     next_ask: u64,
+    /// The threads list changed (a thread was created or resumed): resend it to the pane.
+    threads_changed: bool,
     /// Per participant: streamed text held back while it could still be part of a key.
     redactors: HashMap<String, transcript::StreamRedactor>,
     outside_repo: bool,
@@ -221,6 +220,7 @@ impl Runtime {
                     .take(60)
                     .collect();
                 let thread = self.store.create_thread(&title, &self.checkout)?;
+                self.threads_changed = true;
                 tracing::info!(thread = %thread.meta.id, "thread opened");
                 self.thread.insert(thread)
             }
@@ -515,6 +515,22 @@ impl Runtime {
         }
     }
 
+    /// The threads pane's rows, newest first.
+    fn thread_rows(&self) -> Vec<roundtable::app::ThreadRow> {
+        self.store
+            .list_threads()
+            .unwrap_or_default()
+            .into_iter()
+            .take(50)
+            .map(|m| roundtable::app::ThreadRow {
+                elsewhere: m.checkout != self.checkout,
+                day: transcript::day_of(m.created_at),
+                id: m.id,
+                title: m.title,
+            })
+            .collect()
+    }
+
     /// `/usage <scope>`: tokens and cost per model from `usage.json` (ADR 0010).
     fn usage_report(&self, scope: &str) -> String {
         let totals = match scope {
@@ -648,7 +664,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
         for effect in app.update(event) {
             match effect {
                 Effect::Redraw => {
-                    terminal.draw(|frame| draw(frame, &app))?;
+                    terminal.draw(|frame| ui::draw(frame, &app))?;
                 }
                 Effect::Quit => {
                     tracing::info!("quit");
@@ -866,6 +882,9 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                 }
             }
         }
+        if std::mem::take(&mut rt.threads_changed) {
+            local.push_back(Event::Threads(rt.thread_rows()));
+        }
         if quit_by.is_some() && rt.turns.is_empty() {
             return Ok(());
         }
@@ -1008,117 +1027,6 @@ async fn tick(tx: mpsc::Sender<Event>) {
     }
 }
 
-fn draw(frame: &mut Frame, app: &App) {
-    // The input grows with its lines (Alt-Enter), up to a few.
-    let input_rows = app.input.split('\n').count().clamp(1, 6) as u16;
-    let completions = app.completions();
-    let popup_rows = completions.len().min(6) as u16;
-    let [chat_area, popup_area, input_area] = Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(if popup_rows > 0 { popup_rows + 2 } else { 0 }),
-        Constraint::Length(input_rows + 2),
-    ])
-    .areas(frame.area());
-
-    let text = if app.lines.is_empty() {
-        Text::styled(
-            "Nothing at the table yet. Type to Claude, start with @codex or @all, or /help.",
-            Style::new().add_modifier(Modifier::DIM),
-        )
-    } else {
-        Text::from(app.lines.iter().flat_map(chat_lines).collect::<Vec<_>>())
-    };
-    // Keep the newest lines in view unless scrolled back (PgUp). Measured before the
-    // border is added: `line_count` counts border rows too.
-    let chat = Paragraph::new(text).wrap(Wrap { trim: false });
-    let inner_height = chat_area.height.saturating_sub(2);
-    let total = chat.line_count(chat_area.width.saturating_sub(2)) as u16;
-    let bottom = total.saturating_sub(inner_height);
-    let top = bottom.saturating_sub(app.scroll);
-    let title = if top < bottom {
-        format!(" roundtable · scrolled up {} lines (PgDn) ", bottom - top)
-    } else {
-        " roundtable ".to_string()
-    };
-    let chat = chat.scroll((top, 0)).block(Block::bordered().title(title));
-    frame.render_widget(chat, chat_area);
-
-    if popup_rows > 0 {
-        let items: Vec<Line> = completions
-            .iter()
-            .take(6)
-            .enumerate()
-            .map(|(i, c)| {
-                let style = if i == 0 {
-                    Style::new().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::new().add_modifier(Modifier::DIM)
-                };
-                Line::styled(c.clone(), style)
-            })
-            .collect();
-        let popup = Paragraph::new(items).block(Block::bordered().title(" Tab completes "));
-        frame.render_widget(popup, popup_area);
-    }
-
-    let input = Paragraph::new(format!("> {}", app.input)).block(Block::bordered().title_bottom(
-        " Enter send · Alt-Enter new line · /help · Esc cancel · Ctrl-C twice quit ",
-    ));
-    frame.render_widget(input, input_area);
-    let last = app.input.rsplit('\n').next().unwrap_or("");
-    let row = (input_rows - 1).min(input_area.height.saturating_sub(3));
-    let col = if input_rows > 1 { 1 } else { 3 } + last.chars().count() as u16;
-    frame.set_cursor_position(Position::new(
-        (input_area.x + col).min(input_area.right().saturating_sub(2)),
-        input_area.y + 1 + row,
-    ));
-}
-
-/// Stable colour per speaker, from the 16-colour palette so light and dark themes work.
-fn colour(who: &str) -> Color {
-    match who.split(' ').next() {
-        Some("claude") => Color::Yellow,
-        Some("codex") => Color::Cyan,
-        Some("roundtable") => Color::DarkGray,
-        _ => Color::Reset,
-    }
-}
-
-fn chat_lines(line: &ChatLine) -> Vec<Line<'static>> {
-    let who = Style::new()
-        .fg(colour(&line.who))
-        .add_modifier(Modifier::BOLD);
-    let body = match line.kind {
-        LineKind::Error => Style::new().fg(Color::Red),
-        LineKind::Info | LineKind::Tool => Style::new().add_modifier(Modifier::DIM),
-        _ => Style::new(),
-    };
-    let suffix = match line.kind {
-        LineKind::Streaming => " …",
-        LineKind::Reply(Outcome::Interrupted) => " [interrupted]",
-        LineKind::Reply(Outcome::Failed) => " [failed]",
-        _ => "",
-    };
-    let head = match line.kind {
-        LineKind::Tool => format!("  ↳ {} ran ", line.who),
-        _ => format!("{} › ", line.who),
-    };
-    let mut rows = line.text.lines();
-    let first = rows.next().unwrap_or("");
-    let mut out = vec![Line::from(vec![
-        Span::styled(head, who),
-        Span::styled(first.to_string(), body),
-    ])];
-    out.extend(rows.map(|row| Line::from(Span::styled(row.to_string(), body))));
-    if let Some(last) = out.last_mut() {
-        last.push_span(Span::styled(
-            suffix,
-            Style::new().add_modifier(Modifier::DIM),
-        ));
-    }
-    out
-}
-
 /// `/resume <which>`: a number from the list (newest first) or the start of an id.
 fn pick_thread<'a>(threads: &'a [transcript::Meta], which: &str) -> Option<&'a transcript::Meta> {
     match which.parse::<usize>() {
@@ -1192,7 +1100,7 @@ mod tests {
 
     fn render(app: &App, width: u16, height: u16) -> TestBackend {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
         terminal.backend().clone()
     }
 
@@ -1252,6 +1160,53 @@ mod tests {
             pick_thread(&threads, "01AA").is_none(),
             "ambiguous picks nothing"
         );
+    }
+
+    #[test]
+    fn draws_three_panes_when_wide_and_one_when_narrow() {
+        let mut app = App::default();
+        app.update(Event::Threads(vec![
+            roundtable::app::ThreadRow {
+                id: "01A".into(),
+                title: "fix the login bug".into(),
+                day: "2026-11-25".into(),
+                elsewhere: false,
+            },
+            roundtable::app::ThreadRow {
+                id: "01B".into(),
+                title: "review in another repo".into(),
+                day: "2026-11-24".into(),
+                elsewhere: true,
+            },
+        ]));
+        for c in "@claude check with codex".chars() {
+            app.update(Event::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )));
+        }
+        app.update(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        app.update(Event::Asked {
+            ask: 1,
+            caller: "claude".into(),
+            to: "codex".into(),
+            prompt: "is the **fix** right?\nline two".into(),
+        });
+        app.update(Event::Agent(
+            "codex".into(),
+            PEvent::Message("Yes, `ok`.".into()),
+        ));
+        // Tab to the chat, Enter expands the handoff.
+        app.update(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        app.update(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        insta::assert_snapshot!("wide", render(&app, 130, 14));
+        insta::assert_snapshot!("narrow", render(&app, 80, 14));
     }
 
     #[test]

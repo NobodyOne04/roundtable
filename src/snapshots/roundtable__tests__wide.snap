@@ -1,0 +1,18 @@
+---
+source: src/main.rs
+expression: "render(&app, 130, 14)"
+---
+"┌ threads ───────────────┐┌ roundtable ────────────────────────────────────────────────────────────┐┌ context ───────────────────┐"
+"│fix the login bug       ││you → claude (may edit) › check with codex                              ││claude streaming            │"
+"│review in another repo  ││claude ›  …                                                             ││  ?  0↑ 0↓                  │"
+"│                        ││  ↳ claude → codex [handoff ▾]                                          ││  lead                      │"
+"│                        ││      is the **fix** right?                                             ││codex streaming             │"
+"│                        ││      line two                                                          ││  ?  0↑ 0↓                  │"
+"│                        ││codex → claude › Yes, ok. …                                             ││  reviewer                  │"
+"│                        ││                                                                        ││                            │"
+"│                        ││                                                                        ││                            │"
+"└────────────────────────┘└────────────────────────────────────────────────────────────────────────┘└────────────────────────────┘"
+"┌────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
+"│>                                                                                                                               │"
+"└ Enter send · Alt-Enter new line · Tab panes · /help · Esc cancel ──────────────────────────────────────────────────────────────┘"
+" talk:on · 1/6 turns · 0/50000 tokens                                                                                             "

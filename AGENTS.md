@@ -23,6 +23,7 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
 ## Pending for Codex
 - Review the ADR 0007 PR (`feature/adr-0007-ask`), if it was skipped there.
 - Review the ADR 0008 PR (`feature/adr-0008-commands`), skipped (usage limit).
+- Review the layout PR (`feature/adr-0009-layout`), skipped (usage limit).
 - Review the `/resume` PR (`feature/adr-0008-resume`), skipped (usage limit): especially
   the identity checks when rebuilding sessions and model histories.
 - Verify how Codex approves an MCP tool in `codex exec` (`mcp_servers.<name>.default_tools_approval_mode`
