@@ -3,8 +3,9 @@
 A terminal console where Claude Code, Codex and free models sit at one table, and you watch them talk.
 
 > **Status: early build.** The architecture is decided in [`docs/adr/`](docs/adr/README.md).
-> Built so far: a chat with Claude Code and Codex (read-only for now), streaming replies,
-> the transcript on disk, and a live model registry (`/models`, `/model enable|disable|use`).
+> Built so far: a chat with Claude Code and Codex, streaming replies, a `writer` that may
+> edit files, the transcript on disk, and a live model registry (`/models`,
+> `/model enable|disable|use`).
 > See [Roadmap](#roadmap).
 
 ## What it is
@@ -112,15 +113,20 @@ cargo build --release
 ```
 
 Type to talk to Claude; start a line with `@codex` or `@all` to address others. `Esc`
-cancels running replies. For now every agent is read-only: plan mode for Claude, the
-read-only sandbox for Codex, both without your own MCP servers, hooks and plugins. Editing
-arrives with the `writer` in step 5.
+cancels running replies.
 
-The Rust toolchain is pinned in `rust-toolchain.toml`; rustup installs it on first build.
-For a shorter command, add `alias rt=roundtable` to your shell (with the binary on your
-`PATH`). Logs go to `roundtable.log` in your data dir (macOS:
-`~/Library/Application Support/roundtable/`, Linux: `~/.local/share/roundtable/`); set
-`RUST_LOG=debug` for more.
+**Who may edit.** Only the `writer` from `models.toml` (default `claude`), and only when a
+message goes to it alone: the chat shows `you → claude (may edit)`. It runs with your own
+setup and the `permission_mode` you give it (`acceptEdits` lets Claude edit without asking;
+unset keeps the CLI's own default: Claude then refuses edits it can't ask about, Codex
+uses the sandbox from your own Codex config). Everyone else, and the
+writer itself when reached through `@all` or several mentions, is read-only: plan mode for
+Claude, the read-only sandbox for Codex, both without your own MCP servers, hooks and
+plugins.
+
+**After a crash.** If roundtable dies while the writer works, the CLI may keep editing.
+On the next start in that checkout, edits stay locked (every turn read-only) until you
+check nothing is running and type `/quiet`.
 
 ## Requirements
 
@@ -158,8 +164,8 @@ Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
 | 2 | [0002](docs/adr/0002-single-owner-event-loop.adr) | Event loop: one owner of state, events in, effects out | done |
 | 3 | [0010](docs/adr/0010-filesystem-event-log.adr) | Transcript as JSONL files, single-instance lock | done |
 | 4 | [0004](docs/adr/0004-cli-agent-adapters.adr) | Claude Code and Codex in the chat, read-only until 0011 | done |
-| 5 | [0011](docs/adr/0011-hot-model-registry.adr) | Hot model registry, `writer`, enable/disable | registry done; writer edits next |
-| 6 | [0005](docs/adr/0005-openai-compatible-models.adr) | Free models over the OpenAI-compatible API | |
+| 5 | [0011](docs/adr/0011-hot-model-registry.adr) | Hot model registry, `writer`, enable/disable | done |
+| 6 | [0005](docs/adr/0005-openai-compatible-models.adr) | Free models over the OpenAI-compatible API | next |
 | 7 | [0007](docs/adr/0007-model-to-model-communication.adr) | Model-to-model `ask`, talk policy, limits, `/talk on\|off` | |
 | 8 | [0008](docs/adr/0008-slash-commands-and-mentions.adr) | Full command set and completion | |
 | 9 | [0009](docs/adr/0009-tui-layout.adr) | Three-pane layout | |

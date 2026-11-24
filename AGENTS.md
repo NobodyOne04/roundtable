@@ -39,6 +39,8 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
   record a real two-turn Codex fixture: `tests/fixtures/codex-0.171.0-turn1.jsonl` was cut
   from one turn, and resume was never recorded.
 - Review the ADR 0011 PR (`feature/adr-0011-hot-registry`), skipped for the same reason.
+- Review the writer PR (`feature/adr-0011-writer`): the first PR that lets an agent edit.
+  Check that no path makes a non-writer, `@all` or locked turn writable.
 
 ## Notes
 - ADR 0004: the owner chose a git worktree per agent for the single-writer limit

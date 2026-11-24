@@ -91,6 +91,14 @@ async fn start() -> Result<()> {
             Err(why) => app.note(format!("{id}: unavailable: {why}"), true),
         }
     }
+    let unfinished = runtime
+        .store
+        .unfinished_writers(&runtime.cwd)
+        .context("checking for unfinished writer turns")?;
+    app.lock_edits(
+        unfinished.into_iter().map(|m| m.id).collect(),
+        &runtime.cwd.display().to_string(),
+    );
     if let Some(why) = load_error {
         app.note(
             format!("{} not applied: {why}", runtime.models_path.display()),
@@ -236,6 +244,30 @@ impl Runtime {
         Ok(())
     }
 
+    /// Closes each thread's unfinished writer turn with a `settle`, after the user confirmed
+    /// the checkout is quiet (ADR 0010).
+    fn confirm_quiet(&mut self, threads: &[String]) -> Result<()> {
+        for id in threads {
+            let mut thread = self.store.open_thread(id)?;
+            let settle = NewEvent {
+                turn: None,
+                parent: None,
+                from: transcript::Party {
+                    id: "user".into(),
+                    identity: None,
+                },
+                to: vec![],
+                kind: transcript::Kind::Settle,
+                payload: serde_json::json!({ "writable": true, "status": "interrupted" }),
+                tokens_in: None,
+                tokens_out: None,
+            };
+            thread.append(settle, true)?;
+            tracing::info!(thread = %id, "writer turn settled after /quiet");
+        }
+        Ok(())
+    }
+
     fn cancel_all(&self) {
         for token in self.turns.values() {
             token.cancel();
@@ -292,6 +324,8 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     model,
                     prompt,
                     session,
+                    writable,
+                    permission_mode,
                 } => {
                     let token = CancellationToken::new();
                     rt.turns.insert(id.clone(), token.clone());
@@ -302,6 +336,8 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         cwd: rt.cwd.clone(),
                         outside_repo: rt.outside_repo,
                         model,
+                        writable,
+                        permission_mode,
                     };
                     tokio::spawn(agent::run(id, kind, turn, tx.clone(), token));
                 }
@@ -311,6 +347,12 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     }
                 }
                 Effect::CancelTurns => rt.cancel_all(),
+                Effect::ConfirmQuiet(threads) => {
+                    if let Err(err) = rt.confirm_quiet(&threads) {
+                        tracing::error!(%err, "closing unfinished writer turns failed");
+                        let _ = tx.try_send(Event::Notice(format!("transcript: {err:#}")));
+                    }
+                }
                 Effect::EditRegistry(edit) => {
                     if let Err(err) = rt.edit_registry(&edit) {
                         tracing::error!(%err, "editing models.toml failed");

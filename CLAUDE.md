@@ -25,7 +25,8 @@ Rust TUI console that runs Claude Code, Codex and OpenAI-compatible models in on
 ## Conventions
 - Each ADR implementation PR marks its row `done` in the README roadmap and the next one `next`.
 - New CLI version: record a fresh two-turn fixture (sanitize: no paths, account or credential fields, no request ids such as `api_message_id`, `msg_…`, `uuid`, thinking `signature`), keep the old one, and update the tested versions in the README.
-- Agent turns are read-only until the writer PR lands; never pass a bypass/full-access flag to a CLI, and the registry refuses such `permission_mode`s.
+- Only a message to the `writer` alone is writable (`App::submit`); every other turn gets the read-only flags in `agent::command`. Never pass a bypass/full-access flag to a CLI; the registry refuses such `permission_mode`s.
+- Writer marker: a writable `delivery` (synced before spawn) opens it, the writer's reply or a `settle` with `writable: true` closes it; `transcript::writer_open` reads it at startup.
 - The registry lives in `App`; the loop does the file I/O (`Runtime::reload_registry`, `edit_registry`). Own writes are skipped by fingerprint, so never reload on every watcher event without the hash check.
 - Transcript lines are append-only: never rewrite `events.jsonl`; a status change is a new `settle`/`delivery` line. Small JSON files go through `transcript::write_atomic`.
 - State changes only in `App::update` (no I/O there); tasks send `Event`s, the loop runs `Effect`s. Never share `App` behind a lock.

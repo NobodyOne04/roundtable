@@ -7,10 +7,8 @@
 //! <root>/threads/<ulid>/events.jsonl
 //! ```
 //!
-//! Lands with the steps that produce the data: the writer task and its acks into the event
-//! loop and the unclean-writer interlock (with the first writable turn, ADR 0011); key
-//! redaction and identity hashes, which also key `sessions.json` (ADR 0011); `usage.json`
-//! (with `/usage`, ADR 0008).
+//! Still to land: the writer task and its acks into the event loop; key redaction (with the
+//! first resolved key, ADR 0005); `usage.json` (with `/usage`, ADR 0008).
 
 use std::fs::{self, File, OpenOptions, Permissions, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -189,6 +187,19 @@ impl Store {
         Thread::open(dir, meta)
     }
 
+    /// Threads of `checkout` whose last writable turn never finished: its CLI may still be
+    /// editing after a crash, so edits stay locked until the user confirms (ADR 0010).
+    pub fn unfinished_writers(&self, checkout: &Path) -> Result<Vec<Meta>> {
+        let checkout = checkout.canonicalize()?;
+        let mut found = vec![];
+        for meta in self.list_threads()? {
+            if meta.checkout == checkout && writer_open(&self.open_thread(&meta.id)?.events()?) {
+                found.push(meta);
+            }
+        }
+        Ok(found)
+    }
+
     /// All threads, newest first. A folder without a readable `meta.json` is skipped.
     pub fn list_threads(&self) -> Result<Vec<Meta>> {
         let mut metas = Vec::new();
@@ -295,6 +306,20 @@ impl Thread {
         }
         Ok(events)
     }
+}
+
+/// Whether the last writable turn in `events` started and never ended. A writable turn
+/// starts with a `delivery` marked `writable`, and ends with the writer's reply marked
+/// `writable` or a `settle` marked `writable` (the user confirmed the checkout is quiet).
+pub fn writer_open(events: &[EventLine]) -> bool {
+    let writable =
+        |e: &EventLine| e.payload.get("writable") == Some(&serde_json::Value::Bool(true));
+    events.iter().fold(false, |open, e| match e.kind {
+        Kind::Delivery if writable(e) => true,
+        Kind::Msg if e.from.id != "user" && writable(e) => false,
+        Kind::Settle if writable(e) => false,
+        _ => open,
+    })
 }
 
 /// Returns the byte length of the valid prefix and how many lines it holds. Only the last
@@ -429,6 +454,44 @@ mod tests {
             assert_eq!(mode(&tdir.join(file)), 0o600, "{file}");
         }
         assert_eq!(mode(&root.join("roundtable.lock")), 0o600);
+    }
+
+    #[test]
+    fn an_unfinished_writer_is_found_until_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let mut done = store.create_thread("done", dir.path()).unwrap();
+        let mut crashed = store.create_thread("crashed", dir.path()).unwrap();
+        let event = |kind, from: &str, writable| NewEvent {
+            from: Party {
+                id: from.into(),
+                identity: None,
+            },
+            kind,
+            payload: json!({ "writable": writable }),
+            ..user_msg("")
+        };
+        done.append(event(Kind::Delivery, "router", true), true)
+            .unwrap();
+        done.append(event(Kind::Msg, "claude", true), true).unwrap();
+        crashed
+            .append(event(Kind::Delivery, "router", true), true)
+            .unwrap();
+        crashed
+            .append(event(Kind::Msg, "codex", false), true)
+            .unwrap();
+        let found = store.unfinished_writers(dir.path()).unwrap();
+        assert_eq!(found, [crashed.meta.clone()]);
+        let other = tempfile::tempdir().unwrap();
+        assert!(
+            store.unfinished_writers(other.path()).unwrap().is_empty(),
+            "other checkout"
+        );
+
+        crashed
+            .append(event(Kind::Settle, "user", true), true)
+            .unwrap();
+        assert!(store.unfinished_writers(dir.path()).unwrap().is_empty());
     }
 
     #[test]

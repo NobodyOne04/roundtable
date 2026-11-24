@@ -52,6 +52,9 @@ pub enum Effect {
         model: Option<String>,
         prompt: String,
         session: Option<String>,
+        /// The writer's own turn, which may edit files (ADR 0004).
+        writable: bool,
+        permission_mode: Option<String>,
     },
     /// Cancel the running turn of one participant.
     CancelTurn(String),
@@ -69,6 +72,9 @@ pub enum Effect {
         session: String,
     },
     EditRegistry(FileEdit),
+    /// The user confirmed the checkout is quiet: close these threads' unfinished writer
+    /// turns with a `settle`, which unlocks edits (ADR 0010).
+    ConfirmQuiet(Vec<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,8 +100,11 @@ struct Seat {
     id: String,
     busy: bool,
     session: Option<String>,
-    /// Direct messages waiting while busy (ADR 0007: queued, not dropped).
-    queue: VecDeque<String>,
+    /// Direct messages waiting while busy (ADR 0007: queued, not dropped), each with
+    /// whether it may edit.
+    queue: VecDeque<(String, bool)>,
+    /// The running turn may edit; its reply then ends the writer marker.
+    writable: bool,
     /// Index of the reply being streamed in `lines`.
     reply: Option<usize>,
     usage: (u64, u64, Option<f64>),
@@ -110,6 +119,8 @@ pub struct App {
     registry: Registry,
     checks: Checks,
     seats: Vec<Seat>,
+    /// Threads whose writer turn never finished (a crash): edits stay locked until `/quiet`.
+    edits_locked: Vec<String>,
     /// First Ctrl-C arms, the second quits.
     quit_armed: bool,
 }
@@ -137,6 +148,7 @@ impl App {
             registry: Registry::parse("").expect("empty registry"),
             checks: Checks::new(),
             seats: vec![],
+            edits_locked: vec![],
             quit_armed: false,
         };
         app.apply_registry(registry, checks, false);
@@ -151,6 +163,23 @@ impl App {
             LineKind::Info
         };
         self.push("roundtable", text, kind);
+    }
+
+    /// At startup: a previous writer in this checkout may still be running (ADR 0010).
+    pub fn lock_edits(&mut self, threads: Vec<String>, checkout: &str) {
+        if threads.is_empty() {
+            return;
+        }
+        self.push(
+            "roundtable",
+            format!(
+                "edits are locked: a writer from an earlier run never finished in {checkout} and \
+                 may still be running. Check nothing is editing there, then type /quiet. \
+                 Until then every turn is read-only."
+            ),
+            LineKind::Error,
+        );
+        self.edits_locked = threads;
     }
 
     /// The only place state changes. No I/O here, so it is testable without a terminal.
@@ -227,11 +256,23 @@ impl App {
                 return vec![];
             }
         };
+        // Only a message to the writer alone may edit: `@all` and several mentions are
+        // read-only for everyone (ADR 0004).
+        let to_writer = targets.len() == 1 && self.registry.writer() == Some(targets[0].as_str());
+        let writable = to_writer && self.edits_locked.is_empty();
+        let edits = if writable { " (may edit)" } else { "" };
         self.push(
-            &format!("you → {}", targets.join(", ")),
+            &format!("you → {}{edits}", targets.join(", ")),
             prompt.clone(),
             LineKind::User,
         );
+        if to_writer && !writable {
+            self.push(
+                "roundtable",
+                "read-only: edits are locked until /quiet".into(),
+                LineKind::Info,
+            );
+        }
         let to = targets.iter().map(|id| self.party(id)).collect();
         let mut effects = vec![record(
             user(),
@@ -240,7 +281,7 @@ impl App {
             json!({ "text": prompt }),
         )];
         for id in targets {
-            effects.extend(self.deliver(&id, prompt.clone()));
+            effects.extend(self.deliver(&id, prompt.clone(), writable));
         }
         effects
     }
@@ -257,10 +298,18 @@ impl App {
             ["/model", "enable", id] => self.set_enabled(id, true),
             ["/model", "disable", id] => self.set_enabled(id, false),
             ["/model", "use", id] => self.use_default(id),
+            ["/quiet"] if !self.edits_locked.is_empty() => {
+                self.push("roundtable", "edits unlocked".into(), LineKind::Info);
+                vec![Effect::ConfirmQuiet(std::mem::take(&mut self.edits_locked))]
+            }
+            ["/quiet"] => {
+                self.push("roundtable", "edits are not locked".into(), LineKind::Info);
+                vec![]
+            }
             _ => {
                 self.push(
                     "roundtable",
-                    "commands so far: /models, /model enable|disable|use <id>".into(),
+                    "commands so far: /models, /model enable|disable|use <id>, /quiet".into(),
                     LineKind::Error,
                 );
                 vec![]
@@ -276,7 +325,11 @@ impl App {
                 tags.push("default");
             }
             if self.registry.writer() == Some(p.id.as_str()) {
-                tags.push("writer (edits arrive in the next step)");
+                tags.push(if self.edits_locked.is_empty() {
+                    "writer"
+                } else {
+                    "writer, locked until /quiet"
+                });
             }
             let state = match (p.enabled, self.availability(p)) {
                 (false, _) => "disabled".to_string(),
@@ -396,6 +449,7 @@ impl App {
                     busy: false,
                     session: None,
                     queue: VecDeque::new(),
+                    writable: false,
                     reply: None,
                     usage: (0, 0, None),
                 });
@@ -481,7 +535,7 @@ impl App {
         Ok((targets, prompt.into()))
     }
 
-    fn deliver(&mut self, id: &str, prompt: String) -> Vec<Effect> {
+    fn deliver(&mut self, id: &str, prompt: String, writable: bool) -> Vec<Effect> {
         let participant = self.registry.get(id).expect("routed ids exist").clone();
         if !participant.enabled {
             self.push("roundtable", format!("`{id}` is disabled"), LineKind::Error);
@@ -497,16 +551,29 @@ impl App {
         }
         let seat = self.seat_mut(id).expect("every participant has a seat");
         if seat.busy {
-            seat.queue.push_back(prompt);
+            seat.queue.push_back((prompt, writable));
             self.push("roundtable", format!("queued for {id}"), LineKind::Info);
             return vec![];
         }
-        self.start(&participant, prompt)
+        self.start(&participant, prompt, writable)
     }
 
-    fn start(&mut self, p: &Participant, prompt: String) -> Vec<Effect> {
+    fn start(&mut self, p: &Participant, prompt: String, writable: bool) -> Vec<Effect> {
         let Adapter::Cli(kind) = p.adapter else {
             unreachable!("availability() refuses non-cli participants for now");
+        };
+        // One writable turn per checkout (ADR 0004): if the writer changed while the old one
+        // is still editing, the new turn waits its turn as read-only instead of overlapping.
+        let overlap = self.seats.iter().any(|s| s.busy && s.writable);
+        let writable = if writable && overlap {
+            self.push(
+                "roundtable",
+                format!("{}: read-only, another writer is still editing", p.id),
+                LineKind::Info,
+            );
+            false
+        } else {
+            writable
         };
         let index = self.lines.len();
         self.lines.push(ChatLine {
@@ -516,6 +583,7 @@ impl App {
         });
         let seat = self.seat_mut(&p.id).expect("seat");
         seat.busy = true;
+        seat.writable = writable;
         seat.reply = Some(index);
         seat.usage = (0, 0, None);
         let session = seat.session.clone();
@@ -524,7 +592,8 @@ impl App {
                 router(),
                 vec![self.party(&p.id)],
                 transcript::Kind::Delivery,
-                json!({ "status": "sent", "text": prompt }),
+                // A writable delivery is the writer marker: synced before the CLI starts.
+                json!({ "status": "sent", "text": prompt, "writable": writable }),
             )
             .durable(),
             Effect::StartTurn {
@@ -534,6 +603,8 @@ impl App {
                 model: p.model.clone(),
                 prompt,
                 session,
+                writable,
+                permission_mode: p.permission_mode.clone(),
             },
         ]
     }
@@ -638,6 +709,7 @@ impl App {
         let seat = self.seat_mut(id).expect("seat");
         seat.busy = false;
         let (tokens_in, tokens_out, cost) = seat.usage;
+        let writable = std::mem::take(&mut seat.writable);
         let text = match seat.reply.take() {
             Some(i) => {
                 self.lines[i].kind = LineKind::Reply(outcome);
@@ -649,7 +721,8 @@ impl App {
             party,
             vec![user()],
             transcript::Kind::Msg,
-            json!({ "text": text, "status": outcome.as_str(), "cost_usd": cost }),
+            // `writable` here closes the writer marker of the delivery (ADR 0010).
+            json!({ "text": text, "status": outcome.as_str(), "cost_usd": cost, "writable": writable }),
         )
         .durable();
         if let Effect::Record { event, .. } = &mut reply {
@@ -658,10 +731,13 @@ impl App {
         }
         let mut effects = vec![reply];
         let next = self.seat_mut(id).and_then(|s| s.queue.pop_front());
-        if let Some(prompt) = next
+        if let Some((prompt, writable)) = next
             && let Some(p) = self.registry.get(id).cloned()
         {
-            effects.extend(self.start(&p, prompt));
+            // Rechecked: the writer or the lock may have changed while it waited.
+            let writable =
+                writable && self.registry.writer() == Some(id) && self.edits_locked.is_empty();
+            effects.extend(self.start(&p, prompt, writable));
         }
         effects
     }
@@ -1051,6 +1127,110 @@ mod tests {
             effects.iter().any(|e| matches!(e,
                 Effect::StartTurn { session: None, model: Some(m), .. } if m == "other")),
             "a new identity starts a new session with the new model"
+        );
+    }
+
+    fn writable(effects: &[Effect]) -> Vec<(String, bool)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::StartTurn { id, writable, .. } => Some((id.clone(), *writable)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn payload_writable(effects: &[Effect], kind: transcript::Kind) -> Option<bool> {
+        effects.iter().find_map(|e| match e {
+            Effect::Record { event, .. } if event.kind == kind => {
+                event.payload["writable"].as_bool()
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn only_a_message_to_the_writer_alone_may_edit() {
+        let mut app = App::default();
+        let effects = type_line(&mut app, "fix the bug");
+        assert_eq!(writable(&effects), [("claude".into(), true)]);
+        assert_eq!(
+            payload_writable(&effects, transcript::Kind::Delivery),
+            Some(true),
+            "the delivery is the writer marker"
+        );
+        assert!(app.lines.iter().any(|l| l.who == "you → claude (may edit)"));
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        assert_eq!(
+            payload_writable(&effects, transcript::Kind::Msg),
+            Some(true),
+            "the reply closes the marker"
+        );
+
+        for line in ["@all fix", "@claude @codex fix", "@codex fix"] {
+            let mut app = App::default();
+            let effects = type_line(&mut app, line);
+            assert!(writable(&effects).iter().all(|(_, w)| !w), "{line}");
+        }
+    }
+
+    #[test]
+    fn locked_edits_run_read_only_until_quiet() {
+        let mut app = App::default();
+        app.lock_edits(vec!["T1".into()], "/repo");
+        assert!(last_text(&app).starts_with("edits are locked"));
+        let effects = type_line(&mut app, "fix");
+        assert_eq!(writable(&effects), [("claude".into(), false)]);
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| l.text == "read-only: edits are locked until /quiet")
+        );
+        app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+
+        assert_eq!(
+            type_line(&mut app, "/quiet"),
+            [Effect::ConfirmQuiet(vec!["T1".into()])]
+        );
+        assert_eq!(
+            writable(&type_line(&mut app, "fix")),
+            [("claude".into(), true)]
+        );
+        assert!(
+            type_line(&mut app, "/quiet").is_empty(),
+            "nothing left to unlock"
+        );
+    }
+
+    #[test]
+    fn two_writable_turns_never_overlap() {
+        let mut app = App::default();
+        type_line(&mut app, "claude edits");
+        // The writer becomes codex while claude is still editing.
+        reload(
+            &mut app,
+            &DEFAULT_FILE.replace("writer = \"claude\"", "writer = \"codex\""),
+        );
+        let effects = type_line(&mut app, "@codex edit too");
+        assert_eq!(writable(&effects), [("codex".into(), false)]);
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| l.text == "codex: read-only, another writer is still editing")
+        );
+    }
+
+    #[test]
+    fn a_queued_edit_is_rechecked_when_it_starts() {
+        let mut app = App::default();
+        type_line(&mut app, "first");
+        type_line(&mut app, "second, queued");
+        reload(&mut app, &DEFAULT_FILE.replace("writer = \"claude\"", ""));
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        assert_eq!(
+            writable(&effects),
+            [("claude".into(), false)],
+            "the writer was removed while it waited"
         );
     }
 
