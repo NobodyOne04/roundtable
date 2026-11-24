@@ -24,6 +24,12 @@ pub enum Event {
     InputClosed(String),
     /// Output of a running turn of participant `id`.
     Agent(String, PEvent),
+    /// A chat turn resolved its API key: the loop adds it to the transcript redaction list.
+    /// Handled by the loop, never by `update`.
+    KeyResolved {
+        reference: String,
+        value: Secret,
+    },
     /// The watcher saw `models.toml` change. The loop reads it (I/O) and turns this into
     /// `Registry`, so `update` never sees it.
     RegistryFileChanged,
@@ -50,6 +56,16 @@ pub enum EditLock {
     OutsideGit,
 }
 
+/// A secret value whose `Debug` never shows it, so no event dump can leak a key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
 /// A change to `models.toml` asked for by a command; the loop writes it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileEdit {
@@ -73,6 +89,8 @@ pub enum Effect {
         prompt: String,
         context_window: u64,
         max_output: u64,
+        connect_timeout_s: u64,
+        idle_timeout_s: u64,
     },
     StartTurn {
         id: String,
@@ -261,7 +279,11 @@ impl App {
         self.dirty = true;
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.key(key),
-            Event::Key(_) | Event::Resize | Event::Tick | Event::RegistryFileChanged => vec![],
+            Event::Key(_)
+            | Event::Resize
+            | Event::Tick
+            | Event::RegistryFileChanged
+            | Event::KeyResolved { .. } => vec![],
             Event::InputClosed(reason) => {
                 tracing::error!(%reason, "terminal input closed");
                 self.quit()
@@ -744,6 +766,12 @@ impl App {
                     max_output: p
                         .max_output_tokens
                         .unwrap_or(crate::openai::DEFAULT_MAX_OUTPUT),
+                    connect_timeout_s: p
+                        .connect_timeout_s
+                        .unwrap_or(crate::openai::DEFAULT_CONNECT_TIMEOUT_S),
+                    idle_timeout_s: p
+                        .idle_timeout_s
+                        .unwrap_or(crate::openai::DEFAULT_IDLE_TIMEOUT_S),
                 },
             ];
         };
@@ -876,12 +904,18 @@ impl App {
             }
             None => String::new(),
         };
-        // A complete exchange becomes the model's own history for its next turn.
+        // A complete exchange becomes the model's own history for its next turn, but only
+        // if the model still points where the turn went (ADR 0005): a reload in between
+        // must not carry it to a new destination.
+        let turn_identity = self
+            .seats
+            .iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.turn_identity.clone());
         if outcome == Outcome::Complete
-            && self
-                .registry
-                .get(id)
-                .is_some_and(|p| p.adapter == Adapter::OpenAi)
+            && self.registry.get(id).is_some_and(|p| {
+                p.adapter == Adapter::OpenAi && Some(&p.identity) == turn_identity.as_ref()
+            })
             && let Some(prompt) = prompt
         {
             let seat = self.seat_mut(id).expect("seat");
@@ -1734,6 +1768,22 @@ mod tests {
         assert!(
             chats(&effects)[0].1.is_empty(),
             "history not carried to a hosted API"
+        );
+    }
+
+    #[test]
+    fn a_reply_finishing_after_a_new_endpoint_is_not_kept() {
+        let mut app = App::default();
+        reload(&mut app, &format!("{DEFAULT_FILE}{LLAMA}"));
+        type_line(&mut app, "@llama private");
+        let hosted = LLAMA.replace("http://localhost:11434/v1", "https://openrouter.ai/api/v1");
+        reload(&mut app, &format!("{DEFAULT_FILE}{hosted}"));
+        // The old turn's Done arrives after the switch.
+        app.update(agent("llama", PEvent::Done(Outcome::Complete)));
+        let effects = type_line(&mut app, "@llama hi");
+        assert!(
+            chats(&effects)[0].1.is_empty(),
+            "the local exchange stays local"
         );
     }
 

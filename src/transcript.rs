@@ -335,8 +335,8 @@ pub fn redact(value: &mut serde_json::Value, secrets: &[(String, String)]) {
     match value {
         serde_json::Value::String(text) => {
             for (secret, reference) in secrets {
-                // Very short values would redact ordinary words; real keys are long.
-                if secret.len() >= 8 && text.contains(secret.as_str()) {
+                // Keys shorter than 8 are refused when resolved, so any non-empty one counts.
+                if !secret.is_empty() && text.contains(secret.as_str()) {
                     *text = text.replace(secret.as_str(), &format!("[redacted:{reference}]"));
                 }
             }

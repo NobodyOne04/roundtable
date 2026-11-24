@@ -408,6 +408,12 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                 Some(result) => Event::Registry(result),
                 None => continue,
             },
+            Event::KeyResolved { reference, value } => {
+                if !rt.secrets.iter().any(|(v, _)| *v == value.0) {
+                    rt.secrets.push((value.0, reference));
+                }
+                continue;
+            }
             other => other,
         };
         if let Event::Agent(id, PEvent::Done(_)) = &event {
@@ -469,32 +475,24 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     prompt,
                     context_window,
                     max_output,
+                    connect_timeout_s,
+                    idle_timeout_s,
                 } => {
-                    // Resolved per request (ADR 0011): a changed key is used at once.
-                    let key = match key_ref.as_deref().map(openai::resolve_key).transpose() {
-                        Ok(key) => key,
-                        Err(why) => {
-                            local.push_back(Event::Agent(id.clone(), PEvent::Error(why)));
-                            local.push_back(Event::Agent(id, PEvent::Done(Outcome::Failed)));
-                            continue;
-                        }
-                    };
-                    if let (Some(value), Some(reference)) = (&key, &key_ref)
-                        && !rt.secrets.iter().any(|(v, _)| v == value)
-                    {
-                        rt.secrets.push((value.clone(), reference.clone()));
-                    }
+                    // The key is resolved inside the turn, off this loop (the keychain may
+                    // block); it comes back as `KeyResolved` before any reply.
                     let token = CancellationToken::new();
                     rt.turns.insert(id.clone(), token.clone());
                     let chat = openai::Chat {
                         base_url,
                         model,
-                        key,
+                        key_ref,
                         system,
                         history,
                         prompt,
                         context_window,
                         max_output,
+                        connect_timeout: Duration::from_secs(connect_timeout_s),
+                        idle_timeout: Duration::from_secs(idle_timeout_s),
                     };
                     tokio::spawn(openai::run(id, chat, tx.clone(), token));
                 }

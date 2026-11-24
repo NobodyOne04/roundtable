@@ -10,29 +10,33 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Outcome, PEvent};
-use crate::app::Event;
+use crate::app::{Event, Secret};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// No byte from the provider for this long ends the turn.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const RETRY_BACKOFF: Duration = Duration::from_secs(2);
-/// Defaults when `models.toml` doesn't say.
+/// Defaults when `models.toml` doesn't say (ADR 0005).
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 8_192;
 pub const DEFAULT_MAX_OUTPUT: u64 = 4_096;
+pub const DEFAULT_CONNECT_TIMEOUT_S: u64 = 10;
+pub const DEFAULT_IDLE_TIMEOUT_S: u64 = 120;
+/// Shorter keys are refused: every key must be redactable without hitting ordinary words.
+const MIN_KEY_LEN: usize = 8;
 
 /// One request: the model's own history (oldest first, as prompt/reply pairs) and the new
-/// prompt. The runner fits them to the window.
+/// prompt. The runner resolves the key and fits the messages to the window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chat {
     pub base_url: String,
     pub model: String,
-    /// The resolved key (never a reference, never logged).
-    pub key: Option<String>,
+    /// A reference (`env:`/`keyring:`), resolved by the runner off the UI loop.
+    pub key_ref: Option<String>,
     pub system: String,
     pub history: Vec<(String, String)>,
     pub prompt: String,
     pub context_window: u64,
     pub max_output: u64,
+    pub connect_timeout: Duration,
+    /// No byte from the provider for this long (headers, body or stream) ends the turn.
+    pub idle_timeout: Duration,
 }
 
 /// Tokens of `text`, estimated: chars/3 plus one per non-ASCII char, so code, CJK and
@@ -45,8 +49,9 @@ pub fn estimate(text: &str) -> u64 {
 
 /// The messages to send, fitted to the window (ADR 0005): output space reserved first, the
 /// system hint and the new prompt always kept, whole older turns dropped oldest first.
-/// `Err` when even the prompt alone doesn't fit, with the sizes.
-pub fn fit(chat: &Chat, history: &[(String, String)]) -> Result<Vec<Value>, String> {
+/// Returns the messages and how many history turns made it in. `Err` when even the prompt
+/// alone doesn't fit, with the sizes.
+pub fn fit(chat: &Chat, history: &[(String, String)]) -> Result<(Vec<Value>, usize), String> {
     // A few tokens per message for the role and separators.
     let cost = |text: &str| estimate(text) + 4;
     let budget = chat.context_window.saturating_sub(chat.max_output);
@@ -67,13 +72,57 @@ pub fn fit(chat: &Chat, history: &[(String, String)]) -> Result<Vec<Value>, Stri
         room -= turn;
         kept.push((prompt, reply));
     }
+    let turns = kept.len();
     let mut messages = vec![json!({"role": "system", "content": chat.system})];
     for (prompt, reply) in kept.into_iter().rev() {
         messages.push(json!({"role": "user", "content": prompt}));
         messages.push(json!({"role": "assistant", "content": reply}));
     }
     messages.push(json!({"role": "user", "content": chat.prompt}));
-    Ok(messages)
+    Ok((messages, turns))
+}
+
+/// Hides a key in streamed text before it is shown anywhere. Text is held back by up to
+/// `key.len() - 1` bytes, so a key split across chunks is never shown in pieces.
+struct Redactor {
+    key: Option<String>,
+    pending: String,
+}
+
+impl Redactor {
+    fn new(key: Option<String>) -> Self {
+        Self {
+            key: key.filter(|k| !k.is_empty()),
+            pending: String::new(),
+        }
+    }
+
+    /// Text safe to show now.
+    fn push(&mut self, text: &str) -> String {
+        let Some(key) = &self.key else {
+            return text.to_string();
+        };
+        self.pending.push_str(text);
+        self.pending = self.pending.replace(key.as_str(), "[redacted]");
+        // Keep back what could still turn out to be the start of the key.
+        let keep = key.len().saturating_sub(1).min(self.pending.len());
+        let mut cut = self.pending.len() - keep;
+        while !self.pending.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        self.pending.drain(..cut).collect()
+    }
+
+    fn finish(&mut self) -> String {
+        std::mem::take(&mut self.pending)
+    }
+
+    fn clean(&self, text: &str) -> String {
+        match &self.key {
+            Some(key) => text.replace(key.as_str(), "[redacted]"),
+            None => text.to_string(),
+        }
+    }
 }
 
 /// What one HTTP attempt ended with.
@@ -95,8 +144,41 @@ pub async fn run(id: String, chat: Chat, tx: mpsc::Sender<Event>, cancel: Cancel
             let _ = tx.send(Event::Agent(id, event)).await;
         }
     };
+    // The OS keychain may block (an unlock prompt): never on the UI loop.
+    let key = match chat.key_ref.clone() {
+        None => None,
+        Some(reference) => {
+            let resolved = tokio::task::spawn_blocking({
+                let reference = reference.clone();
+                move || resolve_key(&reference)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("key lookup: {e}")));
+            match resolved {
+                Ok(key) => {
+                    // To the loop first, so the transcript redacts it before any reply.
+                    let _ = tx
+                        .send(Event::KeyResolved {
+                            reference,
+                            value: Secret(key.clone()),
+                        })
+                        .await;
+                    Some(key)
+                }
+                Err(why) => {
+                    emit(PEvent::Error(why)).await;
+                    emit(PEvent::Done(Outcome::Failed)).await;
+                    return;
+                }
+            }
+        }
+    };
     let client = match reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
+        .connect_timeout(chat.connect_timeout)
+        // Covers waiting for headers and every read of the body, errors included.
+        .read_timeout(chat.idle_timeout)
+        // A redirect would carry the prompt and history to another origin.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(client) => client,
@@ -106,12 +188,13 @@ pub async fn run(id: String, chat: Chat, tx: mpsc::Sender<Event>, cancel: Cancel
             return;
         }
     };
+    let mut redactor = Redactor::new(key.clone());
     let mut history = chat.history.clone();
     let mut trimmed = false;
     let mut retried_5xx = false;
     let outcome = loop {
-        let messages = match fit(&chat, &history) {
-            Ok(messages) => messages,
+        let (messages, turns) = match fit(&chat, &history) {
+            Ok(fitted) => fitted,
             Err(why) => {
                 emit(PEvent::Error(why)).await;
                 break Outcome::Failed;
@@ -119,16 +202,17 @@ pub async fn run(id: String, chat: Chat, tx: mpsc::Sender<Event>, cancel: Cancel
         };
         let attempt = tokio::select! {
             _ = cancel.cancelled() => Attempt::Done(Outcome::Interrupted),
-            attempt = request(&client, &chat, messages, &emit) => attempt,
+            attempt = request(&client, &chat, key.as_deref(), messages, &mut redactor, &emit) => attempt,
         };
         match attempt {
             Attempt::Done(outcome) => break outcome,
-            Attempt::TooLong(why) if !trimmed && !history.is_empty() => {
-                // Drop the oldest quarter (at least one turn) and try once more.
-                let drop = history.len().div_ceil(4);
-                history.drain(..drop);
+            Attempt::TooLong(_) if !trimmed && turns > 0 => {
+                // Drop the oldest quarter (at least one) of the turns actually sent.
+                let sent_from = history.len() - turns;
+                let drop = turns.div_ceil(4);
+                history.drain(..sent_from + drop);
                 trimmed = true;
-                tracing::info!(id, %why, dropped = drop, "context too long, retrying");
+                tracing::info!(id, dropped = drop, "context too long, retrying");
             }
             Attempt::TooLong(why) => {
                 emit(PEvent::Error(format!(
@@ -137,9 +221,10 @@ pub async fn run(id: String, chat: Chat, tx: mpsc::Sender<Event>, cancel: Cancel
                 .await;
                 break Outcome::Failed;
             }
-            Attempt::ServerError(why) if !retried_5xx => {
+            Attempt::ServerError(_) if !retried_5xx => {
                 retried_5xx = true;
-                tracing::info!(id, %why, "server error, retrying once");
+                // Provider text is not logged: it may echo a key.
+                tracing::info!(id, "server error, retrying once");
                 tokio::select! {
                     _ = cancel.cancelled() => break Outcome::Interrupted,
                     _ = tokio::time::sleep(RETRY_BACKOFF) => {}
@@ -157,7 +242,9 @@ pub async fn run(id: String, chat: Chat, tx: mpsc::Sender<Event>, cancel: Cancel
 async fn request<F, Fut>(
     client: &reqwest::Client,
     chat: &Chat,
+    key: Option<&str>,
     messages: Vec<Value>,
+    redactor: &mut Redactor,
     emit: &F,
 ) -> Attempt
 where
@@ -165,6 +252,11 @@ where
     Fut: std::future::Future<Output = ()>,
 {
     let url = format!("{}/chat/completions", chat.base_url.trim_end_matches('/'));
+    let sent_estimate: u64 = messages
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .map(estimate)
+        .sum();
     let body = json!({
         "model": chat.model,
         "messages": messages,
@@ -173,7 +265,7 @@ where
         "stream_options": {"include_usage": true},
     });
     let mut builder = client.post(&url).json(&body);
-    if let Some(key) = &chat.key {
+    if let Some(key) = key {
         builder = builder.bearer_auth(key);
     }
     let response = match builder.send().await {
@@ -189,9 +281,18 @@ where
         }
     };
     let status = response.status();
+    if status.is_redirection() {
+        emit(PEvent::Error(format!(
+            "{}: redirected ({status}); redirects are not followed, fix base_url",
+            chat.base_url
+        )))
+        .await;
+        return Attempt::Done(Outcome::Failed);
+    }
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
         let message = provider_message(&text).unwrap_or_else(|| text.chars().take(300).collect());
+        let message = redactor.clean(&message);
         let why = format!("{} {status}: {message}", chat.base_url);
         if status.is_server_error() {
             return Attempt::ServerError(why);
@@ -209,20 +310,14 @@ where
     let mut buffer: Vec<u8> = vec![];
     let mut usage = None;
     let mut reply_chars = String::new();
+    // A clean end of the connection is not proof the model finished: only `[DONE]` or a
+    // `finish_reason` is.
+    let mut completed = false;
     let mut finished = false;
     while !finished {
-        let chunk = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
-            Err(_) => {
-                emit(PEvent::Error(format!(
-                    "{}: no data for {}s",
-                    chat.base_url,
-                    IDLE_TIMEOUT.as_secs()
-                )))
-                .await;
-                return Attempt::Done(Outcome::Failed);
-            }
-            Ok(None) => break,
-            Ok(Some(Err(err))) => {
+        let chunk = match stream.next().await {
+            None => break,
+            Some(Err(err)) => {
                 emit(PEvent::Error(format!(
                     "{}: {}",
                     chat.base_url,
@@ -231,7 +326,7 @@ where
                 .await;
                 return Attempt::Done(Outcome::Failed);
             }
-            Ok(Some(Ok(bytes))) => bytes,
+            Some(Ok(bytes)) => bytes,
         };
         buffer.extend_from_slice(&chunk);
         while let Some(end) = buffer.iter().position(|&b| b == b'\n') {
@@ -242,6 +337,7 @@ where
             };
             let data = data.trim();
             if data == "[DONE]" {
+                completed = true;
                 finished = true;
                 break;
             }
@@ -255,7 +351,16 @@ where
                 && !text.is_empty()
             {
                 reply_chars.push_str(text);
-                emit(PEvent::TextDelta(text.into())).await;
+                let shown = redactor.push(text);
+                if !shown.is_empty() {
+                    emit(PEvent::TextDelta(shown)).await;
+                }
+            }
+            if event
+                .pointer("/choices/0/finish_reason")
+                .is_some_and(|r| !r.is_null())
+            {
+                completed = true;
             }
             if let Some(u) = event.get("usage").filter(|u| !u.is_null()) {
                 usage = Some((
@@ -264,19 +369,28 @@ where
                 ));
             }
             if let Some(message) = event.pointer("/error/message").and_then(Value::as_str) {
+                let message = redactor.clean(message);
                 emit(PEvent::Error(format!("{}: {message}", chat.base_url))).await;
                 return Attempt::Done(Outcome::Failed);
             }
         }
     }
+    let rest = redactor.finish();
+    if !rest.is_empty() {
+        emit(PEvent::TextDelta(rest)).await;
+    }
+    if !completed {
+        emit(PEvent::Error(format!(
+            "{}: the reply stream ended before the model finished",
+            chat.base_url
+        )))
+        .await;
+        return Attempt::Done(Outcome::Failed);
+    }
     let (input, output, estimated) = match usage {
         Some((input, output)) => (input, output, false),
-        // The provider didn't say: estimate, and say so (ADR 0005).
-        None => (
-            estimate(&chat.system) + estimate(&chat.prompt),
-            estimate(&reply_chars),
-            true,
-        ),
+        // The provider didn't say: estimate over what was really sent, and say so.
+        None => (sent_estimate, estimate(&reply_chars), true),
     };
     emit(PEvent::Usage {
         input,
@@ -308,17 +422,24 @@ fn without_url(err: &reqwest::Error) -> String {
 
 /// Resolves a key reference from `models.toml` (ADR 0011): `env:<VAR>` or
 /// `keyring:<name>` (service `roundtable`). Done per request, so a changed key is used at
-/// once. The error names the source, never a value.
+/// once. The error names the source, never a value. Blocking: call off the UI loop.
 pub fn resolve_key(reference: &str) -> Result<String, String> {
-    if let Some(var) = reference.strip_prefix("env:") {
-        return std::env::var(var).map_err(|_| format!("environment variable {var} is not set"));
-    }
-    if let Some(name) = reference.strip_prefix("keyring:") {
-        return keyring::Entry::new("roundtable", name)
+    let key = if let Some(var) = reference.strip_prefix("env:") {
+        std::env::var(var).map_err(|_| format!("environment variable {var} is not set"))?
+    } else if let Some(name) = reference.strip_prefix("keyring:") {
+        keyring::Entry::new("roundtable", name)
             .and_then(|entry| entry.get_password())
-            .map_err(|e| format!("keychain entry roundtable/{name}: {e}"));
+            .map_err(|e| format!("keychain entry roundtable/{name}: {e}"))?
+    } else {
+        return Err(format!("`{reference}` is not a key reference"));
+    };
+    if key.len() < MIN_KEY_LEN {
+        return Err(format!(
+            "the key from {reference} is shorter than {MIN_KEY_LEN} characters; refused so it \
+             can always be redacted"
+        ));
     }
-    Err(format!("`{reference}` is not a key reference"))
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -331,7 +452,7 @@ mod tests {
         Chat {
             base_url: String::new(),
             model: "m".into(),
-            key: None,
+            key_ref: None,
             system: "sys".into(),
             history: history
                 .into_iter()
@@ -340,6 +461,8 @@ mod tests {
             prompt: "now".into(),
             context_window: window,
             max_output: 10,
+            connect_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(5),
         }
     }
 
@@ -356,7 +479,7 @@ mod tests {
             vec![("old q", "old a"), ("new q", "new a")],
             10 + 5 + 5 + 7 + 7,
         );
-        let messages = fit(&c, &c.history).unwrap();
+        let (messages, turns) = fit(&c, &c.history).unwrap();
         let texts: Vec<&str> = messages
             .iter()
             .map(|m| m["content"].as_str().unwrap())
@@ -366,61 +489,93 @@ mod tests {
             ["sys", "new q", "new a", "now"],
             "only the newest turn fits"
         );
+        assert_eq!(turns, 1);
         let roomy = chat(vec![("old q", "old a"), ("new q", "new a")], 1000);
-        assert_eq!(fit(&roomy, &roomy.history).unwrap().len(), 6);
+        assert_eq!(fit(&roomy, &roomy.history).unwrap().0.len(), 6);
         let tiny = chat(vec![], 12);
         assert!(fit(&tiny, &[]).unwrap_err().contains("only 2 fit"));
     }
 
     #[test]
     fn keys_resolve_from_env_and_never_from_text() {
-        // SAFETY: a variable only this test reads.
-        unsafe { std::env::set_var("ROUNDTABLE_TEST_KEY", "sekret") };
-        assert_eq!(resolve_key("env:ROUNDTABLE_TEST_KEY").unwrap(), "sekret");
+        // SAFETY: variables only this test reads.
+        unsafe {
+            std::env::set_var("ROUNDTABLE_TEST_KEY", "sekret-12345");
+            std::env::set_var("ROUNDTABLE_SHORT_KEY", "abc");
+        }
+        assert_eq!(
+            resolve_key("env:ROUNDTABLE_TEST_KEY").unwrap(),
+            "sekret-12345"
+        );
         assert!(
             resolve_key("env:ROUNDTABLE_NO_SUCH_VAR")
                 .unwrap_err()
                 .contains("not set")
         );
+        assert!(
+            resolve_key("env:ROUNDTABLE_SHORT_KEY")
+                .unwrap_err()
+                .contains("shorter")
+        );
         assert!(resolve_key("sk-literal").is_err());
     }
 
-    /// A one-shot fake provider: answers each connection with the next canned response and
-    /// hands back the request bodies it got.
-    async fn fake(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+    #[test]
+    fn a_key_split_across_chunks_is_never_shown() {
+        let mut r = Redactor::new(Some("SECRETKEY".into()));
+        let mut shown = String::new();
+        for chunk in ["your key is SEC", "RETK", "EY, bye"] {
+            shown.push_str(&r.push(chunk));
+            assert!(!shown.contains("SEC"), "a piece leaked: {shown}");
+        }
+        shown.push_str(&r.finish());
+        assert_eq!(shown, "your key is [redacted], bye");
+        let mut none = Redactor::new(None);
+        assert_eq!(none.push("abc"), "abc");
+    }
+
+    /// A fake provider: answers each connection with the next canned response and hands
+    /// back the request bodies and authorization headers it got.
+    async fn fake(
+        responses: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<(Value, String)>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let handle = tokio::spawn(async move {
-            let mut bodies = vec![];
+            let mut got = vec![];
             for response in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = vec![];
                 let mut buf = [0u8; 65536];
-                // Read headers, then exactly content-length bytes of body.
-                let body = loop {
+                let (body, auth) = loop {
                     let n = socket.read(&mut buf).await.unwrap();
                     request.extend_from_slice(&buf[..n]);
                     let text = String::from_utf8_lossy(&request).to_string();
                     if let Some(split) = text.find("\r\n\r\n") {
-                        let length: usize = text
-                            .lines()
-                            .find_map(|l| {
-                                l.to_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .map(|v| v.trim().parse().unwrap())
+                        let header = |name: &str| {
+                            text.lines().find_map(|l| {
+                                let lower = l.to_lowercase();
+                                lower
+                                    .strip_prefix(&format!("{name}:"))
+                                    .map(|v| v.trim().to_string())
                             })
+                        };
+                        let length: usize = header("content-length")
+                            .map(|v| v.parse().unwrap())
                             .unwrap_or(0);
                         if request.len() >= split + 4 + length {
-                            break serde_json::from_slice(&request[split + 4..split + 4 + length])
-                                .unwrap();
+                            let body =
+                                serde_json::from_slice(&request[split + 4..split + 4 + length])
+                                    .unwrap();
+                            break (body, header("authorization").unwrap_or_default());
                         }
                     }
                 };
-                bodies.push(body);
+                got.push((body, auth));
                 socket.write_all(response.as_bytes()).await.unwrap();
                 socket.shutdown().await.unwrap();
             }
-            bodies
+            got
         });
         (url, handle)
     }
@@ -444,7 +599,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         tokio::spawn(run("llama".into(), c, tx, CancellationToken::new()));
         let mut events = vec![];
-        while let Some(Event::Agent(_, event)) = rx.recv().await {
+        while let Some(event) = rx.recv().await {
+            let Event::Agent(_, event) = event else {
+                continue; // KeyResolved goes to the loop, not the chat
+            };
             let done = matches!(event, PEvent::Done(_));
             events.push(event);
             if done {
@@ -458,20 +616,22 @@ mod tests {
     async fn streams_deltas_and_reported_usage() {
         let (url, server) = fake(vec![sse(&[
             r#"{"choices":[{"delta":{"content":"po"}}]}"#,
-            r#"{"choices":[{"delta":{"content":"ng"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"ng"},"finish_reason":"stop"}]}"#,
             r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":2}}"#,
             "[DONE]",
         ])])
         .await;
+        // SAFETY: a variable only this test reads.
+        unsafe { std::env::set_var("ROUNDTABLE_STREAM_KEY", "sk-stream-0001") };
         let mut c = chat(vec![("q", "a")], 1000);
         c.base_url = url;
-        c.key = Some("sekret".into());
+        c.key_ref = Some("env:ROUNDTABLE_STREAM_KEY".into());
         let events = run_chat(c).await;
         assert_eq!(
             events,
             [
-                PEvent::TextDelta("po".into()),
-                PEvent::TextDelta("ng".into()),
+                // With a key, text is held back until it can't be part of the key.
+                PEvent::TextDelta("pong".into()),
                 PEvent::Usage {
                     input: 12,
                     output: 2,
@@ -481,8 +641,8 @@ mod tests {
                 PEvent::Done(Outcome::Complete)
             ]
         );
-        let body = &server.await.unwrap()[0];
-        assert_eq!(body["stream"], true);
+        let (body, auth) = &server.await.unwrap()[0];
+        assert_eq!(auth, "bearer sk-stream-0001", "lowercased by the fake");
         assert_eq!(
             body["messages"].as_array().unwrap().len(),
             4,
@@ -491,10 +651,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stream_cut_short_is_a_failure_not_a_reply() {
+        let (url, _server) = fake(vec![sse(&[
+            r#"{"choices":[{"delta":{"content":"half"}}]}"#,
+        ])])
+        .await;
+        let mut c = chat(vec![], 1000);
+        c.base_url = url;
+        let events = run_chat(c).await;
+        assert!(matches!(&events[1], PEvent::Error(e) if e.contains("ended before")));
+        assert_eq!(events.last(), Some(&PEvent::Done(Outcome::Failed)));
+    }
+
+    #[tokio::test]
     async fn a_429_is_shown_and_not_retried() {
         let (url, server) = fake(vec![status(429, "rate limited, try later")]).await;
         let mut c = chat(vec![], 1000);
-        c.base_url = url.clone();
+        c.base_url = url;
         let events = run_chat(c).await;
         assert!(
             matches!(&events[0], PEvent::Error(e) if e.contains("429") && e.contains("rate limited"))
@@ -504,31 +677,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_5xx_is_retried_once() {
+    async fn redirects_are_not_followed() {
+        let redirect = "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://127.0.0.1:9/elsewhere\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string();
+        let (url, server) = fake(vec![redirect]).await;
+        let mut c = chat(vec![("private q", "private a")], 1000);
+        c.base_url = url;
+        let events = run_chat(c).await;
+        assert!(matches!(&events[0], PEvent::Error(e) if e.contains("redirects are not followed")));
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_5xx_is_retried_once_and_usage_is_estimated_over_what_was_sent() {
         let (url, server) = fake(vec![
             status(503, "overloaded"),
             sse(&[r#"{"choices":[{"delta":{"content":"ok"}}]}"#, "[DONE]"]),
         ])
         .await;
-        let mut c = chat(vec![], 1000);
+        let mut c = chat(
+            vec![("a long earlier question here", "and its long answer")],
+            1000,
+        );
         c.base_url = url;
         let events = run_chat(c).await;
         assert_eq!(events[0], PEvent::TextDelta("ok".into()));
+        let PEvent::Usage {
+            input, estimated, ..
+        } = events[1]
+        else {
+            panic!("{events:?}")
+        };
+        assert!(estimated);
         assert!(
-            matches!(
-                events[1],
-                PEvent::Usage {
-                    estimated: true,
-                    ..
-                }
-            ),
-            "no usage reported: estimated"
+            input > estimate("sys") + estimate("now"),
+            "history counted: {input}"
         );
         assert_eq!(server.await.unwrap().len(), 2);
     }
 
     #[tokio::test]
-    async fn too_long_retries_once_with_a_quarter_less_history() {
+    async fn too_long_retries_once_with_a_quarter_less_of_what_was_sent() {
         let (url, server) = fake(vec![
             status(400, "This model's maximum context length is 4096 tokens"),
             sse(&[r#"{"choices":[{"delta":{"content":"ok"}}]}"#, "[DONE]"]),
@@ -542,12 +730,47 @@ mod tests {
         c.base_url = url;
         let events = run_chat(c).await;
         assert_eq!(events.last(), Some(&PEvent::Done(Outcome::Complete)));
-        let bodies = server.await.unwrap();
+        let got = server.await.unwrap();
         let count = |b: &Value| b["messages"].as_array().unwrap().len();
         assert_eq!(
-            (count(&bodies[0]), count(&bodies[1])),
+            (count(&got[0].0), count(&got[1].0)),
             (2 + 16, 2 + 12),
             "8 turns, then 6"
         );
+    }
+
+    #[tokio::test]
+    async fn the_retry_shrinks_even_when_fitting_already_dropped_turns() {
+        let (url, server) = fake(vec![
+            status(400, "context too long"),
+            sse(&[r#"{"choices":[{"delta":{"content":"ok"}}]}"#, "[DONE]"]),
+        ])
+        .await;
+        // Ten turns, but the window only fits the newest few.
+        let history = (0..10)
+            .map(|i| (format!("question {i}"), format!("answer {i}")))
+            .collect::<Vec<_>>();
+        let mut c = chat(vec![], 10 + 5 + 5 + 4 * 16);
+        c.history = history;
+        c.base_url = url;
+        run_chat(c).await;
+        let got = server.await.unwrap();
+        let count = |b: &Value| b["messages"].as_array().unwrap().len();
+        assert!(count(&got[1].0) < count(&got[0].0), "the retry sends less");
+    }
+
+    #[tokio::test]
+    async fn an_echoed_key_is_redacted_in_errors() {
+        let (url, _server) = fake(vec![status(401, "bad key sk-echo-0000001")]).await;
+        // SAFETY: a variable only this test reads.
+        unsafe { std::env::set_var("ROUNDTABLE_ECHO_KEY", "sk-echo-0000001") };
+        let mut c = chat(vec![], 1000);
+        c.base_url = url;
+        c.key_ref = Some("env:ROUNDTABLE_ECHO_KEY".into());
+        let events = run_chat(c).await;
+        let PEvent::Error(e) = &events[0] else {
+            panic!("{events:?}")
+        };
+        assert!(e.contains("[redacted]") && !e.contains("sk-echo"), "{e}");
     }
 }
