@@ -43,10 +43,8 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
   owner decision below. Re-review only if the owner changes the lock design.
 
 ## Notes
-- Open owner decision (writer lock): the crash lock lives in the data folder and matches
-  checkouts by path, so a renamed checkout or another data root (`XDG_DATA_HOME`) can miss
-  an unfinished writer. The fix would be a lock inside the checkout (e.g. under `.git/`),
-  which changes ADR 0010. Don't re-report it until the owner decides.
+- The writer lock moved into the checkout (ADR 0012, `src/writer_lock.rs`); the transcript
+  scan is gone. Known, accepted limit: a rename *during* a writable turn (needs `openat`).
 - ADR 0004: the owner chose a git worktree per agent for the single-writer limit
   (2026-11-24); its own ADR comes later. Don't re-report project hooks or detached tools
   as findings; review the worktree ADR when it exists.

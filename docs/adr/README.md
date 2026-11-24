@@ -16,6 +16,7 @@ Implementation order: see the note under the table.
 | [0009](0009-tui-layout.adr) | Three-pane layout: threads, conversation, context | Accepted |
 | [0010](0010-filesystem-event-log.adr) | Append-only JSONL files are the transcript (replaces 0003) | Accepted |
 | [0011](0011-hot-model-registry.adr) | Model registry lives in memory, changes hot, persists to TOML (replaces 0006) | Accepted |
+| [0012](0012-checkout-writer-lock.adr) | The writer lock lives in the checkout (amends 0010) | Proposed |
 
 Implementation order follows dependencies, not numbers: 0001, 0002, 0010, 0004, 0011,
-0005, 0007, 0008, 0009 (0010 and 0011 replace earlier numbers that others depend on).
+0005, 0007, 0008, 0009; 0012 lands with the writer fixes (0010 and 0011 replace earlier numbers that others depend on).
