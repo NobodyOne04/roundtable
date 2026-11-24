@@ -182,20 +182,30 @@ impl App {
     }
 
     /// At startup: a previous writer in this checkout may still be running (ADR 0010).
-    pub fn lock_edits(&mut self, locks: Vec<Lock>, checkout: &str) {
+    pub fn lock_edits(&mut self, locks: Vec<Lock>) {
+        let mut checkouts = vec![];
         for lock in locks {
             match lock {
-                Lock::Open(id) => self.edits_locked.push(id),
+                Lock::Open { id, checkout } => {
+                    self.edits_locked.push(id);
+                    let checkout = checkout.display().to_string();
+                    if !checkouts.contains(&checkout) {
+                        checkouts.push(checkout);
+                    }
+                }
                 Lock::Unreadable { id, why } => self.unreadable.push((id, why)),
             }
         }
-        if !self.edits_locked.is_empty() {
+        if !checkouts.is_empty() {
+            // Every checkout is named: `/quiet` confirms all of them, so the user must know
+            // which (e.g. an outer repo around a nested one).
             self.push(
                 "roundtable",
                 format!(
-                    "edits are locked: a writer from an earlier run never finished in \
-                     {checkout} and may still be running. Check nothing is editing there, then \
-                     type /quiet. Until then every turn is read-only."
+                    "edits are locked: a writer from an earlier run never finished in {}, and \
+                     may still be running. Check nothing is editing there, then type /quiet. \
+                     Until then every turn is read-only.",
+                    checkouts.join(" and ")
                 ),
                 LineKind::Error,
             );
@@ -210,6 +220,15 @@ impl App {
                 ),
                 LineKind::Error,
             );
+        }
+    }
+
+    /// How to lift the lock, for messages: `/quiet` can't fix unreadable history.
+    fn unlock_hint(&self) -> &'static str {
+        if self.unreadable.is_empty() {
+            "until /quiet"
+        } else {
+            "until the unreadable thread is repaired or moved"
         }
     }
 
@@ -333,7 +352,7 @@ impl App {
         if to_writer && !writable {
             self.push(
                 "roundtable",
-                "read-only: edits are locked until /quiet".into(),
+                format!("read-only: edits are locked {}", self.unlock_hint()),
                 LineKind::Info,
             );
         }
@@ -401,7 +420,7 @@ impl App {
                 tags.push(if !self.locked() {
                     "writer"
                 } else {
-                    "writer, locked until /quiet"
+                    "writer, locked"
                 });
             }
             let state = match (p.enabled, self.availability(p)) {
@@ -1288,7 +1307,10 @@ mod tests {
     #[test]
     fn locked_edits_run_read_only_until_quiet() {
         let mut app = App::default();
-        app.lock_edits(vec![Lock::Open("T1".into())], "/repo");
+        app.lock_edits(vec![Lock::Open {
+            id: "T1".into(),
+            checkout: "/repo".into(),
+        }]);
         assert!(last_text(&app).starts_with("edits are locked"));
         let effects = type_line(&mut app, "fix");
         assert_eq!(writable(&effects), [("claude".into(), false)]);
@@ -1450,19 +1472,37 @@ mod tests {
     #[test]
     fn unreadable_threads_lock_and_quiet_cannot_lift_it() {
         let mut app = App::default();
-        app.lock_edits(
-            vec![Lock::Unreadable {
-                id: "T9".into(),
-                why: "meta.json: eof".into(),
-            }],
-            "/repo",
-        );
+        app.lock_edits(vec![Lock::Unreadable {
+            id: "T9".into(),
+            why: "meta.json: eof".into(),
+        }]);
         assert!(last_text(&app).contains("thread T9 can't be read"));
         assert!(type_line(&mut app, "/quiet").is_empty());
         assert_eq!(
             writable(&type_line(&mut app, "fix")),
             [("claude".into(), false)]
         );
+        assert!(
+            app.lines.iter().any(|l| l.text
+                == "read-only: edits are locked until the unreadable thread is repaired or moved"),
+            "the hint names the real way out"
+        );
+    }
+
+    #[test]
+    fn the_lock_names_every_checkout_it_covers() {
+        let mut app = App::default();
+        app.lock_edits(vec![
+            Lock::Open {
+                id: "T1".into(),
+                checkout: "/outer".into(),
+            },
+            Lock::Open {
+                id: "T2".into(),
+                checkout: "/outer/nested".into(),
+            },
+        ]);
+        assert!(last_text(&app).contains("never finished in /outer and /outer/nested"));
     }
 
     #[test]

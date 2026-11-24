@@ -222,7 +222,10 @@ impl Store {
                 continue;
             }
             match writer_open_in(&dir.join("events.jsonl")) {
-                Ok(true) => locks.push(Lock::Open(id)),
+                Ok(true) => locks.push(Lock::Open {
+                    id,
+                    checkout: meta.checkout,
+                }),
                 Ok(false) => {}
                 Err(why) => locks.push(unreadable(why)),
             }
@@ -343,7 +346,7 @@ impl Thread {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lock {
     /// Its last writable turn never finished; `/quiet` settles it.
-    Open(String),
+    Open { id: String, checkout: PathBuf },
     /// Its history can't be read, so its writer state is unknown. Only moving the thread
     /// folder out of the way (or repairing it) unlocks.
     Unreadable { id: String, why: String },
@@ -352,7 +355,7 @@ pub enum Lock {
 impl Lock {
     pub fn id(&self) -> &str {
         match self {
-            Lock::Open(id) | Lock::Unreadable { id, .. } => id,
+            Lock::Open { id, .. } | Lock::Unreadable { id, .. } => id,
         }
     }
 }
@@ -405,22 +408,21 @@ pub fn writer_open(events: &[EventLine]) -> bool {
 /// line may be torn; a bad line before it is corruption and an error.
 fn scan(file: &mut File, path: &Path) -> Result<(u64, u64)> {
     file.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let mut good_len = 0;
-    let mut count = 0;
-    let mut rest = bytes.as_slice();
-    while !rest.is_empty() {
-        let Some(end) = rest.iter().position(|&b| b == b'\n') else {
-            break; // no newline: torn
-        };
-        match serde_json::from_slice::<EventLine>(&rest[..end]) {
+    // Line by line, so reopening a long transcript never loads it whole.
+    let mut reader = BufReader::new(&mut *file);
+    let mut line = Vec::new();
+    let (mut good_len, mut count) = (0, 0);
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 || !line.ends_with(b"\n") {
+            break; // end, or a torn last line (no newline)
+        }
+        match serde_json::from_slice::<EventLine>(&line) {
             Ok(_) => {
-                good_len += end as u64 + 1;
+                good_len += read as u64;
                 count += 1;
-                rest = &rest[end + 1..];
             }
-            Err(_) if rest[end + 1..].is_empty() => break, // torn last line
             Err(source) => {
                 return Err(Error::Corrupt {
                     path: path.into(),
@@ -560,7 +562,13 @@ mod tests {
             .append(event(Kind::Msg, "codex", false), true)
             .unwrap();
         let found = store.writer_locks(dir.path()).unwrap();
-        assert_eq!(found, [Lock::Open(crashed.meta.id.clone())]);
+        assert_eq!(
+            found,
+            [Lock::Open {
+                id: crashed.meta.id.clone(),
+                checkout: dir.path().canonicalize().unwrap()
+            }]
+        );
         let sub = dir.path().join("src");
         fs::create_dir(&sub).unwrap();
         assert_eq!(

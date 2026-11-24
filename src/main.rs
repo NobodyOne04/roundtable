@@ -96,7 +96,7 @@ async fn start() -> Result<()> {
         .store
         .writer_locks(&runtime.checkout)
         .context("checking for unfinished writer turns")?;
-    app.lock_edits(locks, &runtime.checkout.display().to_string());
+    app.lock_edits(locks);
     if let Some(why) = load_error {
         app.note(
             format!("{} not applied: {why}", runtime.models_path.display()),
