@@ -12,8 +12,9 @@
 //! redaction and identity hashes, which also key `sessions.json` (ADR 0011); `usage.json`
 //! (with `/usage`, ADR 0008).
 
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions, Permissions, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -122,9 +123,11 @@ impl Store {
     /// Takes the single-instance lock, so start-up recovery can never touch a live turn
     /// of another instance.
     pub fn open(root: &Path) -> Result<Self> {
-        fs::create_dir_all(root.join("threads"))?;
+        private_dir(root)?;
+        private_dir(&root.join("threads"))?;
         let path = root.join("roundtable.lock");
         let mut lock = OpenOptions::new()
+            .mode(0o600)
             .read(true)
             .write(true)
             .create(true)
@@ -161,7 +164,7 @@ impl Store {
             .map_err(|err| io::Error::other(err.to_string()))?
             .to_string();
         let dir = self.thread_dir(&id);
-        fs::create_dir(&dir)?;
+        fs::DirBuilder::new().mode(0o700).create(&dir)?;
         let meta = Meta {
             id: id.clone(),
             title: title.into(),
@@ -215,6 +218,7 @@ impl Thread {
     fn open(dir: PathBuf, meta: Meta) -> Result<Self> {
         let events_path = dir.join("events.jsonl");
         let mut file = OpenOptions::new()
+            .mode(0o600)
             .read(true)
             .append(true)
             .create(true)
@@ -325,10 +329,26 @@ fn scan(file: &mut File, path: &Path) -> Result<(u64, u64)> {
     Ok((good_len, count))
 }
 
+/// Creates `path` (and parents) readable by the owner only, and tightens it if it already
+/// exists: the transcript holds prompts and replies. Everything under an owner-only folder
+/// is out of reach for other users, including files from before this rule.
+pub fn private_dir(path: &Path) -> io::Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
+    fs::set_permissions(path, Permissions::from_mode(0o700))
+}
+
 /// Writes a small file so readers see either the old or the new content, never a mix.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
-    let mut file = File::create(&tmp)?;
+    let mut file = OpenOptions::new()
+        .mode(0o600)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
     file.write_all(bytes)?;
     file.sync_data()?;
     fs::rename(&tmp, path)
@@ -388,6 +408,27 @@ mod tests {
                     .1
         });
         assert!(reopened, "the lock outlived its store");
+    }
+
+    #[test]
+    fn everything_is_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, Permissions::from_mode(0o755)).unwrap(); // from an older run
+        let mut store = Store::open(&root).unwrap();
+        let mut thread = store.create_thread("t", dir.path()).unwrap();
+        thread.append(user_msg("secret"), true).unwrap();
+        thread.save_sessions(&Default::default()).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tdir = root.join("threads").join(&thread.meta.id);
+        assert_eq!(mode(&root), 0o700, "an existing root is tightened");
+        assert_eq!(mode(&root.join("threads")), 0o700);
+        assert_eq!(mode(&tdir), 0o700);
+        for file in ["meta.json", "events.jsonl", "sessions.json"] {
+            assert_eq!(mode(&tdir.join(file)), 0o600, "{file}");
+        }
+        assert_eq!(mode(&root.join("roundtable.lock")), 0o600);
     }
 
     #[test]

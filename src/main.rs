@@ -2,7 +2,8 @@
 //! Stack: ADR 0001. Event loop: ADR 0002. Transcript files: ADR 0010. CLI agents: ADR 0004.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Mutex;
@@ -338,7 +339,8 @@ fn data_root() -> Result<PathBuf> {
     let dir = dirs::data_dir()
         .context("no data directory on this system")?
         .join("roundtable");
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    roundtable::transcript::private_dir(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
 }
 
@@ -346,6 +348,7 @@ fn data_root() -> Result<PathBuf> {
 fn init_logging(root: &Path) -> Result<()> {
     let path = root.join("roundtable.log");
     let file = OpenOptions::new()
+        .mode(0o600)
         .create(true)
         .append(true)
         .open(&path)
