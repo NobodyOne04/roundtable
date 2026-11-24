@@ -11,6 +11,9 @@
 - AGENTS.md: Codex context with its role, state and pending review
 - Proposed ADR 0010 (JSONL files as the transcript) and 0011 (hot in-memory model registry)
 
+### Fixed
+- Transcript, sessions and logs are readable by the owner only (data folder 0700, files 0600)
+
 ### Changed
 - README matches the ADRs: roadmap in build order with progress, worktree decision, hot-registry and disable behaviour, chat-only models, requirements
 - ADRs 0010 and 0011 accepted
