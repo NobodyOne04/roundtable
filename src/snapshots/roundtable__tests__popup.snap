@@ -1,0 +1,16 @@
+---
+source: src/main.rs
+expression: "render(&app, 60, 12)"
+---
+"┌ roundtable ──────────────────────────────────────────────┐"
+"│Nothing at the table yet. Type to Claude, start with      │"
+"│@codex or @all, or /help.                                 │"
+"│                                                          │"
+"└──────────────────────────────────────────────────────────┘"
+"┌ Tab completes ───────────────────────────────────────────┐"
+"│/models                                                   │"
+"│/model                                                    │"
+"└──────────────────────────────────────────────────────────┘"
+"┌──────────────────────────────────────────────────────────┐"
+"│> /mo                                                     │"
+"└ Enter send · Alt-Enter new line · /help · Esc cancel · Ct┘"

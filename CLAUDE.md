@@ -14,6 +14,7 @@ Rust TUI console that runs Claude Code, Codex and OpenAI-compatible models in on
 - `src/agent.rs`: Claude Code and Codex adapters (command + JSON parser) and the process runner: process group, cancel, reap (ADR 0004).
 - `tests/fixtures/`: recorded CLI output per version (`claude-<ver>-turnN.jsonl`, `codex-<ver>-turnN.jsonl`), stripped of paths and account fields.
 - `src/registry.rs`: `models.toml` parsing and validation (all or nothing), default file, identities (FNV-1a), comment-keeping edits (ADR 0011).
+- `src/commands.rs`: the slash-command table (`/help` and completion come from it) (ADR 0008).
 - `src/mcp.rs`: `roundtable mcp`, the stdio MCP server giving Claude the `ask` tool, and its socket client (ADR 0007).
 - `src/openai.rs`: OpenAI-compatible chat: streaming SSE, history fitting, retries, key resolution (ADR 0005).
 - `src/writer_lock.rs`: checkout resolution (git root, git dir) and the writer lock and crash marker (ADR 0012).
@@ -26,6 +27,7 @@ Rust TUI console that runs Claude Code, Codex and OpenAI-compatible models in on
 - `AGENTS.md`: Codex context (its role here, state, pending tasks); keep "Pending for Codex" current.
 
 ## Conventions
+- A new slash command goes in `commands::COMMANDS` and in `App::command`; `/help` and completion read the table.
 - `ask` (ADR 0007): the loop gives each Claude turn that may ask a one-time token (`Runtime::ask_tokens`) and only accepts asks carrying it; `App::asked` runs the checks in the ADR's order and every ask is answered exactly once (`Effect::Answer`), refusals included. Asked turns are never writable.
 - Resolved API keys reach the loop only as `Event::KeyResolved` (`Secret` hides its value in Debug) and live in `Runtime::secrets`. All participant output is cleaned by `Runtime::redact_output` before the app sees it, and transcript writes by `Runtime::record`; never log or show a key value, only its reference. Provider text is not logged.
 - Events the loop raises itself go into its `local` queue, never `try_send` on its own channel (a full channel would drop them).

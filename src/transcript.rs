@@ -204,6 +204,27 @@ impl Store {
         Ok(())
     }
 
+    /// Usage summed over every thread (optionally one day), from each `usage.json`.
+    pub fn usage(&self, day: Option<&str>) -> Result<std::collections::BTreeMap<String, Tally>> {
+        let mut total = std::collections::BTreeMap::<String, Tally>::new();
+        for entry in fs::read_dir(self.root.join("threads"))? {
+            let path = entry?.path().join("usage.json");
+            let Ok(bytes) = fs::read(&path) else {
+                continue; // a thread with no replies yet
+            };
+            let usage: Usage = serde_json::from_slice(&bytes)?;
+            for (d, by) in &usage {
+                if day.is_some_and(|day| day != d) {
+                    continue;
+                }
+                for (id, tally) in by {
+                    total.entry(id.clone()).or_default().add(tally);
+                }
+            }
+        }
+        Ok(total)
+    }
+
     /// All threads, newest first. A folder without a readable `meta.json` is skipped.
     pub fn list_threads(&self) -> Result<Vec<Meta>> {
         let mut metas = Vec::new();
@@ -227,6 +248,9 @@ pub struct Thread {
     events_path: PathBuf,
     file: File,
     next_seq: u64,
+    /// Tokens and cost per day and participant (`usage.json`, ADR 0010), so `/usage` reads
+    /// one small file per thread instead of every transcript.
+    usage: Usage,
     /// Set when a failed append could not be undone: the file may end in a partial line, so
     /// nothing more is appended until the thread is reopened (which repairs the tail).
     broken: bool,
@@ -248,6 +272,10 @@ impl Thread {
             file.set_len(good_len)?;
             file.sync_data()?;
         }
+        let usage = fs::read(dir.join("usage.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
         Ok(Self {
             meta,
             dir,
@@ -255,6 +283,7 @@ impl Thread {
             file,
             next_seq: lines,
             broken: false,
+            usage,
         })
     }
 
@@ -295,7 +324,33 @@ impl Thread {
         if durable {
             self.file.sync_data()?;
         }
+        // A participant's reply with tokens counts toward the thread's usage.
+        if line.kind == Kind::Msg
+            && line.from.id != "user"
+            && (line.tokens_in.is_some() || line.tokens_out.is_some())
+        {
+            let day = day_of(line.ts);
+            let entry = self
+                .usage
+                .entry(day)
+                .or_default()
+                .entry(line.from.id.clone())
+                .or_default();
+            entry.input += line.tokens_in.unwrap_or(0);
+            entry.output += line.tokens_out.unwrap_or(0);
+            entry.cost_usd += line.payload["cost_usd"].as_f64().unwrap_or(0.0);
+            entry.estimated |= line.payload["usage_estimated"] == true;
+            write_atomic(
+                &self.dir.join("usage.json"),
+                &serde_json::to_vec_pretty(&self.usage)?,
+            )?;
+        }
         Ok(line.seq)
+    }
+
+    /// This thread's usage, every day.
+    pub fn usage(&self) -> &Usage {
+        &self.usage
     }
 
     /// The native CLI session of each participant in this thread (`sessions.json`), so the
@@ -327,6 +382,48 @@ impl Thread {
         }
         Ok(events)
     }
+}
+
+/// Tokens and cost of one participant.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Tally {
+    pub input: u64,
+    pub output: u64,
+    pub cost_usd: f64,
+    /// Some of it was estimated by roundtable (ADR 0005).
+    pub estimated: bool,
+}
+
+impl Tally {
+    pub fn add(&mut self, other: &Tally) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cost_usd += other.cost_usd;
+        self.estimated |= other.estimated;
+    }
+}
+
+/// `day (YYYY-MM-DD, UTC) -> participant -> tally`.
+pub type Usage = std::collections::BTreeMap<String, std::collections::BTreeMap<String, Tally>>;
+
+/// The UTC date of a unix-milliseconds timestamp.
+pub fn day_of(ms: u64) -> String {
+    // Civil-from-days (Howard Hinnant), so no date crate is needed for one function.
+    let days = (ms / 86_400_000) as i64 + 719_468;
+    let era = days.div_euclid(146_097);
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Today's UTC date.
+pub fn today() -> String {
+    day_of(now_ms())
 }
 
 /// Replaces every resolved key value in `value` with `[redacted:<reference>]`, before
@@ -581,6 +678,48 @@ mod tests {
         assert_eq!(payload["text"], "error: invalid key [redacted:env:K]");
         assert_eq!(payload["nested"][0]["echo"], "[redacted:env:K]");
         assert_eq!(payload["short"], "abc");
+    }
+
+    #[test]
+    fn days_are_utc_dates() {
+        assert_eq!(day_of(0), "1970-01-01");
+        assert_eq!(day_of(951_782_400_000), "2000-02-29");
+        assert_eq!(day_of(1_795_525_069_792), "2026-11-24");
+    }
+
+    #[test]
+    fn replies_add_up_in_usage_json_and_across_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let reply = |tokens: u64| NewEvent {
+            from: Party {
+                id: "claude".into(),
+                identity: None,
+            },
+            kind: Kind::Msg,
+            payload: json!({ "text": "x", "cost_usd": 0.5 }),
+            tokens_in: Some(tokens),
+            tokens_out: Some(1),
+            ..user_msg("")
+        };
+        let mut a = store.create_thread("a", dir.path()).unwrap();
+        a.append(user_msg("q"), false).unwrap();
+        a.append(reply(10), false).unwrap();
+        a.append(reply(5), false).unwrap();
+        let mut b = store.create_thread("b", dir.path()).unwrap();
+        b.append(reply(100), false).unwrap();
+        let today = today();
+        let mine = &a.usage()[&today]["claude"];
+        assert_eq!((mine.input, mine.output, mine.cost_usd), (15, 2, 1.0));
+        let all = store.usage(None).unwrap();
+        assert_eq!(all["claude"].input, 115);
+        assert!(store.usage(Some("1999-01-01")).unwrap().is_empty());
+        // Reopened, the thread keeps counting from its file.
+        let id = a.meta.id.clone();
+        drop(a);
+        let mut a = store.open_thread(&id).unwrap();
+        a.append(reply(1), false).unwrap();
+        assert_eq!(a.usage()[&today]["claude"].input, 16);
     }
 
     #[test]

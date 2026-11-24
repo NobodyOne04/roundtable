@@ -3,10 +3,10 @@ source: src/main.rs
 expression: "render(&App::default(), 60, 8)"
 ---
 "┌ roundtable ──────────────────────────────────────────────┐"
-"│Nothing at the table yet. Type to Claude, or start with   │"
-"│@codex or @all.                                           │"
+"│Nothing at the table yet. Type to Claude, start with      │"
+"│@codex or @all, or /help.                                 │"
 "│                                                          │"
 "└──────────────────────────────────────────────────────────┘"
 "┌──────────────────────────────────────────────────────────┐"
 "│>                                                         │"
-"└ Enter send · @codex @all · Esc cancel · Ctrl-C twice quit┘"
+"└ Enter send · Alt-Enter new line · /help · Esc cancel · Ct┘"

@@ -38,9 +38,12 @@ the reply, and the tokens it cost.
 
 - `@claude`, `@codex`, `@all` to address participants; no mention goes to the default.
   With `@all`, every enabled participant answers you independently.
-- Slash commands like Claude Code: `/help`, `/usage`, `/context`, `/status`, `/models`,
-  `/model enable|disable|use|test`, `/talk on|off|allow|deny|show`, `/budget`, `/turns`,
-  `/resume`, `/clear`. Full list: [ADR 0008](docs/adr/0008-slash-commands-and-mentions.adr).
+- Slash commands like Claude Code (`/help` lists them, `Tab` completes them and `@` ids):
+  `/status`, `/usage [thread|today|all]`, `/context [id]`, `/models`,
+  `/model enable|disable|use|test <id>`, `/talk on|off|show|allow a->b|deny a->b`,
+  `/budget`, `/turns`, `/clear`, `/exit`, `/quiet`. `Alt-Enter` adds a line, `PgUp`/`PgDn`
+  scroll, `\/` sends a literal slash. `/resume` comes next; `/model add`, `/compact`,
+  `/handoff` and `/fork` later ([ADR 0008](docs/adr/0008-slash-commands-and-mentions.adr)).
 - Add any free model with a few lines of config, no rebuild, no restart: the registry is
   hot, so edits to the file or `/model …` commands apply at once. An edit with an error
   is not applied at all; the chat shows the error and the old registry stays live.
@@ -192,7 +195,7 @@ Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
 | 5 | [0011](docs/adr/0011-hot-model-registry.adr) | Hot model registry, `writer`, enable/disable | done |
 | 6 | [0005](docs/adr/0005-openai-compatible-models.adr) | Free models over the OpenAI-compatible API | done |
 | 7 | [0007](docs/adr/0007-model-to-model-communication.adr) | Model-to-model `ask`, talk policy, limits, `/talk on\|off` | done |
-| 8 | [0008](docs/adr/0008-slash-commands-and-mentions.adr) | Full command set and completion | next |
+| 8 | [0008](docs/adr/0008-slash-commands-and-mentions.adr) | Full command set and completion | done except `/resume` (next) |
 | 9 | [0009](docs/adr/0009-tui-layout.adr) | Three-pane layout | |
 
 Later, each with its own ADR first: git worktree per agent, `/model add` (guided),
