@@ -560,12 +560,25 @@ fn checkout_root(cwd: &Path) -> Result<PathBuf, String> {
     if output.status.success() {
         let root = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
         // Only Git's line terminator: a repo name may itself end in spaces.
-        return Ok(PathBuf::from(root.strip_suffix('\n').unwrap_or(&root)));
+        let root = PathBuf::from(root.strip_suffix('\n').unwrap_or(&root));
+        // An inherited GIT_WORK_TREE can name an unrelated tree; the lock must cover the
+        // folder the agents actually run in.
+        let (canon_root, canon_cwd) = (root.canonicalize(), cwd.canonicalize());
+        return match (canon_root, canon_cwd) {
+            (Ok(r), Ok(c)) if c.starts_with(&r) => Ok(root),
+            _ => Err(format!(
+                "git names {} as the checkout, which doesn't contain {}",
+                root.display(),
+                cwd.display()
+            )),
+        };
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // Exactly git's "no repository here or above"; a broken worktree says
-    // "not a git repository: <gitdir>" and must not count as outside a repo.
-    if stderr.contains("not a git repository (or any of the parent directories)") {
+    // Exactly git's "no repository here or above" (also when it stops at a mount point);
+    // a broken worktree says "not a git repository: <gitdir>" and must not count.
+    if stderr.contains("not a git repository (or any of the parent directories)")
+        || stderr.contains("not a git repository (or any parent up to mount point")
+    {
         Ok(cwd.to_path_buf())
     } else {
         Err(stderr.trim().to_string())
@@ -645,6 +658,27 @@ mod tests {
         fs::create_dir(&broken).unwrap();
         fs::write(broken.join(".git"), "gitdir: /nonexistent/worktrees/x\n").unwrap();
         assert!(checkout_root(&broken).is_err());
+
+        // GIT_WORK_TREE pointing elsewhere is refused, not trusted.
+        let elsewhere = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(&repo)
+            .env("GIT_DIR", repo.join(".git"))
+            .env("GIT_WORK_TREE", outside.path())
+            .output()
+            .unwrap();
+        assert!(elsewhere.status.success(), "git accepts the override");
+        // SAFETY: tests in this binary don't read these vars concurrently.
+        unsafe {
+            std::env::set_var("GIT_DIR", repo.join(".git"));
+            std::env::set_var("GIT_WORK_TREE", outside.path());
+        }
+        let result = checkout_root(&repo.join("src"));
+        unsafe {
+            std::env::remove_var("GIT_DIR");
+            std::env::remove_var("GIT_WORK_TREE");
+        }
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
