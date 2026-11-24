@@ -1,11 +1,12 @@
 ---
 source: src/main.rs
-expression: terminal.backend()
+expression: "render(&App::default(), 60, 8)"
 ---
-"┌ roundtable ──────────────────────────┐"
-"│       Nothing at the table yet.      │"
-"│                                      │"
-"│          q or Ctrl-C to quit         │"
-"│                                      │"
-"│                                      │"
-"└──────────────────────────────────────┘"
+"┌ roundtable ──────────────────────────────────────────────┐"
+"│Nothing at the table yet. Type to Claude, or start with   │"
+"│@codex or @all.                                           │"
+"│                                                          │"
+"└──────────────────────────────────────────────────────────┘"
+"┌──────────────────────────────────────────────────────────┐"
+"│>                                                         │"
+"└ Enter send · @codex @all · Esc cancel · Ctrl-C twice quit┘"

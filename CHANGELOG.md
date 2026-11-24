@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Claude Code and Codex in the chat (ADR 0004): `@claude`, `@codex`, `@all`, streaming replies, tool lines, queue when busy, `Esc` cancels (whole process group), sessions resumed, read-only for now, preflight with versions
 - Transcript files (ADR 0010): append-only JSONL per thread, torn-line repair, atomic metadata, and only one roundtable running at a time
 - Event loop (ADR 0002): one task owns the app state; terminal input and a 30 fps tick send events through one bounded channel; redraw only on change
 - Rust skeleton (ADR 0001): pinned toolchain, empty table screen, terminal restored on exit and panic, file logging, CI

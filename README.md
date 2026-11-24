@@ -3,8 +3,8 @@
 A terminal console where Claude Code, Codex and free models sit at one table, and you watch them talk.
 
 > **Status: early build.** The architecture is decided in [`docs/adr/`](docs/adr/README.md).
-> Built so far: the skeleton and the event loop (ADR 0001, 0002). It opens an empty table
-> and quits; no agents yet. See [Roadmap](#roadmap).
+> Built so far: a chat with Claude Code and Codex (read-only for now), streaming replies,
+> and the transcript on disk. See [Roadmap](#roadmap).
 
 ## What it is
 
@@ -98,8 +98,14 @@ API keys are never written here: use `key = "keyring:<name>"` (OS keychain) or
 
 ```sh
 cargo build --release
-./target/release/roundtable          # q or Ctrl-C to quit
+./target/release/roundtable          # Ctrl-C twice, or Ctrl-D on an empty line, to quit
+./target/release/roundtable --outside-repo   # let Codex run outside a git repo
 ```
+
+Type to talk to Claude; start a line with `@codex` or `@all` to address others. `Esc`
+cancels running replies. For now every agent is read-only: plan mode for Claude, the
+read-only sandbox for Codex, both without your own MCP servers, hooks and plugins. Editing
+arrives with the `writer` in step 5.
 
 The Rust toolchain is pinned in `rust-toolchain.toml`; rustup installs it on first build.
 For a shorter command, add `alias rt=roundtable` to your shell (with the binary on your
@@ -110,11 +116,12 @@ For a shorter command, add `alias rt=roundtable` to your shell (with the binary 
 ## Requirements
 
 - macOS or Linux.
-- Planned, as agents land: the agent CLIs you want at the table, installed and logged in
-  (`claude`, `codex`; tested versions will be listed here), and Ollama or LM Studio for
-  free local models.
-- From step 4: start it inside a git repo; outside one, Codex runs only after you confirm.
-- From step 3: one roundtable at a time; a second instance exits with "already running".
+- The agent CLIs, installed and logged in. Tested with Claude Code 2.1.331 and
+  codex-cli 0.171.0; their JSON output changes between versions, so others may misbehave.
+- Start it inside a git repo; outside one, Codex is unavailable unless you pass
+  `--outside-repo`.
+- One roundtable at a time; a second instance exits with "already running".
+- Planned (step 6): Ollama or LM Studio for free local models.
 
 ## Privacy
 
@@ -138,9 +145,9 @@ Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
 |---|---|---|---|
 | 1 | [0001](docs/adr/0001-rust-tokio-ratatui.adr) | Skeleton: toolchain, terminal safety, CI | done |
 | 2 | [0002](docs/adr/0002-single-owner-event-loop.adr) | Event loop: one owner of state, events in, effects out | done |
-| 3 | [0010](docs/adr/0010-filesystem-event-log.adr) | Transcript as JSONL files, single-instance lock | next |
-| 4 | [0004](docs/adr/0004-cli-agent-adapters.adr) | Claude Code and Codex in the chat, read-only until 0011 | |
-| 5 | [0011](docs/adr/0011-hot-model-registry.adr) | Hot model registry, `writer`, enable/disable | |
+| 3 | [0010](docs/adr/0010-filesystem-event-log.adr) | Transcript as JSONL files, single-instance lock | done |
+| 4 | [0004](docs/adr/0004-cli-agent-adapters.adr) | Claude Code and Codex in the chat, read-only until 0011 | done |
+| 5 | [0011](docs/adr/0011-hot-model-registry.adr) | Hot model registry, `writer`, enable/disable | next |
 | 6 | [0005](docs/adr/0005-openai-compatible-models.adr) | Free models over the OpenAI-compatible API | |
 | 7 | [0007](docs/adr/0007-model-to-model-communication.adr) | Model-to-model `ask`, talk policy, limits, `/talk on\|off` | |
 | 8 | [0008](docs/adr/0008-slash-commands-and-mentions.adr) | Full command set and completion | |

@@ -8,8 +8,9 @@
 //! ```
 //!
 //! Lands with the steps that produce the data: the writer task and its acks into the event
-//! loop, `sessions.json` and the unclean-writer interlock (ADR 0004); key redaction and
-//! identity hashes (ADR 0011); `usage.json` (first `settle` with tokens).
+//! loop and the unclean-writer interlock (with the first writable turn, ADR 0011); key
+//! redaction and identity hashes, which also key `sessions.json` (ADR 0011); `usage.json`
+//! (with `/usage`, ADR 0008).
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -62,7 +63,7 @@ pub enum Kind {
 }
 
 /// An event before it is written; the thread assigns `seq` and `ts`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NewEvent {
     pub turn: Option<u64>,
     pub parent: Option<u64>,
@@ -204,6 +205,7 @@ impl Store {
 /// An open thread: its metadata and its transcript, open for appending.
 pub struct Thread {
     pub meta: Meta,
+    dir: PathBuf,
     events_path: PathBuf,
     file: File,
     next_seq: u64,
@@ -226,6 +228,7 @@ impl Thread {
         }
         Ok(Self {
             meta,
+            dir,
             events_path,
             file,
             next_seq: lines,
@@ -257,6 +260,20 @@ impl Thread {
         }
         self.next_seq += 1;
         Ok(line.seq)
+    }
+
+    /// The native CLI session of each participant in this thread (`sessions.json`), so the
+    /// next turn resumes it.
+    // shortcut: keyed by participant id; ADR 0010 keys by (id, identity) once 0011 adds identities.
+    pub fn save_sessions(
+        &self,
+        sessions: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        write_atomic(
+            &self.dir.join("sessions.json"),
+            &serde_json::to_vec_pretty(sessions)?,
+        )?;
+        Ok(())
     }
 
     /// Every event, in order. The thread state is a fold over these (ADR 0010).
@@ -360,7 +377,17 @@ mod tests {
     fn lock_is_released_when_the_store_drops() {
         let dir = tempfile::tempdir().unwrap();
         drop(Store::open(dir.path()).unwrap());
-        Store::open(dir.path()).unwrap();
+        // A process forked by another test holds a copy of every open file until it execs,
+        // the lock included, so allow that brief window instead of failing on it.
+        let reopened = (0..50).any(|_| {
+            Store::open(dir.path()).is_ok()
+                || (
+                    std::thread::sleep(std::time::Duration::from_millis(20)),
+                    false,
+                )
+                    .1
+        });
+        assert!(reopened, "the lock outlived its store");
     }
 
     #[test]
