@@ -38,6 +38,7 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
 - Review the ADR 0004 PR (`feature/adr-0004-cli-agents`), skipped for the same reason. Also
   record a real two-turn Codex fixture: `tests/fixtures/codex-0.171.0-turn1.jsonl` was cut
   from one turn, and resume was never recorded.
+- Review the ADR 0011 PR (`feature/adr-0011-hot-registry`), skipped for the same reason.
 
 ## Notes
 - ADR 0004: the owner chose a git worktree per agent for the single-writer limit

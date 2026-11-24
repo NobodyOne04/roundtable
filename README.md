@@ -4,7 +4,8 @@ A terminal console where Claude Code, Codex and free models sit at one table, an
 
 > **Status: early build.** The architecture is decided in [`docs/adr/`](docs/adr/README.md).
 > Built so far: a chat with Claude Code and Codex (read-only for now), streaming replies,
-> and the transcript on disk. See [Roadmap](#roadmap).
+> the transcript on disk, and a live model registry (`/models`, `/model enable|disable|use`).
+> See [Roadmap](#roadmap).
 
 ## What it is
 
@@ -53,10 +54,14 @@ the reply, and the tokens it cost.
   thread (`tail -f` it to watch live): replay, resume, usage per model. A thread is tied to
   the checkout it started in; resumed elsewhere, it is read-only.
 
-## Config preview
+## Config
 
 `models.toml` in your config dir (Linux: `~/.config/roundtable/`, macOS:
-`~/Library/Application Support/roundtable/`), created with `claude` and `codex` on first run:
+`~/Library/Application Support/roundtable/`), written on first run with `claude` and `codex`
+and commented. Edit it while roundtable runs: changes apply within a fraction of a second.
+A file with any error is not applied; the chat shows the error with its line and the
+previous registry stays. `/model enable|disable|use <id>` change it from the chat, keeping
+your comments. Example with a free local model added:
 
 ```toml
 default = "claude"
@@ -68,6 +73,8 @@ kind = "cli"
 cmd = "claude"
 role = "lead"
 enabled = true
+# model = "claude-opus-5-5"         # passed to the CLI
+# permission_mode = "acceptEdits"   # only for the writer's own turns; bypass is refused
 
 [[model]]
 id = "codex"
@@ -92,7 +99,9 @@ allow = { claude = ["codex", "llama"], codex = [] }
 ```
 
 API keys are never written here: use `key = "keyring:<name>"` (OS keychain) or
-`key = "env:<VAR>"`.
+`key = "env:<VAR>"`; a literal key is refused, and so is a key over plain `http://` to a
+non-local host. Changing a model's `cmd`, `base_url` or `model` makes it a new destination:
+its old session and history are not carried over.
 
 ## Build and run
 
@@ -149,7 +158,7 @@ Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
 | 2 | [0002](docs/adr/0002-single-owner-event-loop.adr) | Event loop: one owner of state, events in, effects out | done |
 | 3 | [0010](docs/adr/0010-filesystem-event-log.adr) | Transcript as JSONL files, single-instance lock | done |
 | 4 | [0004](docs/adr/0004-cli-agent-adapters.adr) | Claude Code and Codex in the chat, read-only until 0011 | done |
-| 5 | [0011](docs/adr/0011-hot-model-registry.adr) | Hot model registry, `writer`, enable/disable | next |
+| 5 | [0011](docs/adr/0011-hot-model-registry.adr) | Hot model registry, `writer`, enable/disable | registry done; writer edits next |
 | 6 | [0005](docs/adr/0005-openai-compatible-models.adr) | Free models over the OpenAI-compatible API | |
 | 7 | [0007](docs/adr/0007-model-to-model-communication.adr) | Model-to-model `ask`, talk policy, limits, `/talk on\|off` | |
 | 8 | [0008](docs/adr/0008-slash-commands-and-mentions.adr) | Full command set and completion | |

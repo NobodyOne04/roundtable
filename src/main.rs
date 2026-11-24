@@ -2,7 +2,7 @@
 //! Stack: ADR 0001. Event loop: ADR 0002. Transcript files: ADR 0010. CLI agents: ADR 0004.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -21,9 +21,12 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-use roundtable::agent::{self, Kind, Outcome, PEvent, Turn};
-use roundtable::app::{App, ChatLine, Effect, Event, LineKind};
-use roundtable::transcript::{NewEvent, Store, Thread};
+use notify_debouncer_mini::notify::RecursiveMode;
+use notify_debouncer_mini::{DebounceEventResult, DebouncedEventBatch, new_debouncer};
+use roundtable::agent::{self, Outcome, PEvent, Turn};
+use roundtable::app::{App, ChatLine, Checks, Effect, Event, FileEdit, LineKind};
+use roundtable::registry::{self, Adapter, Registry};
+use roundtable::transcript::{self, NewEvent, Store, Thread};
 
 /// Bounded so a flood of events slows its senders instead of growing memory (ADR 0002).
 const CHANNEL_CAPACITY: usize = 1024;
@@ -59,35 +62,45 @@ async fn start() -> Result<()> {
     let store = Store::open(&root)?;
     let cwd = std::env::current_dir().context("reading the current directory")?;
 
-    let checks: Vec<_> = Kind::ALL
-        .iter()
-        .map(|&kind| (kind, agent::preflight(kind, &cwd, outside_repo)))
-        .collect();
-    let mut app = App::new(
-        checks
-            .iter()
-            .map(|(kind, check)| (*kind, check.as_ref().map(|_| ()).map_err(Clone::clone)))
-            .collect(),
-    );
-    for (kind, check) in &checks {
-        tracing::info!(agent = kind.id(), ?check, "preflight");
-        match check {
-            Ok(version) => app.note(format!("{}: {version}", kind.id()), false),
-            Err(why) => app.note(format!("{}: unavailable: {why}", kind.id()), true),
-        }
-    }
-
-    // Enters raw mode and the alternate screen, and installs a panic hook that restores the
-    // terminal first, so a crash never leaves the user's shell broken.
-    let terminal = ratatui::init();
-    let runtime = Runtime {
+    let models_path = config_root()?.join("models.toml");
+    let mut runtime = Runtime {
         store,
         thread: None,
         sessions: BTreeMap::new(),
         turns: HashMap::new(),
         cwd,
         outside_repo,
+        models_path,
+        models_hash: None,
+        checked: HashMap::new(),
     };
+    let (registry, checks, load_error) = match runtime.load_registry() {
+        Ok((registry, checks)) => (registry, checks, None),
+        // Not applied at all (ADR 0011): start empty and say why; fixing the file applies it.
+        Err(why) => (
+            Registry::parse("").expect("empty"),
+            Checks::new(),
+            Some(why),
+        ),
+    };
+    let mut app = App::new(registry, checks.clone());
+    for (id, check) in &checks {
+        tracing::info!(id, ?check, "preflight");
+        match check {
+            Ok(version) => app.note(format!("{id}: {version}"), false),
+            Err(why) => app.note(format!("{id}: unavailable: {why}"), true),
+        }
+    }
+    if let Some(why) = load_error {
+        app.note(
+            format!("{} not applied: {why}", runtime.models_path.display()),
+            true,
+        );
+    }
+
+    // Enters raw mode and the alternate screen, and installs a panic hook that restores the
+    // terminal first, so a crash never leaves the user's shell broken.
+    let terminal = ratatui::init();
     let result = run(terminal, app, runtime).await;
     ratatui::restore();
     result
@@ -111,10 +124,17 @@ struct Runtime {
     store: Store,
     /// Opened on the first message, so starting and quitting leaves no empty thread.
     thread: Option<Thread>,
+    /// Native sessions by `id/identity`, so a new destination never resumes an old session.
     sessions: BTreeMap<String, String>,
-    turns: HashMap<Kind, CancellationToken>,
+    turns: HashMap<String, CancellationToken>,
     cwd: PathBuf,
     outside_repo: bool,
+    models_path: PathBuf,
+    /// Fingerprint of the `models.toml` text last applied or written, so own writes and
+    /// unrelated changes in the folder are not reloaded.
+    models_hash: Option<String>,
+    /// Preflight per CLI command, so a reload doesn't rerun it for known commands.
+    checked: HashMap<String, Result<String, String>>,
 }
 
 impl Runtime {
@@ -123,6 +143,11 @@ impl Runtime {
     fn record(&mut self, event: NewEvent, durable: bool) -> Result<()> {
         let thread = match &mut self.thread {
             Some(thread) => thread,
+            // Only a message opens a thread; registry notes before it go to the log only.
+            None if event.kind == transcript::Kind::Status => {
+                tracing::info!(payload = %event.payload, "status before any thread");
+                return Ok(());
+            }
             None => {
                 let title: String = event.payload["text"]
                     .as_str()
@@ -139,11 +164,75 @@ impl Runtime {
         Ok(())
     }
 
-    fn save_session(&mut self, agent: Kind, session: String) -> Result<()> {
-        self.sessions.insert(agent.id().into(), session);
+    fn save_session(&mut self, id: &str, identity: &str, session: String) -> Result<()> {
+        self.sessions.insert(format!("{id}/{identity}"), session);
         if let Some(thread) = &self.thread {
             thread.save_sessions(&self.sessions)?;
         }
+        Ok(())
+    }
+
+    /// Reads `models.toml`, writing the default file first if there is none.
+    fn load_registry(&mut self) -> Result<(Registry, Checks), String> {
+        let text = match fs::read_to_string(&self.models_path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                transcript::write_atomic(&self.models_path, registry::DEFAULT_FILE.as_bytes())
+                    .map_err(|e| format!("writing the default file: {e}"))?;
+                registry::DEFAULT_FILE.to_string()
+            }
+            Err(err) => return Err(err.to_string()),
+        };
+        self.models_hash = Some(registry::fingerprint(&text));
+        let registry = Registry::parse(&text)?;
+        let checks = self.checks(&registry);
+        Ok((registry, checks))
+    }
+
+    /// `None` when the file is unchanged since the last read or write.
+    fn reload_registry(&mut self) -> Option<Result<(Registry, Checks), String>> {
+        let text = match fs::read_to_string(&self.models_path) {
+            Ok(text) => text,
+            Err(err) => return Some(Err(format!("reading models.toml: {err}"))),
+        };
+        let hash = registry::fingerprint(&text);
+        if self.models_hash.as_ref() == Some(&hash) {
+            return None;
+        }
+        self.models_hash = Some(hash);
+        Some(Registry::parse(&text).map(|registry| {
+            let checks = self.checks(&registry);
+            (registry, checks)
+        }))
+    }
+
+    // shortcut: preflight runs on the loop; only new commands are checked, each in ~100 ms.
+    fn checks(&mut self, registry: &Registry) -> Checks {
+        let mut checks = Checks::new();
+        for p in &registry.participants {
+            let (Adapter::Cli(kind), Some(cmd)) = (p.adapter, &p.cmd) else {
+                continue;
+            };
+            let result = self
+                .checked
+                .entry(cmd.clone())
+                .or_insert_with(|| agent::preflight(kind, cmd, &self.cwd, self.outside_repo))
+                .clone();
+            checks.insert(p.id.clone(), result);
+        }
+        checks
+    }
+
+    /// Writes a command's change into `models.toml`, keeping comments (ADR 0011).
+    fn edit_registry(&mut self, edit: &FileEdit) -> Result<(), String> {
+        let text = fs::read_to_string(&self.models_path).map_err(|e| e.to_string())?;
+        let text = match edit {
+            FileEdit::Enabled { id, enabled } => registry::set_enabled(&text, id, *enabled),
+            FileEdit::Default(id) => registry::set_default(&text, id),
+        }
+        .map_err(|e| format!("{e} (fix models.toml; the change applies in this session only)"))?;
+        transcript::write_atomic(&self.models_path, text.as_bytes()).map_err(|e| e.to_string())?;
+        self.models_hash = Some(registry::fingerprint(&text));
         Ok(())
     }
 
@@ -158,6 +247,8 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
     let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
     tokio::spawn(read_terminal(tx.clone()));
     tokio::spawn(tick(tx.clone()));
+    // Held for the whole run: dropping it stops the watch.
+    let _watcher = watch_registry(&rt.models_path, tx.clone())?;
 
     let mut quit_by: Option<tokio::time::Instant> = None;
     loop {
@@ -172,8 +263,15 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                 return Ok(());
             }
         };
-        if let Event::Agent(kind, PEvent::Done(_)) = &event {
-            rt.turns.remove(kind);
+        let event = match event {
+            Event::RegistryFileChanged => match rt.reload_registry() {
+                Some(result) => Event::Registry(result),
+                None => continue,
+            },
+            other => other,
+        };
+        if let Event::Agent(id, PEvent::Done(_)) = &event {
+            rt.turns.remove(id);
         }
         for effect in app.update(event) {
             match effect {
@@ -188,21 +286,37 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     quit_by.get_or_insert(tokio::time::Instant::now() + QUIT_GRACE);
                 }
                 Effect::StartTurn {
-                    agent: kind,
+                    id,
+                    kind,
+                    cmd,
+                    model,
                     prompt,
                     session,
                 } => {
                     let token = CancellationToken::new();
-                    rt.turns.insert(kind, token.clone());
+                    rt.turns.insert(id.clone(), token.clone());
                     let turn = Turn {
+                        cmd,
                         prompt,
                         session,
                         cwd: rt.cwd.clone(),
                         outside_repo: rt.outside_repo,
+                        model,
                     };
-                    tokio::spawn(agent::run(kind, turn, tx.clone(), token));
+                    tokio::spawn(agent::run(id, kind, turn, tx.clone(), token));
+                }
+                Effect::CancelTurn(id) => {
+                    if let Some(token) = rt.turns.get(&id) {
+                        token.cancel();
+                    }
                 }
                 Effect::CancelTurns => rt.cancel_all(),
+                Effect::EditRegistry(edit) => {
+                    if let Err(err) = rt.edit_registry(&edit) {
+                        tracing::error!(%err, "editing models.toml failed");
+                        let _ = tx.try_send(Event::Notice(format!("models.toml: {err}")));
+                    }
+                }
                 Effect::Record { event, durable } => {
                     if let Err(err) = rt.record(event, durable) {
                         tracing::error!(%err, "transcript write failed");
@@ -210,10 +324,11 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     }
                 }
                 Effect::SaveSession {
-                    agent: kind,
+                    id,
+                    identity,
                     session,
                 } => {
-                    if let Err(err) = rt.save_session(kind, session) {
+                    if let Err(err) = rt.save_session(&id, &identity, session) {
                         tracing::error!(%err, "saving the session failed");
                         let _ = tx.try_send(Event::Notice(format!("sessions: {err:#}")));
                     }
@@ -224,6 +339,42 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             return Ok(());
         }
     }
+}
+
+/// Watches the folder of `models.toml` (editors save by rename, so the file itself can't be
+/// watched) and reports changes to it, debounced 200 ms (ADR 0011).
+fn watch_registry(
+    path: &Path,
+    tx: mpsc::Sender<Event>,
+) -> Result<notify_debouncer_mini::Debouncer<notify_debouncer_mini::notify::RecommendedWatcher>> {
+    let name = path.file_name().map(ToOwned::to_owned);
+    let mut debouncer = new_debouncer(
+        Duration::from_millis(200),
+        move |result: DebounceEventResult| {
+            let ours = match &result {
+                Ok(DebouncedEventBatch::Events(events)) => {
+                    events.iter().any(|e| e.path.file_name() == name.as_deref())
+                }
+                // Missed events: re-read to be safe; the hash check drops non-changes.
+                Ok(_) => true,
+                Err(err) => {
+                    tracing::warn!(?err, "watching models.toml");
+                    false
+                }
+            };
+            if ours {
+                // Runs on the watcher's own thread, outside the runtime.
+                let _ = tx.blocking_send(Event::RegistryFileChanged);
+            }
+        },
+    )
+    .context("starting the models.toml watcher")?;
+    let dir = path.parent().context("models.toml has no folder")?;
+    debouncer
+        .watcher()
+        .watch(dir, RecursiveMode::NonRecursive)
+        .with_context(|| format!("watching {}", dir.display()))?;
+    Ok(debouncer)
 }
 
 /// Keyboard and resize events from the terminal.
@@ -334,6 +485,15 @@ fn chat_lines(line: &ChatLine) -> Vec<Line<'static>> {
     out
 }
 
+/// `<config_dir>/roundtable`: `models.toml` (ADR 0011). Same folder as the data on macOS.
+fn config_root() -> Result<PathBuf> {
+    let dir = dirs::config_dir()
+        .context("no config directory on this system")?
+        .join("roundtable");
+    transcript::private_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
 /// `<data_dir>/roundtable`: transcript, lock and log (ADR 0010).
 fn data_root() -> Result<PathBuf> {
     let dir = dirs::data_dir()
@@ -393,16 +553,19 @@ mod tests {
             KeyModifiers::NONE,
         )));
         app.update(Event::Agent(
-            Kind::Codex,
+            "codex".into(),
             PEvent::Tool("cat CLAUDE.md".into()),
         ));
         app.update(Event::Agent(
-            Kind::Codex,
+            "codex".into(),
             PEvent::Message("Looks fine.".into()),
         ));
-        app.update(Event::Agent(Kind::Codex, PEvent::Done(Outcome::Complete)));
         app.update(Event::Agent(
-            Kind::Claude,
+            "codex".into(),
+            PEvent::Done(Outcome::Complete),
+        ));
+        app.update(Event::Agent(
+            "claude".into(),
             PEvent::TextDelta("Two notes:\n1. a".into()),
         ));
         insta::assert_snapshot!(render(&app, 60, 10));
