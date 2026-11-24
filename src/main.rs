@@ -1,9 +1,9 @@
 //! roundtable: one terminal chat for Claude Code, Codex and other models.
-//! Stack and terminal rules: ADR 0001. Event loop: ADR 0002.
-
-mod app;
+//! Stack and terminal rules: ADR 0001. Event loop: ADR 0002. Transcript files: ADR 0010.
 
 use std::fs::{self, OpenOptions};
+use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -16,7 +16,8 @@ use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
-use app::{App, Effect, Event};
+use roundtable::app::{App, Effect, Event};
+use roundtable::transcript::Store;
 
 /// Bounded so a flood of events slows its senders instead of growing memory (ADR 0002).
 const CHANNEL_CAPACITY: usize = 1024;
@@ -24,8 +25,22 @@ const CHANNEL_CAPACITY: usize = 1024;
 const TICK: Duration = Duration::from_millis(33);
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    init_logging()?;
+async fn main() -> ExitCode {
+    match start().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            // The terminal is restored by now, so the message is readable.
+            eprintln!("roundtable: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn start() -> Result<()> {
+    let root = data_root()?;
+    init_logging(&root)?;
+    // Before the terminal is taken over, so "already running" prints plainly.
+    let _store = Store::open(&root)?;
     // Enters raw mode and the alternate screen, and installs a panic hook that restores the
     // terminal first, so a crash never leaves the user's shell broken.
     let terminal = ratatui::init();
@@ -92,13 +107,18 @@ fn draw(frame: &mut Frame) {
     frame.render_widget(body, frame.area());
 }
 
-/// Logs go to `<data_dir>/roundtable/roundtable.log`: the TUI owns stdout. Level from `RUST_LOG`.
-fn init_logging() -> Result<()> {
+/// `<data_dir>/roundtable`: transcript, lock and log (ADR 0010).
+fn data_root() -> Result<PathBuf> {
     let dir = dirs::data_dir()
         .context("no data directory on this system")?
         .join("roundtable");
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let path = dir.join("roundtable.log");
+    Ok(dir)
+}
+
+/// Logs go to `<root>/roundtable.log`: the TUI owns stdout. Level from `RUST_LOG`.
+fn init_logging(root: &std::path::Path) -> Result<()> {
+    let path = root.join("roundtable.log");
     let file = OpenOptions::new()
         .create(true)
         .append(true)

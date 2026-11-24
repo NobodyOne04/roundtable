@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Transcript files (ADR 0010): append-only JSONL per thread, torn-line repair, atomic metadata, and only one roundtable running at a time
 - Event loop (ADR 0002): one task owns the app state; terminal input and a 30 fps tick send events through one bounded channel; redraw only on change
 - Rust skeleton (ADR 0001): pinned toolchain, empty table screen, terminal restored on exit and panic, file logging, CI
 - Proposed ADRs 0001-0009 (stack, event loop, event log, adapters, model registry, model-to-model talk, commands, layout) and the README
