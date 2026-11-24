@@ -1,6 +1,6 @@
 # 0012. The writer lock lives in the checkout
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-25
 - Amends: [0010](0010-filesystem-event-log.adr) (the unclean-writer interlock only)
 
