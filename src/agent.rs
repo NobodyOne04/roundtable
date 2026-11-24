@@ -58,6 +58,8 @@ pub enum PEvent {
         input: u64,
         output: u64,
         cost_usd: Option<f64>,
+        /// Counted by roundtable because the provider didn't report it (ADR 0005).
+        estimated: bool,
     },
     Error(String),
     /// Always the last event of a turn, sent after the process and its group are gone.
@@ -229,6 +231,7 @@ fn parse_claude(v: &Value) -> Vec<PEvent> {
                     + u64_at(v, &["usage", "cache_read_input_tokens"]),
                 output: u64_at(v, &["usage", "output_tokens"]),
                 cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
+                estimated: false,
             }];
             if v.get("is_error").and_then(Value::as_bool) == Some(true) {
                 let msg = str_at(v, &["result"]).unwrap_or("Claude reported an error");
@@ -259,6 +262,7 @@ fn parse_codex(v: &Value) -> Vec<PEvent> {
             input: u64_at(v, &["usage", "input_tokens"]),
             output: u64_at(v, &["usage", "output_tokens"]),
             cost_usd: None,
+            estimated: false,
         }],
         Some("error") => vec![PEvent::Error(
             str_at(v, &["message"]).unwrap_or("Codex error").into(),
@@ -553,7 +557,8 @@ mod tests {
             Some(&PEvent::Usage {
                 input: 118547,
                 output: 1894,
-                cost_usd: None
+                cost_usd: None,
+                estimated: false
             })
         );
     }

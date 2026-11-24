@@ -3,9 +3,10 @@
 A terminal console where Claude Code, Codex and free models sit at one table, and you watch them talk.
 
 > **Status: early build.** The architecture is decided in [`docs/adr/`](docs/adr/README.md).
-> Built so far: a chat with Claude Code and Codex, streaming replies, a `writer` that may
-> edit files, the transcript on disk, and a live model registry (`/models`,
-> `/model enable|disable|use`).
+> Built so far: a chat with Claude Code, Codex and any OpenAI-compatible model (Ollama,
+> OpenRouter, …), streaming replies, a `writer` that may edit files, the transcript on disk,
+> and a live model registry (`/models`, `/model enable|disable|use`). Models can't yet ask
+> each other (step 7).
 > See [Roadmap](#roadmap).
 
 ## What it is
@@ -99,8 +100,16 @@ budget_tokens = 50000
 allow = { claude = ["codex", "llama"], codex = [] }
 ```
 
-API keys are never written here: use `key = "keyring:<name>"` (OS keychain) or
-`key = "env:<VAR>"`; a literal key is refused, and so is a key over plain `http://` to a
+Free models answer in the chat like the agents, from their own history (what you sent them
+and what they replied), trimmed oldest-first to fit `context_window` (default 8192) while
+keeping `max_output_tokens` (default 4096) free for the reply. They never edit files.
+
+API keys are never written here: use `key = "keyring:<name>"` (OS keychain, service
+`roundtable`: `security add-generic-password -s roundtable -a <name> -w` on macOS) or
+`key = "env:<VAR>"`. Keys are read for each request (shorter than 8 characters is refused)
+and removed from everything roundtable shows, logs or saves, whichever participant printed
+them. `connect_timeout_s` (default 10) and `idle_timeout_s` (default 120) tune the HTTP
+timeouts; redirects are never followed; a literal key is refused, and so is a key over plain `http://` to a
 non-local host. Changing a model's `cmd`, `base_url` or `model` makes it a new destination:
 its old session and history are not carried over.
 
@@ -145,7 +154,8 @@ to the new writer waits until the old one is done instead of editing alongside i
   `.codex/config.toml` (here or in a parent folder): such a config can start MCP servers
   or run programs that a read-only turn couldn't stop.
 - One roundtable at a time; a second instance exits with "already running".
-- Planned (step 6): Ollama or LM Studio for free local models.
+- For free models: any OpenAI-compatible endpoint, e.g. Ollama (`brew install ollama`, then
+  `ollama pull llama3.3`) or LM Studio locally, or OpenRouter / Groq / Gemini with a key.
 
 ## Privacy
 
@@ -172,8 +182,8 @@ Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
 | 3 | [0010](docs/adr/0010-filesystem-event-log.adr) | Transcript as JSONL files, single-instance lock | done |
 | 4 | [0004](docs/adr/0004-cli-agent-adapters.adr) | Claude Code and Codex in the chat, read-only until 0011 | done |
 | 5 | [0011](docs/adr/0011-hot-model-registry.adr) | Hot model registry, `writer`, enable/disable | done |
-| 6 | [0005](docs/adr/0005-openai-compatible-models.adr) | Free models over the OpenAI-compatible API | next |
-| 7 | [0007](docs/adr/0007-model-to-model-communication.adr) | Model-to-model `ask`, talk policy, limits, `/talk on\|off` | |
+| 6 | [0005](docs/adr/0005-openai-compatible-models.adr) | Free models over the OpenAI-compatible API | done |
+| 7 | [0007](docs/adr/0007-model-to-model-communication.adr) | Model-to-model `ask`, talk policy, limits, `/talk on\|off` | next |
 | 8 | [0008](docs/adr/0008-slash-commands-and-mentions.adr) | Full command set and completion | |
 | 9 | [0009](docs/adr/0009-tui-layout.adr) | Three-pane layout | |
 

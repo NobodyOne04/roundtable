@@ -40,6 +40,9 @@ enabled = true
 # base_url = "http://localhost:11434/v1"
 # model = "llama3.3"
 # context_window = 128000
+# max_output_tokens = 4096           # kept free for the reply
+# connect_timeout_s = 10
+# idle_timeout_s = 120               # no data for this long ends the turn
 # key = "keyring:ollama"             # or "env:VAR"; never the key itself
 # enabled = true
 
@@ -69,6 +72,9 @@ struct RawEntry {
     base_url: Option<String>,
     model: Option<String>,
     context_window: Option<u64>,
+    max_output_tokens: Option<u64>,
+    connect_timeout_s: Option<u64>,
+    idle_timeout_s: Option<u64>,
     key: Option<String>,
     #[serde(default = "yes")]
     enabled: bool,
@@ -140,6 +146,11 @@ pub struct Participant {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub context_window: Option<u64>,
+    /// Tokens kept free for the reply when fitting history (ADR 0005).
+    pub max_output_tokens: Option<u64>,
+    /// HTTP timeouts in seconds (ADR 0005: configurable).
+    pub connect_timeout_s: Option<u64>,
+    pub idle_timeout_s: Option<u64>,
     /// A reference (`keyring:<name>` or `env:<VAR>`), resolved per request.
     pub key: Option<String>,
     pub enabled: bool,
@@ -253,9 +264,15 @@ fn participant(e: RawEntry) -> Result<Participant, String> {
     let adapter = match e.kind {
         EntryKind::Cli => {
             // Fields of the other kind are refused rather than silently ignored.
-            if e.base_url.is_some() || e.key.is_some() || e.context_window.is_some() {
+            if e.base_url.is_some()
+                || e.key.is_some()
+                || e.context_window.is_some()
+                || e.max_output_tokens.is_some()
+                || e.connect_timeout_s.is_some()
+                || e.idle_timeout_s.is_some()
+            {
                 return Err(at(
-                    "cli models take no `base_url`, `key` or `context_window`",
+                    "cli models take no `base_url`, `key`, `context_window`, `max_output_tokens` or timeouts",
                 ));
             }
             let cmd = e
@@ -333,6 +350,9 @@ fn participant(e: RawEntry) -> Result<Participant, String> {
         base_url: e.base_url,
         model: e.model,
         context_window: e.context_window,
+        max_output_tokens: e.max_output_tokens,
+        connect_timeout_s: e.connect_timeout_s,
+        idle_timeout_s: e.idle_timeout_s,
         key: e.key,
         enabled: e.enabled,
         role: e.role,

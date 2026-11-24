@@ -25,6 +25,7 @@ use notify_debouncer_mini::notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, DebouncedEventBatch, new_debouncer};
 use roundtable::agent::{self, Outcome, PEvent, Turn};
 use roundtable::app::{App, ChatLine, Checks, EditLock, Effect, Event, FileEdit, LineKind};
+use roundtable::openai;
 use roundtable::registry::{self, Adapter, Registry};
 use roundtable::transcript::{self, NewEvent, Store, Thread};
 use roundtable::writer_lock::{
@@ -85,6 +86,8 @@ async fn start() -> Result<()> {
         lock,
         writers: HashMap::new(),
         data_root: root.clone(),
+        secrets: vec![],
+        redactors: HashMap::new(),
         cwd,
         outside_repo,
         models_path,
@@ -156,6 +159,11 @@ struct Runtime {
     /// The running writable turn's lock and marker, by participant id.
     writers: HashMap<String, WriterGuard>,
     data_root: PathBuf,
+    /// Resolved API keys with their references, redacted from everything shown or written
+    /// (ADR 0010). Values only ever live in memory.
+    secrets: Vec<(String, String)>,
+    /// Per participant: streamed text held back while it could still be part of a key.
+    redactors: HashMap<String, transcript::StreamRedactor>,
     outside_repo: bool,
     models_path: PathBuf,
     /// Fingerprint of the `models.toml` text last applied or written, so own writes and
@@ -168,7 +176,8 @@ struct Runtime {
 impl Runtime {
     // shortcut: appends run on the loop task, not a writer task with acks (ADR 0010);
     // fine while writes are small, move them off the loop when fsync latency shows.
-    fn record(&mut self, event: NewEvent, durable: bool) -> Result<()> {
+    fn record(&mut self, mut event: NewEvent, durable: bool) -> Result<()> {
+        transcript::redact(&mut event.payload, &self.secrets);
         let thread = match &mut self.thread {
             Some(thread) => thread,
             // Only a message opens a thread; registry notes before it go to the log only.
@@ -363,6 +372,42 @@ impl Runtime {
         }
     }
 
+    /// See `Event::Agent` in the loop. Held-back text is released before `Done`, so a turn
+    /// that ends early still shows and records what it said.
+    fn redact_output(
+        &mut self,
+        id: &str,
+        output: PEvent,
+        local: &mut VecDeque<Event>,
+    ) -> Option<PEvent> {
+        let secrets = &self.secrets;
+        let clean = |text: String| {
+            let mut value = serde_json::Value::String(text);
+            transcript::redact(&mut value, secrets);
+            value.as_str().unwrap_or_default().to_string()
+        };
+        let redactor = self.redactors.entry(id.to_string()).or_default();
+        match output {
+            PEvent::TextDelta(text) => {
+                let shown = redactor.push(&text, secrets);
+                (!shown.is_empty()).then_some(PEvent::TextDelta(shown))
+            }
+            PEvent::Message(text) => Some(PEvent::Message(clean(text))),
+            PEvent::Error(text) => Some(PEvent::Error(clean(text))),
+            PEvent::Tool(text) => Some(PEvent::Tool(clean(text))),
+            PEvent::Done(outcome) => {
+                let rest = redactor.flush();
+                if rest.is_empty() {
+                    Some(PEvent::Done(outcome))
+                } else {
+                    local.push_front(Event::Agent(id.to_string(), PEvent::Done(outcome)));
+                    Some(PEvent::TextDelta(rest))
+                }
+            }
+            other => Some(other),
+        }
+    }
+
     fn cancel_all(&self) {
         for token in self.turns.values() {
             token.cancel();
@@ -400,6 +445,18 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
         let event = match event {
             Event::RegistryFileChanged => match rt.reload_registry() {
                 Some(result) => Event::Registry(result),
+                None => continue,
+            },
+            Event::KeyResolved { reference, value } => {
+                if !rt.secrets.iter().any(|(v, _)| *v == value.0) {
+                    rt.secrets.push((value.0, reference));
+                }
+                continue;
+            }
+            // Every participant's output, any model or CLI, is cleaned of every known key
+            // before the app shows or records it.
+            Event::Agent(id, output) => match rt.redact_output(&id, output, &mut local) {
+                Some(output) => Event::Agent(id, output),
                 None => continue,
             },
             other => other,
@@ -452,6 +509,37 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         permission_mode,
                     };
                     tokio::spawn(agent::run(id, kind, turn, tx.clone(), token));
+                }
+                Effect::StartChat {
+                    id,
+                    base_url,
+                    model,
+                    key_ref,
+                    system,
+                    history,
+                    prompt,
+                    context_window,
+                    max_output,
+                    connect_timeout_s,
+                    idle_timeout_s,
+                } => {
+                    // The key is resolved inside the turn, off this loop (the keychain may
+                    // block); it comes back as `KeyResolved` before any reply.
+                    let token = CancellationToken::new();
+                    rt.turns.insert(id.clone(), token.clone());
+                    let chat = openai::Chat {
+                        base_url,
+                        model,
+                        key_ref,
+                        system,
+                        history,
+                        prompt,
+                        context_window,
+                        max_output,
+                        connect_timeout: Duration::from_secs(connect_timeout_s),
+                        idle_timeout: Duration::from_secs(idle_timeout_s),
+                    };
+                    tokio::spawn(openai::run(id, chat, tx.clone(), token));
                 }
                 Effect::CancelTurn(id) => {
                     if let Some(token) = rt.turns.get(&id) {
