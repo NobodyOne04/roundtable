@@ -1,6 +1,6 @@
 # 0011. Model registry lives in memory, changes hot, persists to TOML
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-24
 
 Replaces the rejected [0006](0006-model-registry-config.adr): the owner wants the registry

@@ -14,8 +14,8 @@ Implementation order: see the note under the table.
 | [0007](0007-model-to-model-communication.adr) | Model-to-model talk: an `ask` tool, a policy matrix and hard limits | Accepted |
 | [0008](0008-slash-commands-and-mentions.adr) | Slash commands and @mentions | Accepted |
 | [0009](0009-tui-layout.adr) | Three-pane layout: threads, conversation, context | Accepted |
-| [0010](0010-filesystem-event-log.adr) | Append-only JSONL files are the transcript (replaces 0003) | Proposed |
-| [0011](0011-hot-model-registry.adr) | Model registry lives in memory, changes hot, persists to TOML (replaces 0006) | Proposed |
+| [0010](0010-filesystem-event-log.adr) | Append-only JSONL files are the transcript (replaces 0003) | Accepted |
+| [0011](0011-hot-model-registry.adr) | Model registry lives in memory, changes hot, persists to TOML (replaces 0006) | Accepted |
 
 Implementation order follows dependencies, not numbers: 0001, 0002, 0010, 0004, 0011,
 0005, 0007, 0008, 0009 (0010 and 0011 replace earlier numbers that others depend on).
