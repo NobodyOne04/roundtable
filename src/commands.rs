@@ -19,6 +19,11 @@ pub const COMMANDS: &[Command] = &[
         help: "start a new thread",
     },
     Command {
+        name: "/resume",
+        args: "[n|id]",
+        help: "list past threads, or reopen one (by number or id)",
+    },
+    Command {
         name: "/exit",
         args: "",
         help: "quit (also Ctrl-D on an empty line, or Ctrl-C twice)",

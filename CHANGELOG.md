@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- `/resume` (ADR 0008, 0010): reopen a past thread with its chat, CLI sessions and model histories (only for participants still pointing where they did); threads from another checkout open read-only
 - Commands (ADR 0008): `/help`, `/clear`, `/exit`, `/status`, `/usage`, `/context`, `/model test`, `/talk show|allow|deny`, `/budget`, `/turns`; `Tab` completion for commands and `@` ids, `Alt-Enter` new lines, `PgUp`/`PgDn` scrolling, `\/` escape; per-thread `usage.json`
 - Models ask each other (ADR 0007): Claude's `ask` tool through `roundtable mcp`, talk policy, per-message turn and token limits, `/talk on|off`, inline handoffs, `Esc` cancels the chain
 - Free models over the OpenAI-compatible API (ADR 0005): streaming replies, their own history fitted to the window, one retry on 5xx or a too-long request, keys from env or the OS keychain, redacted from the transcript
