@@ -5,8 +5,8 @@ A terminal console where Claude Code, Codex and free models sit at one table, an
 > **Status: early build.** The architecture is decided in [`docs/adr/`](docs/adr/README.md).
 > Built so far: a chat with Claude Code, Codex and any OpenAI-compatible model (Ollama,
 > OpenRouter, …), streaming replies, a `writer` that may edit files, the transcript on disk,
-> and a live model registry (`/models`, `/model enable|disable|use`). Models can't yet ask
-> each other (step 7).
+> a live model registry (`/models`, `/model enable|disable|use`), and models asking each
+> other (`ask`, `/talk on|off`).
 > See [Roadmap](#roadmap).
 
 ## What it is
@@ -141,6 +141,14 @@ locked (every turn read-only) and the chat shows the marker. Check nothing is ru
 type `/quiet`. Outside a git checkout nobody edits, and if git can't tell the checkout
 (git missing, a broken worktree, `GIT_DIR`/`GIT_WORK_TREE` set) edits stay locked.
 
+**Models asking each other.** Claude gets an `ask` tool: it can put a question to another
+participant mid-turn and use the answer. Each exchange shows inline (`claude → codex`) and
+is kept in the transcript, blocked ones too. Who may ask whom is the `[talk] allow` matrix
+(default: nobody); `max_turns` and `budget_tokens` cap the model-to-model turns and tokens
+per message you send; `/talk off` stops it all. An asked model never edits files, `Esc`
+cancels the whole chain, and a busy model answers `busy` instead of making anyone wait.
+Codex can be asked but doesn't ask yet.
+
 **Waiting writers.** If you change `writer` while the old one is still editing, a message
 to the new writer waits until the old one is done instead of editing alongside it.
 
@@ -183,8 +191,8 @@ Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
 | 4 | [0004](docs/adr/0004-cli-agent-adapters.adr) | Claude Code and Codex in the chat, read-only until 0011 | done |
 | 5 | [0011](docs/adr/0011-hot-model-registry.adr) | Hot model registry, `writer`, enable/disable | done |
 | 6 | [0005](docs/adr/0005-openai-compatible-models.adr) | Free models over the OpenAI-compatible API | done |
-| 7 | [0007](docs/adr/0007-model-to-model-communication.adr) | Model-to-model `ask`, talk policy, limits, `/talk on\|off` | next |
-| 8 | [0008](docs/adr/0008-slash-commands-and-mentions.adr) | Full command set and completion | |
+| 7 | [0007](docs/adr/0007-model-to-model-communication.adr) | Model-to-model `ask`, talk policy, limits, `/talk on\|off` | done |
+| 8 | [0008](docs/adr/0008-slash-commands-and-mentions.adr) | Full command set and completion | next |
 | 9 | [0009](docs/adr/0009-tui-layout.adr) | Three-pane layout | |
 
 Later, each with its own ADR first: git worktree per agent, `/model add` (guided),

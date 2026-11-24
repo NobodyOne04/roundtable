@@ -21,6 +21,9 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
   `## Codex review`.
 
 ## Pending for Codex
+- Review the ADR 0007 PR (`feature/adr-0007-ask`), if it was skipped there.
+- Verify how Codex approves an MCP tool in `codex exec` (`mcp_servers.<name>.default_tools_approval_mode`
+  values), so Codex can get the `ask` tool too; today it can be asked but not ask.
 - Review the ADR 0005 PR (`feature/adr-0005-free-models`): its last commits (loop-wide key
   redaction in `Runtime::redact_output`, `StreamRedactor`, SSE event assembly, unknown
   usage) landed after your two reviews; the third was skipped (usage limit).

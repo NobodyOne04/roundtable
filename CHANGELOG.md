@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Models ask each other (ADR 0007): Claude's `ask` tool through `roundtable mcp`, talk policy, per-message turn and token limits, `/talk on|off`, inline handoffs, `Esc` cancels the chain
 - Free models over the OpenAI-compatible API (ADR 0005): streaming replies, their own history fitted to the window, one retry on 5xx or a too-long request, keys from env or the OS keychain, redacted from the transcript
 - Writer lock in the checkout (ADR 0012, accepted): one writer per checkout across every roundtable and data folder, survives renames; nobody edits outside git
 - The writer may edit (ADR 0004, 0011): only a message to the writer alone, with its `permission_mode`; after a crash edits stay locked until `/quiet` (ADR 0010)
