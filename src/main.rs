@@ -24,7 +24,7 @@ use tracing_subscriber::EnvFilter;
 use notify_debouncer_mini::notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, DebouncedEventBatch, new_debouncer};
 use roundtable::agent::{self, AskBridge, Outcome, PEvent, Turn};
-use roundtable::app::{App, Checks, EditLock, Effect, Event, FileEdit, TestTarget};
+use roundtable::app::{App, Checks, EditLock, Effect, Event, FileEdit, Link, TestTarget};
 use roundtable::mcp::{self, AskAnswer};
 use roundtable::openai;
 use roundtable::registry::{self, Adapter, Registry};
@@ -93,6 +93,7 @@ async fn start() -> Result<()> {
     let mut runtime = Runtime {
         store,
         thread: None,
+        keys: HashMap::new(),
         sessions: BTreeMap::new(),
         turns: HashMap::new(),
         checkout,
@@ -174,6 +175,8 @@ struct Runtime {
     store: Store,
     /// Opened on the first message, so starting and quitting leaves no empty thread.
     thread: Option<Thread>,
+    /// `App`'s `Link` keys to the `seq` they were written at, for the open thread only.
+    keys: HashMap<u64, u64>,
     /// Native sessions by `id/identity`, so a new destination never resumes an old session.
     sessions: BTreeMap<String, String>,
     turns: HashMap<String, CancellationToken>,
@@ -213,8 +216,11 @@ struct Runtime {
 impl Runtime {
     // shortcut: appends run on the loop task, not a writer task with acks (ADR 0010);
     // fine while writes are small, move them off the loop when fsync latency shows.
-    fn record(&mut self, mut event: NewEvent, durable: bool) -> Result<()> {
+    fn record(&mut self, mut event: NewEvent, durable: bool, link: Link) -> Result<()> {
         transcript::redact(&mut event.payload, &self.secrets);
+        if self.thread.is_none() {
+            self.keys.clear();
+        }
         let thread = match &mut self.thread {
             Some(thread) => thread,
             // Only a message opens a thread; registry notes before it go to the log only.
@@ -235,7 +241,13 @@ impl Runtime {
                 self.thread.insert(thread)
             }
         };
-        thread.append(event, durable)?;
+        let resolve = |key| (key != 0).then(|| self.keys.get(&key).copied()).flatten();
+        event.turn = resolve(link.turn);
+        event.parent = resolve(link.parent);
+        let seq = thread.append(event, durable)?;
+        if link.key != 0 {
+            self.keys.insert(link.key, seq);
+        }
         Ok(())
     }
 
@@ -367,7 +379,7 @@ impl Runtime {
                     Some(m)
                         if m.data_root == self.data_root && active.as_ref() == Some(&m.thread) =>
                     {
-                        self.record(transcript::settle_event(), true)
+                        self.record(transcript::settle_event(), true, Link::default())
                     }
                     Some(m) if m.data_root == self.data_root && !m.thread.is_empty() => self
                         .store
@@ -393,6 +405,7 @@ impl Runtime {
                                 tokens_out: None,
                             },
                             true,
+                            Link::default(),
                         )
                     }
                 };
@@ -517,6 +530,7 @@ impl Runtime {
         // Further messages go into this thread (ADR 0010); nothing is sent into one from
         // another checkout, so it is not opened for writing then.
         self.thread = elsewhere.is_none().then_some(thread);
+        self.keys.clear();
         Event::Resumed {
             title: meta.title.clone(),
             events,
@@ -828,7 +842,11 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         local.push_back(Event::Notice(format!("models.toml: {err}")));
                     }
                 },
-                Effect::Record { mut event, durable } => {
+                Effect::Record {
+                    mut event,
+                    durable,
+                    link,
+                } => {
                     let writer = (event.kind == transcript::Kind::Delivery
                         && event.payload["writable"] == true)
                         .then(|| event.to.first().map(|p| p.id.clone()))
@@ -852,7 +870,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         && event.payload["writable"] == true
                         && rt.writers.contains_key(&event.from.id))
                     .then(|| event.from.id.clone());
-                    match rt.record(event, durable) {
+                    match rt.record(event, durable, link) {
                         Ok(()) => {
                             if let Some(id) = reply_of
                                 && let Err(err) = rt.end_writer(&id)
@@ -1108,6 +1126,88 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// A loop runtime over a fresh data folder, with no checkout lock.
+    fn runtime(root: &std::path::Path) -> Runtime {
+        Runtime {
+            store: Store::open(root).unwrap(),
+            thread: None,
+            keys: HashMap::new(),
+            sessions: BTreeMap::new(),
+            turns: HashMap::new(),
+            cwd: root.into(),
+            checkout: root.into(),
+            lock: None,
+            writers: HashMap::new(),
+            data_root: root.into(),
+            secrets: vec![],
+            ask_socket: root.join("ask.sock"),
+            ask_tokens: HashMap::new(),
+            ask_files: HashMap::new(),
+            pending_asks: HashMap::new(),
+            next_ask: 1,
+            redactors: HashMap::new(),
+            threads_changed: false,
+            outside_repo: true,
+            models_path: root.join("models.toml"),
+            models_hash: None,
+            checked: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn records_carry_turn_and_parent_as_written_seqs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime(dir.path());
+        let mut app = App::default();
+        let write = |effects: Vec<Effect>, rt: &mut Runtime| {
+            for effect in effects {
+                if let Effect::Record {
+                    event,
+                    durable,
+                    link,
+                } = effect
+                {
+                    rt.record(event, durable, link).unwrap();
+                }
+            }
+        };
+        // A status line first, so seqs and App keys can't line up by accident.
+        rt.record(transcript::settle_event(), true, Link::default())
+            .unwrap();
+        let mut typed = vec![];
+        for code in [KeyCode::Char('h'), KeyCode::Char('i'), KeyCode::Enter] {
+            typed.extend(app.update(Event::Key(KeyEvent::new(code, KeyModifiers::NONE))));
+        }
+        write(typed, &mut rt);
+        write(
+            app.update(Event::Agent(
+                "claude".into(),
+                roundtable::agent::PEvent::Done(roundtable::agent::Outcome::Complete),
+            )),
+            &mut rt,
+        );
+        let events = rt.thread.as_ref().unwrap().events().unwrap();
+        let by_kind = |kind| events.iter().find(|e| e.kind == kind).unwrap();
+        let msg = events
+            .iter()
+            .find(|e| e.kind == transcript::Kind::Msg && e.from.id == "user")
+            .unwrap();
+        let delivery = by_kind(transcript::Kind::Delivery);
+        let reply = events
+            .iter()
+            .find(|e| e.kind == transcript::Kind::Msg && e.from.id == "claude")
+            .unwrap();
+        assert_eq!((msg.turn, msg.parent), (None, None));
+        assert_eq!(
+            (delivery.turn, delivery.parent),
+            (Some(msg.seq), Some(msg.seq))
+        );
+        assert_eq!(
+            (reply.turn, reply.parent),
+            (Some(msg.seq), Some(delivery.seq))
+        );
+    }
 
     fn render(app: &App, width: u16, height: u16) -> TestBackend {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
