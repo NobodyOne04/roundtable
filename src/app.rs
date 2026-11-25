@@ -64,6 +64,8 @@ pub enum Event {
     Notice(String),
     /// An answer to a command the loop had to work out (`/usage`, `/model test`).
     Report(String),
+    /// `/handoff` (ADR 0020): the open thread as `/log` entries, or why there are none.
+    HandoffEntries(Result<Vec<crate::log::Entry>, String>),
     /// `/worktrees` finished: the loop frees the mirrors it reserved, then shows the report.
     WorktreesDone {
         ids: Vec<String>,
@@ -218,6 +220,8 @@ pub enum Effect {
     Resume(Option<String>),
     /// `/usage <scope>`: the loop sums the transcript's usage files.
     Usage(String),
+    /// `/handoff` (ADR 0020): read the open thread's entries, answered by `HandoffEntries`.
+    HandoffEntries,
     /// `/worktrees [clean [id]]` (ADR 0016): list the agents' mirrors, or remove them.
     Worktrees {
         clean: bool,
@@ -356,6 +360,36 @@ struct Seat {
     thread_tokens: (u64, u64),
 }
 
+/// A `/handoff` (ADR 0020): who summarizes for whom, pinned to both identities.
+#[derive(Debug, Clone)]
+struct Handoff {
+    summarizer: String,
+    summarizer_identity: String,
+    target: String,
+    target_identity: String,
+    note: String,
+    /// `raw [n]`: the last n messages verbatim instead of a summary.
+    raw: Option<usize>,
+    /// The intent event's `Link` key; every turn of the handoff hangs off it.
+    key: u64,
+    stage: Stage,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Stage {
+    /// Waiting for the thread's entries from the loop.
+    Reading,
+    /// Asked y/n; the prompt to send on yes.
+    Confirm(String),
+    /// The summarizer's turn is running.
+    Summary,
+    /// `<target>`'s turn is running.
+    Dispatch,
+}
+
+/// A CLI agent's window when the registry gives none: what Claude and Codex have today.
+const CLI_WINDOW: u64 = 200_000;
+
 #[derive(Debug)]
 pub struct App {
     /// State changed since the last draw.
@@ -371,6 +405,8 @@ pub struct App {
     pub scroll: usize,
     /// A resumed thread from another checkout: nothing may be sent into it (ADR 0010).
     read_only: Option<std::path::PathBuf>,
+    /// The `/handoff` in progress, if any (ADR 0020): one at a time.
+    handoff: Option<Handoff>,
     pub focus: Focus,
     /// The terminal width, from `Event::Resize`: the side panes show only from `WIDE` up.
     pub width: u16,
@@ -432,6 +468,7 @@ impl App {
             edit_lock: None,
             scroll: 0,
             read_only: None,
+            handoff: None,
             focus: Focus::Input,
             selected_line: None,
             width: WIDE,
@@ -589,6 +626,7 @@ impl App {
                 self.threads = rows;
                 vec![]
             }
+            Event::HandoffEntries(entries) => self.handoff_entries(entries),
             Event::Report(text) | Event::WorktreesDone { report: text, .. } => {
                 self.push("roundtable", text, LineKind::Info);
                 vec![]
@@ -968,6 +1006,21 @@ impl App {
     fn submit(&mut self) -> Vec<Effect> {
         let mut input = std::mem::take(&mut self.input);
         self.scroll = 0;
+        // A handoff question is open: this line answers it (ADR 0020).
+        if matches!(
+            self.handoff.as_ref().map(|h| &h.stage),
+            Some(Stage::Confirm(_))
+        ) {
+            let effects = self.handoff_answer(&input);
+            if self
+                .handoff
+                .as_ref()
+                .is_some_and(|h| matches!(h.stage, Stage::Confirm(_)))
+            {
+                self.input = input;
+            }
+            return effects;
+        }
         if input.trim_start().starts_with('/') {
             let effects = self.command(input.trim());
             // A draft put aside by `/` or `:` in Normal mode comes back (ADR 0015).
@@ -1154,6 +1207,7 @@ impl App {
             ["/model", "enable", id] => self.set_enabled(id, true),
             ["/model", "disable", id] => self.set_enabled(id, false),
             ["/model", "use", id] => self.use_default(id),
+            ["/handoff", ..] => self.handoff(&words[1..]),
             ["/talk", state @ ("on" | "off")] => {
                 let on = *state == "on";
                 self.talk_on = on;
@@ -1200,6 +1254,7 @@ impl App {
     ) -> Vec<Effect> {
         self.lines.clear();
         self.origins.clear();
+        self.handoff = None;
         self.scroll = 0;
         for seat in &mut self.seats {
             seat.session = None;
@@ -1327,6 +1382,7 @@ impl App {
         self.origins.clear();
         self.scroll = 0;
         self.read_only = None;
+        self.handoff = None;
         for seat in &mut self.seats {
             seat.session = None;
             seat.history = Default::default();
@@ -1547,6 +1603,387 @@ impl App {
             status(note),
             Effect::EditRegistry(FileEdit::Default(id.into())),
         ]
+    }
+
+    /// `/handoff <id> [from <summarizer>] [note]` or `/handoff <id> raw [n]` (ADR 0020).
+    fn handoff(&mut self, args: &[&str]) -> Vec<Effect> {
+        let fail = |app: &mut Self, why: String| {
+            app.push("roundtable", why, LineKind::Error);
+            vec![]
+        };
+        if self.read_only.is_some() {
+            return fail(self, "this thread is read-only here".into());
+        }
+        if self.handoff.is_some() {
+            return fail(
+                self,
+                "a handoff is already under way (Esc cancels it)".into(),
+            );
+        }
+        if self.seats.iter().any(|s| s.busy || !s.queue.is_empty()) {
+            return fail(self, "wait for replies to finish, or Esc".into());
+        }
+        let Some((target, rest)) = args.split_first() else {
+            return fail(
+                self,
+                "usage: /handoff <id> [from <id>] [note] | /handoff <id> raw [n]".into(),
+            );
+        };
+        let target = target.trim_start_matches('@').to_string();
+        let (raw, summarizer, note) = match rest {
+            ["raw"] => (Some(20), None, String::new()),
+            ["raw", n] => match n.parse::<usize>() {
+                Ok(n) if n > 0 => (Some(n), None, String::new()),
+                _ => return fail(self, format!("`{n}` is not a number of messages")),
+            },
+            ["from", who, note @ ..] => (
+                None,
+                Some(who.trim_start_matches('@').to_string()),
+                note.join(" "),
+            ),
+            note => (None, None, note.join(" ")),
+        };
+        // The summarizer: named, else the default, else (default `all`) the writer.
+        let summarizer = summarizer.or_else(|| match self.registry.default.as_deref() {
+            Some("all") | None => self.registry.writer().map(str::to_string),
+            Some(id) => Some(id.to_string()),
+        });
+        let enabled = |id: &str| self.registry.get(id).filter(|p| p.enabled).cloned();
+        let Some(to) = enabled(&target) else {
+            return fail(self, format!("`{target}` is not an enabled model"));
+        };
+        let from = match (&raw, &summarizer) {
+            (Some(_), _) => None,
+            (None, None) => {
+                return fail(
+                    self,
+                    "no default or writer to summarize: /handoff <id> from <id>".into(),
+                );
+            }
+            (None, Some(id)) if *id == target => {
+                return fail(self, format!("{target} can't hand off to itself"));
+            }
+            (None, Some(id)) => match enabled(id) {
+                Some(p) => Some(p),
+                None => return fail(self, format!("`{id}` is not an enabled model")),
+            },
+        };
+        let key = self.next_key();
+        self.handoff = Some(Handoff {
+            summarizer: from
+                .as_ref()
+                .map_or_else(|| "user".into(), |p| p.id.clone()),
+            summarizer_identity: from.map(|p| p.identity).unwrap_or_default(),
+            target: to.id,
+            target_identity: to.identity,
+            note,
+            raw,
+            key,
+            stage: Stage::Reading,
+        });
+        vec![Effect::HandoffEntries]
+    }
+
+    /// The thread's entries arrived: fit them to the window, then ask or go.
+    fn handoff_entries(&mut self, entries: Result<Vec<crate::log::Entry>, String>) -> Vec<Effect> {
+        let Some(h) = self.handoff.clone().filter(|h| h.stage == Stage::Reading) else {
+            return vec![];
+        };
+        let entries = match entries {
+            Ok(entries) if entries.iter().any(|e| e.message) => entries,
+            Ok(_) => return self.handoff_drop("nothing to hand off yet".into()),
+            Err(why) => return self.handoff_drop(format!("handoff: {why}")),
+        };
+        // Newest first until the reader's window is full (about 3 characters a token,
+        // leaving room for the instructions and the reply).
+        let reader = if h.raw.is_some() {
+            &h.target
+        } else {
+            &h.summarizer
+        };
+        let window = self
+            .registry
+            .get(reader)
+            .and_then(|p| p.context_window)
+            .unwrap_or(CLI_WINDOW);
+        let mut budget = usize::try_from(window.saturating_mul(3) / 2).unwrap_or(usize::MAX);
+        let pool: Vec<&crate::log::Entry> = match h.raw {
+            Some(n) => entries.iter().filter(|e| e.message).rev().take(n).collect(),
+            None => entries.iter().rev().collect(),
+        };
+        let mut kept: Vec<&crate::log::Entry> = pool
+            .into_iter()
+            .take_while(|e| match budget.checked_sub(e.text.len()) {
+                Some(left) => {
+                    budget = left;
+                    true
+                }
+                None => false,
+            })
+            .collect();
+        kept.reverse();
+        if kept.is_empty() {
+            return self.handoff_drop("the last message alone doesn't fit the window".into());
+        }
+        let log: String = kept.iter().map(|e| e.text.as_str()).collect();
+        let note = match h.note.as_str() {
+            "" => String::new(),
+            note => format!("\n\nNote from the user: {note}"),
+        };
+        let authors = |entries: &[&crate::log::Entry]| {
+            let mut names: Vec<String> = vec![];
+            for e in entries {
+                let name = if e.from == "user" {
+                    "you"
+                } else {
+                    e.from.as_str()
+                };
+                if !names.iter().any(|n| n == name) {
+                    names.push(name.to_string());
+                }
+            }
+            names.join(", ")
+        };
+        let (question, prompt) = match h.raw {
+            Some(_) => {
+                let place = self
+                    .registry
+                    .get(&h.target)
+                    .and_then(|p| p.base_url.clone())
+                    .map_or_else(String::new, |url| format!(" at {url}"));
+                // Named: whose replies would reach the target's provider.
+                let others: Vec<&crate::log::Entry> =
+                    kept.iter().copied().filter(|e| e.from != "user").collect();
+                let whose = match authors(&others).as_str() {
+                    "" => "yours only".to_string(),
+                    names => names.to_string(),
+                };
+                let question = format!(
+                    "send {} messages ({whose}) to {}{place}? y/n",
+                    kept.len(),
+                    h.target
+                );
+                let prompt = format!(
+                    "handoff from the user: the last {} messages of this thread, verbatim.{note}\n\n{log}\n\nReply with what you understood and your first step.",
+                    kept.len()
+                );
+                (Some(question), prompt)
+            }
+            None => {
+                // Anything not from or to the summarizer is new to its provider: asked first.
+                let unseen: Vec<&crate::log::Entry> = kept
+                    .iter()
+                    .copied()
+                    .filter(|e| e.from != h.summarizer && !e.to.contains(&h.summarizer))
+                    .collect();
+                let question = (!unseen.is_empty()).then(|| {
+                    format!(
+                        "{s} summarizes for {t}; {s} has not seen {n} entries ({who}) — send them to {s}? y/n",
+                        s = h.summarizer,
+                        t = h.target,
+                        n = unseen.len(),
+                        who = authors(&unseen)
+                    )
+                });
+                let prompt = format!(
+                    "You are handing this roundtable thread over to `{}`. Summarize it for a colleague who takes over: the goal, decisions made, the state of the work, open questions, files touched, and the next step. Answer with the summary only.{note}\n\nThe thread:\n{log}",
+                    h.target
+                );
+                (question, prompt)
+            }
+        };
+        match question {
+            Some(question) => {
+                self.push("roundtable", question, LineKind::Info);
+                if let Some(h) = &mut self.handoff {
+                    h.stage = Stage::Confirm(prompt);
+                }
+                vec![]
+            }
+            None => self.handoff_go(prompt),
+        }
+    }
+
+    /// The y/n answer to the handoff question; anything else is asked again.
+    fn handoff_answer(&mut self, answer: &str) -> Vec<Effect> {
+        let Some(Stage::Confirm(prompt)) = self.handoff.as_ref().map(|h| h.stage.clone()) else {
+            return vec![];
+        };
+        match answer.trim().to_lowercase().as_str() {
+            "y" | "yes" => self.handoff_go(prompt),
+            "n" | "no" => self.handoff_drop("handoff cancelled".into()),
+            _ => {
+                self.push(
+                    "roundtable",
+                    "the handoff is waiting: y or n".into(),
+                    LineKind::Error,
+                );
+                vec![]
+            }
+        }
+    }
+
+    /// Records the intent (synced first) and starts the summary, or for `raw` the dispatch.
+    fn handoff_go(&mut self, prompt: String) -> Vec<Effect> {
+        let Some(h) = self.handoff.clone() else {
+            return vec![];
+        };
+        let line = format!("handoff {} → {}", h.summarizer, h.target);
+        let intent = record(
+            router(),
+            vec![self.party(&h.summarizer), self.party(&h.target)],
+            transcript::Kind::Status,
+            json!({
+                "text": line,
+                "handoff": {
+                    "summarizer": h.summarizer,
+                    "summarizer_identity": h.summarizer_identity,
+                    "target": h.target,
+                    "target_identity": h.target_identity,
+                    "note": h.note,
+                    "raw": h.raw,
+                }
+            }),
+        )
+        .durable()
+        .linked(Link {
+            key: h.key,
+            turn: 0,
+            parent: 0,
+        });
+        let mut effects = vec![intent];
+        if h.raw.is_some() {
+            effects.extend(self.handoff_dispatch(prompt));
+            return effects;
+        }
+        // Rechecked: the summarizer may have been repointed while the question was open.
+        let Some(p) = self
+            .registry
+            .get(&h.summarizer)
+            .filter(|p| p.enabled && p.identity == h.summarizer_identity)
+            .cloned()
+        else {
+            effects
+                .extend(self.handoff_settle("blocked", Some(format!("{} changed", h.summarizer))));
+            return effects;
+        };
+        self.push(
+            "roundtable",
+            format!("{line}: {} summarizes…", h.summarizer),
+            LineKind::Info,
+        );
+        if let Some(h) = &mut self.handoff {
+            h.stage = Stage::Summary;
+        }
+        // Read-only, even for the writer: a summary edits nothing.
+        effects.extend(self.start(&p, prompt, false, h.key));
+        effects
+    }
+
+    /// Step 2: the message to the target, after rechecking it is still what was pinned.
+    fn handoff_dispatch(&mut self, prompt: String) -> Vec<Effect> {
+        let Some(h) = self.handoff.clone() else {
+            return vec![];
+        };
+        let Some(p) = self
+            .registry
+            .get(&h.target)
+            .filter(|p| p.enabled && p.identity == h.target_identity)
+            .cloned()
+        else {
+            let why = format!("{} was disabled or repointed", h.target);
+            return self.handoff_settle("blocked", Some(why));
+        };
+        if let Some(h) = &mut self.handoff {
+            h.stage = Stage::Dispatch;
+        }
+        self.start(&p, prompt, false, h.key)
+    }
+
+    /// A handoff turn ended: the summary goes on, the reply completes it.
+    fn handoff_turn_done(
+        &mut self,
+        id: &str,
+        origin: u64,
+        outcome: Outcome,
+        text: &str,
+    ) -> Vec<Effect> {
+        let Some(h) = self.handoff.clone().filter(|h| h.key == origin) else {
+            return vec![];
+        };
+        let status = match outcome {
+            Outcome::Complete => None,
+            Outcome::Interrupted => Some("interrupted"),
+            Outcome::Failed => Some("failed"),
+        };
+        match (&h.stage, status) {
+            (Stage::Summary, None) if id == h.summarizer => {
+                let note = match h.note.as_str() {
+                    "" => String::new(),
+                    note => format!("\n\nNote from the user: {note}"),
+                };
+                self.handoff_dispatch(format!(
+                    "handoff from {}: {}{note}\n\nReply with what you understood and your first step.",
+                    h.summarizer,
+                    text.trim()
+                ))
+            }
+            (Stage::Dispatch, None) if id == h.target => {
+                let mut effects = self.handoff_settle("complete", None);
+                // The default moves only now, as `/model use` does it; `writer` never.
+                effects.extend(self.use_default(&h.target));
+                if let Some(writer) = self.registry.writer()
+                    && writer != h.target
+                {
+                    let note = format!(
+                        "{} is now the default; it is read-only (writer: {writer})",
+                        h.target
+                    );
+                    self.push("roundtable", note, LineKind::Info);
+                }
+                effects
+            }
+            (_, Some(status)) => self.handoff_settle(status, None),
+            _ => vec![],
+        }
+    }
+
+    /// Ends the handoff with its one `settle` line.
+    fn handoff_settle(&mut self, status: &str, reason: Option<String>) -> Vec<Effect> {
+        let Some(h) = self.handoff.take() else {
+            return vec![];
+        };
+        let shown = match &reason {
+            Some(why) => format!("handoff {} → {}: {status} ({why})", h.summarizer, h.target),
+            None => format!("handoff {} → {}: {status}", h.summarizer, h.target),
+        };
+        let kind = if status == "complete" {
+            LineKind::Info
+        } else {
+            LineKind::Error
+        };
+        self.push("roundtable", shown, kind);
+        vec![
+            record(
+                router(),
+                vec![],
+                transcript::Kind::Settle,
+                json!({ "handoff": status, "reason": reason }),
+            )
+            .durable()
+            .linked(Link {
+                key: 0,
+                turn: h.key,
+                parent: h.key,
+            }),
+        ]
+    }
+
+    /// Drops a handoff that never started (nothing recorded yet).
+    fn handoff_drop(&mut self, why: String) -> Vec<Effect> {
+        self.handoff = None;
+        self.push("roundtable", why, LineKind::Error);
+        vec![]
     }
 
     /// Applies a new registry as a diff against the live one (ADR 0011).
@@ -1854,6 +2291,15 @@ impl App {
     }
 
     fn cancel_all(&mut self) -> Vec<Effect> {
+        // A handoff not started yet just goes; a running one settles `interrupted` when its
+        // turn reports back.
+        if self
+            .handoff
+            .as_ref()
+            .is_some_and(|h| matches!(h.stage, Stage::Reading | Stage::Confirm(_)))
+        {
+            self.handoff_drop("handoff cancelled".into());
+        }
         let mut any = false;
         for seat in &mut self.seats {
             seat.queue.clear();
@@ -1985,8 +2431,19 @@ impl App {
 
     fn finish(&mut self, id: &str, outcome: Outcome) -> Vec<Effect> {
         let party = self.turn_party(id);
+        let summary = self
+            .handoff
+            .as_ref()
+            .filter(|h| h.stage == Stage::Summary && h.summarizer == id)
+            .map(|h| {
+                (
+                    h.key,
+                    format!("{} → {} (handoff summary)", h.summarizer, h.target),
+                )
+            });
         let seat = self.seat_mut(id).expect("seat");
         seat.busy = false;
+        let origin = seat.origin;
         let usage = seat.usage;
         if let Some((tokens_in, tokens_out, ..)) = usage {
             seat.thread_tokens.0 += tokens_in;
@@ -2002,6 +2459,13 @@ impl App {
         let text = match seat.reply.take() {
             Some(i) => {
                 self.lines[i].kind = LineKind::Reply(outcome);
+                // A handoff summary is one collapsed line; `Enter` expands it (ADR 0020).
+                if let Some((key, who)) = &summary
+                    && *key == origin
+                {
+                    self.lines[i].kind = LineKind::Handoff;
+                    self.lines[i].who = who.clone();
+                }
                 self.lines[i].text.clone()
             }
             None => String::new(),
@@ -2053,6 +2517,7 @@ impl App {
         }
         let mut effects = vec![reply];
         effects.extend(self.end_ask(id, outcome, &text, usage.map(|u| u.0 + u.1)));
+        effects.extend(self.handoff_turn_done(id, origin, outcome, &text));
         let next = self.seat_mut(id).and_then(|s| s.queue.pop_front());
         if let Some((prompt, writable, origin)) = next
             && let Some(p) = self.registry.get(id).cloned()
@@ -3035,6 +3500,148 @@ mod tests {
         app.update(Event::Registry(Err("line 3: oops".into())));
         assert!(last_text(&app).starts_with("models.toml not applied"));
         assert_eq!(started(&type_line(&mut app, "@codex hi")), ["codex"]);
+    }
+
+    fn entry(from: &str, to: &[&str], text: &str) -> crate::log::Entry {
+        crate::log::Entry {
+            text: format!("\n## {from}\n\n{text}\n"),
+            from: from.into(),
+            to: to.iter().map(|t| (*t).to_string()).collect(),
+            message: true,
+        }
+    }
+
+    fn records(effects: &[Effect]) -> Vec<&NewEvent> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Record { event, .. } => Some(event),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn turn_prompt<'a>(effects: &'a [Effect], who: &str) -> Option<(&'a str, bool)> {
+        effects.iter().find_map(|e| match e {
+            Effect::StartTurn {
+                id,
+                prompt,
+                writable,
+                ..
+            } if id == who => Some((prompt.as_str(), *writable)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_handoff_asks_about_unseen_entries_then_summarizes_dispatches_and_switches() {
+        let mut app = App::default();
+        assert_eq!(
+            type_line(&mut app, "/handoff codex"),
+            [Effect::HandoffEntries]
+        );
+        let entries = vec![
+            entry("user", &["claude"], "fix the parser"),
+            entry("claude", &["user"], "fixed it"),
+            entry("user", &["codex"], "is it right?"),
+            entry("codex", &["user"], "one bug left"),
+        ];
+        assert!(app.update(Event::HandoffEntries(Ok(entries))).is_empty());
+        assert_eq!(
+            app.lines.last().unwrap().text,
+            "claude summarizes for codex; claude has not seen 2 entries (you, codex) — send them to claude? y/n"
+        );
+        // Anything but y/n is asked again and nothing starts.
+        assert!(type_line(&mut app, "maybe").is_empty());
+        app.input.clear();
+        let effects = type_line(&mut app, "y");
+        let intent = records(&effects)[0];
+        assert_eq!(intent.payload["handoff"]["target"], "codex");
+        let (prompt, writable) = turn_prompt(&effects, "claude").expect("summary turn");
+        assert!(prompt.contains("one bug left") && prompt.contains("Summarize"));
+        assert!(!writable, "a summary edits nothing, even for the writer");
+
+        app.update(agent(
+            "claude",
+            PEvent::TextDelta("parser fixed, one bug".into()),
+        ));
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        let (prompt, writable) = turn_prompt(&effects, "codex").expect("dispatch");
+        assert!(prompt.starts_with("handoff from claude: parser fixed, one bug"));
+        assert!(!writable);
+        assert!(
+            app.lines.iter().any(|l| l.kind == LineKind::Handoff),
+            "the summary is one collapsed line"
+        );
+        assert_ne!(app.registry.default.as_deref(), Some("codex"), "not yet");
+
+        app.update(agent("codex", PEvent::TextDelta("on it".into())));
+        let effects = app.update(agent("codex", PEvent::Done(Outcome::Complete)));
+        assert!(
+            records(&effects)
+                .iter()
+                .any(|e| e.kind == transcript::Kind::Settle && e.payload["handoff"] == "complete")
+        );
+        assert!(effects.contains(&Effect::EditRegistry(FileEdit::Default("codex".into()))));
+        assert_eq!(app.registry.default.as_deref(), Some("codex"));
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| l.text == "codex is now the default; it is read-only (writer: claude)")
+        );
+    }
+
+    #[test]
+    fn a_repointed_target_blocks_the_handoff_and_keeps_the_default() {
+        let mut app = App::default();
+        type_line(&mut app, "/handoff codex");
+        let entries = vec![
+            entry("user", &["claude"], "hi"),
+            entry("claude", &["user"], "hello"),
+        ];
+        let effects = app.update(Event::HandoffEntries(Ok(entries)));
+        assert!(
+            turn_prompt(&effects, "claude").is_some(),
+            "nothing unseen: no question"
+        );
+        let repointed = crate::registry::DEFAULT_FILE
+            .replace("cmd = \"codex\"\n", "cmd = \"codex\"\nmodel = \"other\"\n");
+        reload(&mut app, &repointed);
+        app.update(agent("claude", PEvent::TextDelta("summary".into())));
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        assert!(turn_prompt(&effects, "codex").is_none());
+        assert!(
+            records(&effects)
+                .iter()
+                .any(|e| e.kind == transcript::Kind::Settle && e.payload["handoff"] == "blocked")
+        );
+        assert_ne!(app.registry.default.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn a_raw_handoff_always_asks_and_no_sends_nothing() {
+        let mut app = App::default();
+        reload(&mut app, &format!("{DEFAULT_FILE}{LLAMA}"));
+        type_line(&mut app, "/handoff llama raw 1");
+        let entries = vec![
+            entry("user", &["claude"], "old"),
+            entry("claude", &["user"], "newest"),
+        ];
+        app.update(Event::HandoffEntries(Ok(entries)));
+        assert_eq!(
+            app.lines.last().unwrap().text,
+            "send 1 messages (claude) to llama at http://localhost:11434/v1? y/n"
+        );
+        let effects = type_line(&mut app, "n");
+        assert!(effects.is_empty(), "nothing recorded or sent");
+        assert!(app.handoff.is_none());
+        // Busy: refused.
+        type_line(&mut app, "@claude go");
+        type_line(&mut app, "/handoff codex");
+        assert_eq!(
+            app.lines.last().unwrap().text,
+            "wait for replies to finish, or Esc"
+        );
     }
 
     const LLAMA: &str = "\n[[model]]\nid = \"llama\"\nkind = \"openai\"\nbase_url = \"http://localhost:11434/v1\"\nmodel = \"llama3.3\"\nkey = \"env:LLAMA_KEY\"\n";

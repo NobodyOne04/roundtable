@@ -1240,6 +1240,14 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         let _ = tx.blocking_send(Event::WorktreesDone { ids, report });
                     });
                 }
+                Effect::HandoffEntries => {
+                    let entries = match rt.thread.as_ref().map(Thread::events) {
+                        None => Err("nothing to hand off yet".to_string()),
+                        Some(Err(err)) => Err(format!("{err:#}")),
+                        Some(Ok(events)) => Ok(roundtable::log::entries(&events, utc_offset_at)),
+                    };
+                    local.push_back(Event::HandoffEntries(entries));
+                }
                 Effect::Usage(scope) => {
                     let agents = app.cli_agents();
                     let agents: Vec<&str> = agents.iter().map(String::as_str).collect();

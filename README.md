@@ -43,9 +43,14 @@ the reply, and the tokens it cost.
 - Slash commands like Claude Code (`/help` lists them, `Tab` completes them and `@` ids):
   `/status`, `/usage [thread|today|all]`, `/context [id]`, `/models`,
   `/model enable|disable|use|test <id>`, `/talk on|off|show|allow a->b|deny a->b`,
-  `/budget`, `/turns`, `/clear`, `/resume [n|id]`, `/log`, `/exit`, `/quiet`. `Alt-Enter` adds a
-  line, `PgUp`/`PgDn` scroll, `\/` sends a literal slash. `/model add`, `/compact`,
-  `/handoff` and `/fork` come later ([ADR 0008](docs/adr/0008-slash-commands-and-mentions.adr)).
+  `/budget`, `/turns`, `/clear`, `/resume [n|id]`, `/log`, `/handoff`, `/exit`, `/quiet`.
+  `Alt-Enter` adds a line, `PgUp`/`PgDn` scroll, `\/` sends a literal slash. `/model add`,
+  `/compact` and `/fork` come later ([ADR 0008](docs/adr/0008-slash-commands-and-mentions.adr)).
+- `/handoff <id> [note]` passes the thread on: the default (or the writer, with
+  `default = "all"`; or `from <id>`) summarizes it read-only, `<id>` gets the summary and
+  answers with its first step, then becomes the default (`writer` stays). If the summarizer
+  hasn't seen parts of the thread, you're asked before they go to it. `/handoff <id> raw [n]`
+  sends the last `n` messages verbatim instead, after asking.
 - `/resume` reopens a past thread: the chat, each CLI's session and each free model's
   history come back, and new messages continue it. A thread from another checkout opens
   read-only.
@@ -237,9 +242,10 @@ Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
 | 13 | [0017](docs/adr/0017-writer-edits-from-any-message.adr) | The writer edits from any message; `@all?` keeps everyone read-only | done |
 | 14 | [0018](docs/adr/0018-approvals-in-the-chat.adr) | Tool approvals in the chat | next |
 | 15 | [0016](docs/adr/0016-worktree-per-agent.adr) | A git worktree per read-only agent | done |
+| 16 | [0020](docs/adr/0020-handoff.adr) | `/handoff`: pass the thread to another model | done |
+| 17 | [0019](docs/adr/0019-fork.adr) | `/fork`: branch the thread (waits for a recorded Codex `exec fork` fixture) | |
 
-Later, each with its own ADR first: `/model add` (guided),
-`/compact`, `/handoff`, `/fork`, approvals, an ACP adapter.
+Later, each with its own ADR first: `/model add` (guided), `/compact`, an ACP adapter.
 
 ## License
 
