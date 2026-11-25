@@ -20,7 +20,7 @@ Rust TUI console that runs Claude Code, Codex and OpenAI-compatible models in on
 - `src/limits.rs`: plan limits (ADR 0014): Claude's `rate_limit_event`, Codex's session file (`token_count` lines), the `/usage` block and status warnings; `App::limits`, saved to `<data>/limits.json`.
 - `src/log.rs`: `/log`'s Markdown render of a thread from its transcript (ADR 0024); the loop writes the temp file and hands the terminal to `editor` (`leave_screen`/`enter_screen`).
 - `src/openai.rs`: OpenAI-compatible chat: streaming SSE, history fitting, retries, key resolution (ADR 0005).
-- `src/worktree.rs`: the read-only agents' mirrors (ADR 0016): create, sync (`git diff HEAD --binary` + untracked files), list, remove; git runs with hooks off.
+- `src/worktree.rs`: the read-only agents' mirrors (ADR 0016): create, sync (the writer's index via `write-tree`/`read-tree --reset -u`, then changed and untracked files copied, listed in `<id>.copied`), list, remove; git runs with hooks and fsmonitor off, in its own process group.
 - `src/writer_lock.rs`: checkout resolution (git root, git dir) and the writer lock and crash marker (ADR 0012).
 - `src/transcript.rs`: transcript files, single-instance lock, atomic writes (ADR 0010).
 - `src/app.rs`: `App` state, `Event`, `Effect` and `App::update`, the only place state changes (ADR 0002).
