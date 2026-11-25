@@ -39,6 +39,11 @@ pub const COMMANDS: &[Command] = &[
         help: "tokens and cost per model, from the transcript",
     },
     Command {
+        name: "/log",
+        args: "",
+        help: "open the whole thread as Markdown in the configured `editor`",
+    },
+    Command {
         name: "/context",
         args: "[id]",
         help: "what each participant has seen and how full its window is",

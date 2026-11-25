@@ -17,6 +17,7 @@ Rust TUI console that runs Claude Code, Codex and OpenAI-compatible models in on
 - `src/registry.rs`: `models.toml` parsing and validation (all or nothing), default file, identities (FNV-1a), comment-keeping edits (ADR 0011).
 - `src/commands.rs`: the slash-command table (`/help` and completion come from it) (ADR 0008).
 - `src/mcp.rs`: `roundtable mcp`, the stdio MCP server giving Claude the `ask` tool, and its socket client (ADR 0007).
+- `src/log.rs`: `/log`'s Markdown render of a thread from its transcript (ADR 0024); the loop writes the temp file and hands the terminal to `editor` (`leave_screen`/`enter_screen`).
 - `src/openai.rs`: OpenAI-compatible chat: streaming SSE, history fitting, retries, key resolution (ADR 0005).
 - `src/writer_lock.rs`: checkout resolution (git root, git dir) and the writer lock and crash marker (ADR 0012).
 - `src/transcript.rs`: transcript files, single-instance lock, atomic writes (ADR 0010).

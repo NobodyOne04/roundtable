@@ -17,6 +17,9 @@ pub const DEFAULT_FILE: &str = r#"# roundtable model registry (ADR 0011).
 default = "claude"
 # The only participant that may edit files; remove the line and everyone is read-only.
 writer = "claude"
+# The editor /log opens the thread in (a command line; the file is added last). The file is
+# deleted when the editor closes (ADR 0024).
+editor = "nvim"
 
 [[model]]
 id = "claude"
@@ -125,6 +128,7 @@ impl Default for Talk {
 struct RawFile {
     default: Option<String>,
     writer: Option<String>,
+    editor: Option<String>,
     #[serde(default, rename = "model")]
     models: Vec<RawEntry>,
     #[serde(default)]
@@ -167,6 +171,8 @@ pub struct Registry {
     /// As configured; `default()` and `writer()` give what is in effect right now.
     pub default: Option<String>,
     pub writer: Option<String>,
+    /// `/log`'s editor command, split into words (ADR 0024); empty when unset.
+    pub editor: Vec<String>,
     pub talk: Talk,
     /// Not errors, but the user should know (e.g. a `writer` that was dropped).
     pub warnings: Vec<String>,
@@ -194,6 +200,14 @@ impl Registry {
                 }
             }
         }
+        let editor = match raw.editor.as_deref().map(shell_words::split) {
+            None => vec![],
+            Some(Ok(words)) => words,
+            Some(Err(err)) => {
+                errors.push(format!("editor: {err}"));
+                vec![]
+            }
+        };
         if !errors.is_empty() {
             return Err(errors.join("\n"));
         }
@@ -202,6 +216,7 @@ impl Registry {
             participants,
             default: raw.default,
             writer: raw.writer,
+            editor,
             talk: raw.talk,
             warnings: vec![],
         };
@@ -463,6 +478,23 @@ mod tests {
         assert_eq!(reg.default(), Some("claude"));
         assert_eq!(reg.writer(), Some("claude"));
         assert!(reg.warnings.is_empty());
+    }
+
+    #[test]
+    fn the_editor_is_a_command_line_from_the_file() {
+        assert_eq!(Registry::parse(DEFAULT_FILE).unwrap().editor, ["nvim"]);
+        let set = |line: &str| Registry::parse(&DEFAULT_FILE.replace("editor = \"nvim\"", line));
+        assert_eq!(
+            set("editor = \"code --wait 'my dir'\"").unwrap().editor,
+            ["code", "--wait", "my dir"]
+        );
+        assert!(
+            set("").unwrap().editor.is_empty(),
+            "unset: no editor, nothing built in"
+        );
+        assert!(set("editor = \"\"").unwrap().editor.is_empty());
+        let err = set("editor = \"nvim 'unclosed\"").unwrap_err();
+        assert!(err.contains("editor"), "{err}");
     }
 
     #[test]

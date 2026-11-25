@@ -42,7 +42,7 @@ the reply, and the tokens it cost.
 - Slash commands like Claude Code (`/help` lists them, `Tab` completes them and `@` ids):
   `/status`, `/usage [thread|today|all]`, `/context [id]`, `/models`,
   `/model enable|disable|use|test <id>`, `/talk on|off|show|allow a->b|deny a->b`,
-  `/budget`, `/turns`, `/clear`, `/resume [n|id]`, `/exit`, `/quiet`. `Alt-Enter` adds a
+  `/budget`, `/turns`, `/clear`, `/resume [n|id]`, `/log`, `/exit`, `/quiet`. `Alt-Enter` adds a
   line, `PgUp`/`PgDn` scroll, `\/` sends a literal slash. `/model add`, `/compact`,
   `/handoff` and `/fork` come later ([ADR 0008](docs/adr/0008-slash-commands-and-mentions.adr)).
 - `/resume` reopens a past thread: the chat, each CLI's session and each free model's
@@ -75,6 +75,7 @@ your comments. Example with a free local model added:
 ```toml
 default = "claude"
 writer = "claude"   # the only one that edits files
+editor = "nvim"     # /log opens the thread here; the temp file is deleted on exit
 
 [[model]]
 id = "claude"
@@ -209,6 +210,8 @@ Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
 | 7 | [0007](docs/adr/0007-model-to-model-communication.adr) | Model-to-model `ask`, talk policy, limits, `/talk on\|off` | done |
 | 8 | [0008](docs/adr/0008-slash-commands-and-mentions.adr) | Full command set and completion | done |
 | 9 | [0009](docs/adr/0009-tui-layout.adr) | Three-pane layout | done |
+| 10 | [0024](docs/adr/0024-log-command.adr) | `/log`: the whole thread as Markdown in your configured editor | done |
+| 11 | [0015](docs/adr/0015-vim-keys.adr) | Vim keys | next |
 
 Later, each with its own ADR first: git worktree per agent, `/model add` (guided),
 `/compact`, `/handoff`, `/fork`, approvals, an ACP adapter.
