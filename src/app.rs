@@ -1876,7 +1876,7 @@ impl App {
             h.stage = Stage::Summary;
         }
         // Read-only, even for the writer: a summary edits nothing.
-        effects.extend(self.start(&p, prompt, false, h.key));
+        effects.extend(self.handoff_turn(&p.id, prompt, h.key));
         effects
     }
 
@@ -1897,7 +1897,23 @@ impl App {
         if let Some(h) = &mut self.handoff {
             h.stage = Stage::Dispatch;
         }
-        self.start(&p, prompt, false, h.key)
+        self.handoff_turn(&p.id, prompt, h.key)
+    }
+
+    /// Sends a handoff turn like any message: queued behind a reply still running (one
+    /// the user sent meanwhile). A model that can't take it settles the handoff `failed`.
+    fn handoff_turn(&mut self, id: &str, prompt: String, key: u64) -> Vec<Effect> {
+        let effects = self.deliver(id, prompt, false, key);
+        let taken = self
+            .seats
+            .iter()
+            .find(|s| s.id == id)
+            .is_some_and(|s| s.busy || s.queue.iter().any(|q| q.2 == key));
+        if taken {
+            effects
+        } else {
+            self.handoff_settle("failed", Some(format!("{id} is unavailable")))
+        }
     }
 
     /// A handoff turn ended: the summary goes on, the reply completes it.
@@ -3616,6 +3632,29 @@ mod tests {
                 .any(|e| e.kind == transcript::Kind::Settle && e.payload["handoff"] == "blocked")
         );
         assert_ne!(app.registry.default.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn a_handoff_summary_waits_behind_a_reply_sent_meanwhile() {
+        let mut app = App::default();
+        type_line(&mut app, "/handoff codex");
+        type_line(&mut app, "@claude something else");
+        let entries = vec![
+            entry("user", &["claude"], "hi"),
+            entry("claude", &["user"], "hello"),
+        ];
+        let effects = app.update(Event::HandoffEntries(Ok(entries)));
+        assert!(
+            turn_prompt(&effects, "claude").is_none(),
+            "queued, not started over it"
+        );
+        app.update(agent("claude", PEvent::TextDelta("done".into())));
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        let (prompt, _) = turn_prompt(&effects, "claude").expect("the summary, now");
+        assert!(prompt.contains("Summarize"));
+        app.update(agent("claude", PEvent::TextDelta("summary".into())));
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        assert!(turn_prompt(&effects, "codex").is_some());
     }
 
     #[test]
