@@ -125,16 +125,7 @@ pub fn sync(
     if fs::symlink_metadata(&mirror).is_err() {
         // Deleted from outside, its registration left: git would refuse the path. Ours to
         // drop only with our record for it (never `worktree prune`).
-        if let Some(stale) = registration(checkout, &mirror, cancel)? {
-            let record: Option<Record> = fs::read(&record_file)
-                .ok()
-                .and_then(|b| serde_json::from_slice(&b).ok());
-            if record.is_none_or(|r| r.mirror != mirror || r.source != checkout) {
-                return Err(format!(
-                    "git has a worktree registered at {} that roundtable didn't record",
-                    mirror.display()
-                ));
-            }
+        if let Some(stale) = owned_registration(checkout, &mirror, cancel)? {
             fs::remove_dir_all(&stale).map_err(|e| format!("{}: {e}", stale.display()))?;
         }
         // The record first: a crash during `worktree add` leaves a mirror `/worktrees clean`
@@ -149,6 +140,12 @@ pub fn sync(
         git(&["worktree", "add", "--detach", &path, &head], None)?;
         fs::set_permissions(&mirror, fs::Permissions::from_mode(0o700))
             .map_err(|e| e.to_string())?;
+        // Marks this registration as ours: a record names a path, and git could later hold
+        // another worktree there. Removing the worktree removes the mark with it.
+        let admin = registration(checkout, &mirror, cancel)?
+            .ok_or_else(|| format!("git registered no worktree at {}", mirror.display()))?;
+        fs::write(admin.join(MARK), mirror.as_os_str().as_bytes())
+            .map_err(|e| format!("{}: {e}", admin.display()))?;
     }
     let admin = verify(&mirror, &record_file, checkout, cancel)?;
     // The CLI runs plain git in the mirror: its pointer must name this registration, whatever
@@ -188,9 +185,16 @@ pub fn sync(
             continue;
         }
         let name = Path::new(OsStr::from_bytes(name));
-        if real_dirs_exist(&mirror, name.parent().unwrap_or(Path::new(""))) {
-            clear(&mirror.join(name)).map_err(|e| format!("{}: {e}", name.display()))?;
-        }
+        let parent = name.parent().unwrap_or(Path::new(""));
+        real_dirs_exist(&mirror, parent)
+            .and_then(|real| {
+                if real {
+                    clear(&mirror.join(name))
+                } else {
+                    Ok(())
+                }
+            })
+            .map_err(|e| format!("{}: {e}", name.display()))?;
     }
     in_mirror(&["checkout", "-q", "--detach", "--force", &head], None)?;
     in_mirror(&["reset", "-q", "--hard"], None)?;
@@ -201,16 +205,32 @@ pub fn sync(
     let index = checkout.join(String::from_utf8_lossy(&index).trim());
     let snapshot = dir.join(format!("{id}.index"));
     fs::copy(&index, &snapshot).map_err(|e| format!("{}: {e}", index.display()))?;
-    let src = |args: &[&str]| {
+    let src_in = |args: &[&str], input: Option<&[u8]>| {
         let env = [("GIT_INDEX_FILE", snapshot.as_os_str())];
         run_git(
             &[OsStr::new("-C"), checkout.as_os_str()],
             args,
-            None,
+            input,
             &env,
             cancel,
         )
     };
+    let src = |args: &[&str]| src_in(args, None);
+    // `assume-unchanged` hides a file's edits from `diff`: cleared in the snapshot, so they
+    // are seen. (`skip-worktree` stays: those files may not be in the checkout at all.)
+    let tags = src(&["ls-files", "-v", "-z"])?;
+    let assumed: Vec<u8> = tags
+        .split(|b| *b == 0)
+        .filter(|e| e.first().is_some_and(u8::is_ascii_lowercase))
+        .flat_map(|e| e.get(2..).unwrap_or_default().iter().chain(&[0]))
+        .copied()
+        .collect();
+    if !assumed.is_empty() {
+        src_in(
+            &["update-index", "--no-assume-unchanged", "-z", "--stdin"],
+            Some(&assumed),
+        )?;
+    }
     // The index as a tree (objects only), read into the mirror's index and files whole:
     // renames, file-to-folder swaps and deletions included.
     let tree = match src(&["write-tree"]) {
@@ -226,17 +246,20 @@ pub fn sync(
     let mirror_file = |name: &Path, changed: bool| -> Result<(), String> {
         let from = checkout.join(name);
         let parent = name.parent().unwrap_or(Path::new(""));
-        let source = real_dirs_exist(checkout, parent)
-            .then(|| fs::symlink_metadata(&from).ok())
-            .flatten()
-            .filter(|m| !(changed && m.is_dir()));
-        if source.is_some() {
-            copy_entry(&from, &mirror, name)
-        } else if real_dirs_exist(&mirror, parent) {
-            clear(&mirror.join(name))
-        } else {
-            Ok(())
-        }
+        (|| {
+            let source = if real_dirs_exist(checkout, parent)? {
+                entry(&from)?.filter(|m| !(changed && m.is_dir()))
+            } else {
+                None
+            };
+            if source.is_some() {
+                copy_entry(&from, &mirror, name)
+            } else if real_dirs_exist(&mirror, parent)? {
+                clear(&mirror.join(name))
+            } else {
+                Ok(())
+            }
+        })()
         .map_err(|e| format!("copying {}: {e}", name.display()))
     };
     for name in changed.split(|b| *b == 0).filter(|n| !n.is_empty()) {
@@ -245,14 +268,30 @@ pub fn sync(
         }
         mirror_file(Path::new(OsStr::from_bytes(name)), true)?;
     }
-    // Under the writer's ignore rules (its `.gitignore` edits came above): ignored build
-    // output stays, so a build there survives; `-ff` also removes a repository a turn
-    // cloned there.
-    in_mirror(&["clean", "-ffdq"], None)?;
     // Untracked files, and intent-to-add ones (`git add -N`: in the writer's index, not in
     // its tree, so untracked here), copied last. Listed before copying, so a sync cut
     // short still has the next one remove whatever it copied.
     let untracked = src(&["ls-files", "-z", "-o", "--exclude-standard"])?;
+    // The writer's untracked `.gitignore` files come first and are kept out of `clean`, so
+    // their rules are in force for it too.
+    let mut keep = vec![];
+    for name in untracked
+        .split(|b| *b == 0)
+        .filter(|n| n.ends_with(b".gitignore"))
+    {
+        let name = Path::new(OsStr::from_bytes(name));
+        if name.file_name() == Some(OsStr::new(".gitignore")) {
+            mirror_file(name, false)?;
+            keep.push("-e".to_string());
+            keep.push(format!("/{}", glob_escape(&name.to_string_lossy())));
+        }
+    }
+    // Under the writer's ignore rules (its `.gitignore` edits came above): ignored build
+    // output stays, so a build there survives; `-ff` also removes a repository a turn
+    // cloned there.
+    let mut clean = vec!["clean", "-ffdq"];
+    clean.extend(keep.iter().map(String::as_str));
+    in_mirror(&clean, None)?;
     let intent = src(&[
         "diff",
         "--name-only",
@@ -338,9 +377,32 @@ fn verify(
     {
         return refuse("not a mirror roundtable recorded for this checkout");
     }
-    match registration(checkout, mirror, cancel)? {
+    match owned_registration(checkout, mirror, cancel)? {
         Some(admin) => Ok(admin),
         None => refuse("the checkout's repository has no worktree there"),
+    }
+}
+
+/// The file in a worktree's registration that says roundtable made it for this path.
+const MARK: &str = "roundtable-mirror";
+
+/// `registration`, but only if roundtable made it: one git holds at our path without the
+/// mark is someone else's worktree, never reset or removed here.
+fn owned_registration(
+    checkout: &Path,
+    mirror: &Path,
+    cancel: &AtomicBool,
+) -> Result<Option<PathBuf>, String> {
+    let Some(admin) = registration(checkout, mirror, cancel)? else {
+        return Ok(None);
+    };
+    match fs::read(admin.join(MARK)) {
+        Ok(mark) if mark == mirror.as_os_str().as_bytes() => Ok(Some(admin)),
+        _ => Err(format!(
+            "git has a worktree at {} that roundtable didn't make (`git worktree remove` it \
+             if it is yours to drop)",
+            mirror.display()
+        )),
     }
 }
 
@@ -371,13 +433,42 @@ fn registration(
 }
 
 /// `rel`'s folders under `root` all exist as real folders (no link on the way).
-fn real_dirs_exist(root: &Path, rel: &Path) -> bool {
+/// Missing or not a folder is `false`; any other error (no permission) is an error, never
+/// taken for a deletion.
+fn real_dirs_exist(root: &Path, rel: &Path) -> std::io::Result<bool> {
     let mut at = root.to_path_buf();
-    rel.components().all(|part| {
+    for part in rel.components() {
+        if !matches!(part, std::path::Component::Normal(_)) {
+            return Ok(false);
+        }
         at.push(part);
-        matches!(part, std::path::Component::Normal(_))
-            && fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_dir())
-    })
+        match fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_dir() => {}
+            Ok(_) => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
+/// `symlink_metadata`, with a missing path as `None` and other errors kept.
+fn entry(path: &Path) -> std::io::Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(m) => Ok(Some(m)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// A path as a literal gitignore pattern.
+fn glob_escape(path: &str) -> String {
+    path.chars()
+        .flat_map(|c| {
+            let escape = matches!(c, '*' | '?' | '[' | ']' | '\\' | '!' | '#' | ' ');
+            escape.then_some('\\').into_iter().chain([c])
+        })
+        .collect()
 }
 
 /// Removes whatever is at `path` (a link itself, never what it points to).
@@ -561,7 +652,7 @@ pub fn remove(id: &str, record: &Record) -> Result<(), String> {
         fs::remove_file(&record.mirror).map_err(|e| e.to_string())?;
     }
     if record.source.exists()
-        && let Some(admin) = registration(&record.source, &record.mirror, &never)?
+        && let Some(admin) = owned_registration(&record.source, &record.mirror, &never)?
     {
         if fs::symlink_metadata(&record.mirror).is_ok() {
             // Never `worktree prune`: it would touch the owner's own registrations.
@@ -728,6 +819,22 @@ mod tests {
         fs::remove_file(repo.join("d")).unwrap();
         run(&repo, &["rm", "-q", "--cached", "d/f"]);
         run(&repo, &["commit", "-qm", "no d"]);
+        // An edit hidden by `assume-unchanged`, and an untracked `.gitignore` whose rule
+        // keeps the agent's build output across syncs.
+        run(&repo, &["update-index", "--assume-unchanged", "a.txt"]);
+        fs::create_dir(repo.join("sub")).unwrap();
+        fs::write(repo.join("sub/.gitignore"), "cache/\n").unwrap();
+        let m = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
+        assert_eq!(fs::read_to_string(m.join("a.txt")).unwrap(), "two\n");
+        fs::create_dir(m.join("sub/cache")).unwrap();
+        fs::write(m.join("sub/cache/x"), "x").unwrap();
+        sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
+        assert!(
+            m.join("sub/cache/x").exists(),
+            "an untracked ignore file is in force"
+        );
+        run(&repo, &["update-index", "--no-assume-unchanged", "a.txt"]);
+        fs::remove_dir_all(repo.join("sub")).unwrap();
         // Something the agent left in the mirror is gone after the next sync.
         fs::write(mirror.join("stray.txt"), "x").unwrap();
         let mirror = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
@@ -895,6 +1002,28 @@ mod tests {
         );
         // Its own registration went with it: a new mirror can be made at the path.
         sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
+    }
+
+    #[test]
+    fn a_worktree_roundtable_did_not_make_is_never_touched() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("repo")).unwrap();
+        let repo = tmp.path().join("repo").canonicalize().unwrap();
+        let data = tmp.path().join("data");
+        fs::DirBuilder::new().mode(0o700).create(&data).unwrap();
+        run(&repo, &["init", "-q"]);
+        run(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let mirror = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
+        // The owner removes it with git and puts a worktree of their own at the path.
+        let path = mirror.to_str().unwrap();
+        run(&repo, &["worktree", "remove", "--force", path]);
+        run(&repo, &["worktree", "add", "-q", "--detach", path]);
+        fs::write(mirror.join("work.txt"), "mine").unwrap();
+        let err = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap_err();
+        assert!(err.contains("didn't make"), "{err}");
+        let (id, record) = list(&data, &repo).remove(0);
+        assert!(remove(&id, &record).is_err());
+        assert_eq!(fs::read_to_string(mirror.join("work.txt")).unwrap(), "mine");
     }
 
     #[test]
