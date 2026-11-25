@@ -202,10 +202,12 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) -> u16 {
     // Keep the newest lines in view unless scrolled back (PgUp). Measured before the
     // border is added: `line_count` counts border rows too.
     let chat = Paragraph::new(text).wrap(Wrap { trim: false });
-    let inner_height = area.height.saturating_sub(2);
-    let total = chat.line_count(area.width.saturating_sub(2)) as u16;
+    // Rows in `usize`: a long thread can pass `u16::MAX` wrapped rows; only the widget's
+    // scroll offset is `u16`, clamped at the end.
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let total = chat.line_count(area.width.saturating_sub(2));
     let bottom = total.saturating_sub(inner_height);
-    let mut top = bottom.saturating_sub(app.scroll);
+    let mut top = bottom.saturating_sub(app.scroll as usize);
     // In Normal mode the selected line stays in view (j/k move it, ADR 0015).
     if let Some(i) = (app.focus == Focus::Chat && app.follow_selection)
         .then_some(app.selected_line)
@@ -221,7 +223,7 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) -> u16 {
                 .collect();
             Paragraph::new(text)
                 .wrap(Wrap { trim: false })
-                .line_count(width) as u16
+                .line_count(width)
         };
         let start = rows(&app.lines[..i]);
         let end = rows(&app.lines[..=i]);
@@ -231,17 +233,21 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) -> u16 {
             top = end.saturating_sub(inner_height).min(start);
         }
     }
-    let title = if top < bottom {
-        format!(" roundtable · scrolled up {} lines (PgDn) ", bottom - top)
+    let top = top.min(bottom);
+    let scrolled = u16::try_from(bottom - top).unwrap_or(u16::MAX);
+    let title = if scrolled > 0 {
+        format!(" roundtable · scrolled up {scrolled} lines (PgDn) ")
     } else {
         " roundtable ".to_string()
     };
-    let chat = chat.scroll((top, 0)).block(focused(
-        Block::bordered().title(title),
-        app.focus == Focus::Chat,
-    ));
+    let chat = chat
+        .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
+        .block(focused(
+            Block::bordered().title(title),
+            app.focus == Focus::Chat,
+        ));
     frame.render_widget(chat, area);
-    bottom - top
+    scrolled
 }
 
 fn draw_threads(frame: &mut Frame, app: &App, area: Rect) {
@@ -293,7 +299,7 @@ fn draw_context(frame: &mut Frame, app: &App, area: Rect) {
             .get(&r.id)
             .and_then(|l| roundtable::limits::blocked_until(l, now))
             .map(|until| {
-                let local = |s: i64| (s + crate::utc_offset_s()).max(0) as u64 * 1000;
+                let local = |s: i64| (s + crate::utc_offset_at(s)).max(0) as u64 * 1000;
                 // Its own row: the pane is 28 columns inside, too narrow beside the state.
                 format!(
                     "  limited until {}",

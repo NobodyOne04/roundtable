@@ -3,10 +3,10 @@
 
 use crate::transcript::{EventLine, Kind, day_of};
 
-/// The thread as Markdown. `utc_offset_s` shifts the times shown (the loop passes the local
-/// offset; tests pass 0).
-pub fn render(title: &str, events: &[EventLine], utc_offset_s: i64) -> String {
-    let local = |ts: u64| ts.saturating_add_signed(utc_offset_s * 1000);
+/// The thread as Markdown. `offset_at` gives the local UTC offset in seconds at a Unix second,
+/// so each time is shifted by its own offset (the loop passes the real one; tests a constant).
+pub fn render(title: &str, events: &[EventLine], offset_at: impl Fn(i64) -> i64) -> String {
+    let local = |ts: u64| ts.saturating_add_signed(offset_at((ts / 1000) as i64) * 1000);
     let mut out = format!(
         "# {title} · {}\n",
         events
@@ -169,18 +169,18 @@ mod tests {
                 json!({"registry": "default: all"}),
             ),
         ];
-        insta::assert_snapshot!(render("review", &events, 0));
+        insta::assert_snapshot!(render("review", &events, |_| 0));
     }
 
     #[test]
     fn times_follow_the_offset() {
         let events = [event(0, "user", &[], Kind::Msg, json!({"text": "hi"}))];
-        assert!(render("t", &events, 7 * 3600).contains("## you · 02:41"));
-        assert!(render("t", &events, 7 * 3600).starts_with("# t · 2026-11-26"));
+        assert!(render("t", &events, |_| 7 * 3600).contains("## you · 02:41"));
+        assert!(render("t", &events, |_| 7 * 3600).starts_with("# t · 2026-11-26"));
     }
 
     #[test]
     fn an_empty_thread_has_only_its_title() {
-        assert_eq!(render("t", &[], 0), "# t · \n");
+        assert_eq!(render("t", &[], |_| 0), "# t · \n");
     }
 }

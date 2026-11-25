@@ -351,30 +351,42 @@ fn codex_limits(thread_id: &str) -> Option<crate::limits::Limits> {
     limits
 }
 
-/// Runs `find` over the end of `file`, 64 KiB, then 1 MiB, then 16 MiB, stopping at the
-/// first hit: a long session is never read whole for one recent line. The first, likely
-/// partial, line of a tail is dropped.
+/// Runs `find` over `file` from its end backwards, one 64 KiB chunk of whole lines at a
+/// time, until it finds something or reaches the start: memory stays bounded however long
+/// the session, and no sample is missed (a line longer than 16 MiB is skipped).
 fn read_tail<T>(file: &std::path::Path, find: impl Fn(&str) -> Option<T>) -> Option<T> {
+    read_back(file, 64 << 10, find)
+}
+
+fn read_back<T>(file: &std::path::Path, chunk: u64, find: impl Fn(&str) -> Option<T>) -> Option<T> {
     use std::io::{Read, Seek, SeekFrom};
+    const LONGEST_LINE: usize = 16 << 20;
     let mut f = std::fs::File::open(file).ok()?;
-    let len = f.metadata().ok()?.len();
-    for size in [64 << 10, 1 << 20, 16 << 20] {
-        let start = len.saturating_sub(size);
+    let mut end = f.metadata().ok()?.len();
+    // The start of a line cut by the previous chunk boundary, carried to the next.
+    let mut carry: Vec<u8> = Vec::new();
+    while end > 0 {
+        let start = end.saturating_sub(chunk);
         f.seek(SeekFrom::Start(start)).ok()?;
-        let mut bytes = Vec::new();
-        f.by_ref().take(size).read_to_end(&mut bytes).ok()?;
-        let text = String::from_utf8_lossy(&bytes);
-        let text = if start > 0 {
-            text.split_once('\n').map_or("", |(_, rest)| rest)
+        let mut bytes = Vec::with_capacity((end - start) as usize + carry.len());
+        f.by_ref().take(end - start).read_to_end(&mut bytes).ok()?;
+        bytes.extend_from_slice(&carry);
+        let cut = if start == 0 {
+            0
         } else {
-            &text
+            bytes
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(bytes.len(), |i| i + 1)
         };
-        if let Some(found) = find(text) {
+        if let Some(found) = find(&String::from_utf8_lossy(&bytes[cut..])) {
             return Some(found);
         }
-        if start == 0 {
-            return None;
+        carry = bytes[..cut].to_vec();
+        if carry.len() > LONGEST_LINE {
+            carry.clear();
         }
+        end = start;
     }
     None
 }
@@ -653,6 +665,30 @@ mod tests {
     }
 
     #[test]
+    fn claude_2_1_332_recorded_two_turns() {
+        for (name, reply) in [
+            ("claude-2.1.332-turn1.jsonl", "one"),
+            ("claude-2.1.332-turn2.jsonl", "two"),
+        ] {
+            let events = fixture(name);
+            assert_eq!(
+                events[0],
+                PEvent::Session("ccc6fe82-bf9b-491f-83be-ead8a82a3004".into()),
+                "{name}: same session on resume"
+            );
+            assert_eq!(text(&events).trim(), reply, "{name}");
+            assert!(
+                events.iter().any(|e| matches!(e, PEvent::Limits(_))),
+                "{name}: plan limits in the stream"
+            );
+            assert!(
+                matches!(events.last(), Some(PEvent::Usage { output, cost_usd: Some(_), .. }) if *output > 0),
+                "{name}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
     fn codex_recorded_turn() {
         let events = fixture("codex-0.171.0-turn1.jsonl");
         assert_eq!(
@@ -690,19 +726,28 @@ mod tests {
     }
 
     #[test]
-    fn the_tail_is_read_in_growing_steps() {
+    fn the_file_is_read_backwards_in_bounded_chunks() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("s.jsonl");
         let filler = "x".repeat(100) + "\n";
+        // The sample sits at the very start, far behind the end.
         std::fs::write(&file, format!("needle\n{}", filler.repeat(2_000))).unwrap();
         let seen = std::cell::RefCell::new(vec![]);
-        let found = read_tail(&file, |text| {
+        let found = read_back(&file, 4096, |text| {
             seen.borrow_mut().push(text.len());
             text.lines().any(|l| l == "needle").then_some(())
         });
         assert_eq!(found, Some(()));
         let seen = seen.into_inner();
-        assert!(seen[0] < 70_000 && seen.len() == 2, "{seen:?}");
+        assert!(seen.len() > 40, "many steps: {}", seen.len());
+        assert!(seen.iter().all(|&n| n <= 4096 + 101), "bounded: {seen:?}");
+        // Every complete line is seen exactly once.
+        let lines = std::cell::Cell::new(0);
+        read_back(&file, 4096, |text| {
+            lines.set(lines.get() + text.lines().count());
+            None::<()>
+        });
+        assert_eq!(lines.get(), 2_001);
         assert_eq!(read_tail(&file, |_| None::<()>), None);
     }
 

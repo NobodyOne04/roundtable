@@ -31,7 +31,8 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
 - Review the ADR 0005 PR (`feature/adr-0005-free-models`): its last commits (loop-wide key
   redaction in `Runtime::redact_output`, `StreamRedactor`, SSE event assembly, unknown
   usage) landed after your two reviews; the third was skipped (usage limit).
-- Record a real two-turn Codex fixture (first turn plus `exec resume`):
+- Record a real two-turn Codex fixture (first turn plus `exec resume`) for 0.172.0, the
+  installed version (your review of the fixes asked for it; Claude 2.1.332's is in):
   `tests/fixtures/codex-0.171.0-turn1.jsonl` was cut from one turn, and resume was never
   recorded. Sanitize as CLAUDE.md says, and hand it to Claude to commit.
 

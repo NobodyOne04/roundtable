@@ -87,17 +87,27 @@ pub fn from_codex_session(text: &str) -> Option<Limits> {
             ) else {
                 continue;
             };
-            // Codex leaves `rate_limit_reached_type` empty even at 100% (0.172.0), and when
-            // set it doesn't say which window: then a full window is the blocking one.
             let window = Some(Window {
                 used_percent: used,
                 resets_at: resets,
-                blocked: reached && used >= 100.0,
+                blocked: false,
             });
             match minutes {
                 300 => out.five_hour = window,
                 10080 => out.weekly = window,
                 _ => {}
+            }
+        }
+        // Codex leaves `rate_limit_reached_type` empty even at 100% (0.172.0), so a full
+        // window blocks by itself (`blocked_until`). When it is set without a full window,
+        // it doesn't say which one: every window counts as blocking until it resets.
+        let full = [out.five_hour, out.weekly]
+            .iter()
+            .flatten()
+            .any(|w| w.used_percent >= 100.0);
+        if reached && !full {
+            for w in [&mut out.five_hour, &mut out.weekly].into_iter().flatten() {
+                w.blocked = true;
             }
         }
         (out.five_hour.is_some() || out.weekly.is_some()).then_some(out)
@@ -171,15 +181,16 @@ pub fn codex_session_file(codex_home: &Path, thread_id: &str) -> Option<std::pat
     None
 }
 
-/// The `/usage` block: one row per CLI agent in `ids`. `now_ms` and `utc_offset_s` make it
+/// The `/usage` block: one row per CLI agent in `ids`. `now_ms` and `offset_at` (the local
+/// UTC offset in seconds at a given Unix second, so each time gets its own DST) make it
 /// a pure function of its inputs.
 pub fn report(
     ids: &[&str],
     limits: &BTreeMap<String, Limits>,
     now_ms: u64,
-    utc_offset_s: i64,
+    offset_at: impl Fn(i64) -> i64,
 ) -> String {
-    let local = |s: i64| (s + utc_offset_s).max(0) as u64 * 1000;
+    let local = |s: i64| (s + offset_at(s)).max(0) as u64 * 1000;
     let width = ids.iter().map(|id| id.len()).max().unwrap_or(0);
     let mut rows = vec!["limits:".to_string()];
     for id in ids {
@@ -274,8 +285,13 @@ mod tests {
         let l = from_claude(&blocked, NOW).unwrap();
         assert_eq!(blocked_until(&l, NOW), Some(1795641000));
         assert!(
-            report(&["claude"], &BTreeMap::from([("claude".into(), l)]), NOW, 0)
-                .contains("LIMITED")
+            report(
+                &["claude"],
+                &BTreeMap::from([("claude".into(), l)]),
+                NOW,
+                |_| 0
+            )
+            .contains("LIMITED")
         );
         assert_eq!(from_claude(&json!({"type":"rate_limit_event"}), NOW), None);
         let empty = json!({"rate_limit_info":{"unifiedWindows":{}}});
@@ -319,6 +335,15 @@ mod tests {
         );
         assert_eq!(l.weekly.unwrap().used_percent, 66.0);
         assert_eq!(blocked_until(&l, NOW), None);
+        let reached = json!({"timestamp":"2026-11-25T20:44:00Z","payload":{"rate_limits":{
+            "primary":{"used_percent":90.0,"window_minutes":300,"resets_at":1795641000},
+            "rate_limit_reached_type":"rate_limit"}}})
+        .to_string();
+        assert_eq!(
+            blocked_until(&from_codex_session(&reached).unwrap(), NOW),
+            Some(1795641000),
+            "reached below 100%: still limited"
+        );
         let full = line(json!({"used_percent":100.0,"window_minutes":300,"resets_at":1}));
         assert!(
             blocked_until(&from_codex_session(&full).unwrap(), 0).is_some(),
@@ -427,7 +452,7 @@ mod tests {
                 identity: None,
             },
         );
-        insta::assert_snapshot!(report(&["claude", "codex", "llama"], &limits, NOW, 0), @r"
+        insta::assert_snapshot!(report(&["claude", "codex", "llama"], &limits, NOW, |_| 0), @r"
         limits:
         claude  5h 82%  resets 22:00 · week 32%  resets Mon 09:00  (as of 20:44)
         codex   5h reset since (was 100%)  (as of 19:45)
@@ -440,7 +465,7 @@ mod tests {
             resets_at: 1_795_641_000,
             blocked: false,
         });
-        let report = report(&["codex"], &limits, NOW, 0);
+        let report = report(&["codex"], &limits, NOW, |_| 0);
         assert!(
             report.contains("5h 100%  resets 21:10  LIMITED"),
             "{report}"

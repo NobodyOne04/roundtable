@@ -193,34 +193,54 @@ fn enter_screen() -> Result<()> {
     Ok(())
 }
 
-/// Runs `/log`'s editor on `file` and waits (ADR 0024). `Err` says why it failed.
+/// While held, roundtable ignores SIGINT and SIGQUIT, as `system(3)` does: out of raw mode
+/// Ctrl-C reaches the whole foreground group, and an interrupt meant for the editor (e.g.
+/// `code --wait`) must not kill roundtable. Held from before leaving the screen until after
+/// taking it back, so no moment of the hand-over is exposed.
+struct InterruptGuard {
+    int: libc::sighandler_t,
+    quit: libc::sighandler_t,
+}
+
+impl InterruptGuard {
+    fn hold() -> Self {
+        // SAFETY: `signal` only swaps dispositions; `Drop` puts the old ones back.
+        unsafe {
+            InterruptGuard {
+                int: libc::signal(libc::SIGINT, libc::SIG_IGN),
+                quit: libc::signal(libc::SIGQUIT, libc::SIG_IGN),
+            }
+        }
+    }
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        // SAFETY: as in `hold`.
+        unsafe {
+            libc::signal(libc::SIGINT, self.int);
+            libc::signal(libc::SIGQUIT, self.quit);
+        }
+    }
+}
+
+/// Runs `/log`'s editor on `file` and waits (ADR 0024). `Err` says why it failed. Call it
+/// with an `InterruptGuard` held.
 fn run_editor(editor: &[String], file: &Path) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     let (program, args) = editor.split_first().ok_or("no editor set")?;
     let mut cmd = std::process::Command::new(program);
     cmd.args(args).arg(file);
-    // Out of raw mode, Ctrl-C reaches the whole foreground group: roundtable must not die
-    // of an interrupt meant for the editor (e.g. `code --wait`), as `system(3)` does it.
-    // SAFETY: `signal` only swaps dispositions; the old ones are put back below. In the
-    // child, between fork and exec, it is async-signal-safe.
-    let (int, quit) = unsafe {
+    // The caller ignores interrupts (`InterruptGuard`); the editor gets the defaults back.
+    // SAFETY: between fork and exec `signal` is async-signal-safe.
+    unsafe {
         cmd.pre_exec(|| {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
             libc::signal(libc::SIGQUIT, libc::SIG_DFL);
             Ok(())
         });
-        (
-            libc::signal(libc::SIGINT, libc::SIG_IGN),
-            libc::signal(libc::SIGQUIT, libc::SIG_IGN),
-        )
-    };
-    let status = cmd.status();
-    // SAFETY: as above.
-    unsafe {
-        libc::signal(libc::SIGINT, int);
-        libc::signal(libc::SIGQUIT, quit);
     }
-    match status {
+    match cmd.status() {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(format!("/log: editor `{program}` exited with {status}")),
         Err(err) => Err(format!("/log: editor `{program}`: {err}")),
@@ -230,7 +250,16 @@ fn run_editor(editor: &[String], file: &Path) -> Result<(), String> {
 /// The owner-only folder in the system temp dir that holds `/log` files of the data folder
 /// `root` (ADR 0024): one per data folder, so instances never touch each other's files.
 fn log_dir(root: &Path) -> PathBuf {
-    let id = roundtable::registry::fingerprint(&root.display().to_string());
+    use std::os::unix::ffi::OsStrExt;
+    // The raw path bytes, hex-encoded: `display()` is lossy for non-UTF-8 paths, and two
+    // data folders must never share a log folder.
+    let raw: String = root
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let id = roundtable::registry::fingerprint(&raw);
     std::env::temp_dir().join(format!("roundtable-log-{id}"))
 }
 
@@ -253,13 +282,14 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// The local time zone's offset from UTC now, in seconds.
-fn utc_offset_s() -> i64 {
+/// The local time zone's offset from UTC at Unix second `at`, in seconds: its own, so a
+/// time after a daylight-saving change is shown right.
+pub fn utc_offset_at(at: i64) -> i64 {
     // SAFETY: `localtime_r` only writes into the `tm` we pass; a null result leaves it zeroed.
     unsafe {
-        let now = libc::time(std::ptr::null_mut());
+        let at = at as libc::time_t;
         let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&now, &mut tm);
+        libc::localtime_r(&at, &mut tm);
         tm.tm_gmtoff
     }
 }
@@ -681,7 +711,7 @@ impl Runtime {
         if !events.iter().any(|e| e.kind == transcript::Kind::Msg) {
             return Ok(None);
         }
-        let text = roundtable::log::render(&thread.meta.title, &events, utc_offset_s());
+        let text = roundtable::log::render(&thread.meta.title, &events, utc_offset_at);
         let dir = log_dir(&self.data_root);
         transcript::owned_private_dir(&dir).with_context(|| format!("using {}", dir.display()))?;
         let path = dir.join(format!("{}.md", ulid::Ulid::generate()));
@@ -757,8 +787,9 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
     let mut local: VecDeque<Event> = VecDeque::new();
     local.push_back(Event::Resize(terminal.size().map_or(WIDE, |s| s.width)));
     let mut input = tokio::spawn(read_terminal(tx.clone()));
-    // `/log`'s temp file while its editor has the terminal (ADR 0024): no drawing then.
-    let mut editing: Option<PathBuf> = None;
+    // `/log`'s temp file while its editor has the terminal (ADR 0024): no drawing then. The
+    // guard keeps interrupts away from roundtable for the whole hand-over.
+    let mut editing: Option<(PathBuf, InterruptGuard)> = None;
     tokio::spawn(tick(tx.clone()));
     // Held for the whole run: dropping it stops the watch.
     let _watcher = watch_registry(&rt.models_path, tx.clone())?;
@@ -783,11 +814,13 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
         };
         let event = match event {
             Event::EditorClosed(failure) => {
-                if let Some(path) = editing.take() {
+                let guard = editing.take().map(|(path, guard)| {
                     let _ = fs::remove_file(path);
-                }
+                    guard
+                });
                 enter_screen()?;
                 terminal.clear()?;
+                drop(guard);
                 input = tokio::spawn(read_terminal(tx.clone()));
                 match failure {
                     Some(why) => Event::Notice(why),
@@ -870,6 +903,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     Err(err) => local.push_back(Event::Notice(format!("/log: {err:#}"))),
                     Ok(Some(path)) => {
                         // The editor gets the keyboard: stop reading it, then leave the screen.
+                        let guard = InterruptGuard::hold();
                         input.abort();
                         let _ = (&mut input).await;
                         leave_screen()?;
@@ -878,7 +912,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                             let failure = run_editor(&editor, &file).err();
                             let _ = tx.blocking_send(Event::EditorClosed(failure));
                         });
-                        editing = Some(path);
+                        editing = Some((path, guard));
                     }
                 },
                 Effect::Quit => {
@@ -989,7 +1023,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         &agents,
                         &app.shown_limits(),
                         now_ms(),
-                        utc_offset_s(),
+                        utc_offset_at,
                     );
                     let usage = rt.usage_report(&scope);
                     local.push_back(Event::Report(format!("{limits}\n{usage}")));
@@ -1448,14 +1482,25 @@ mod tests {
     }
 
     #[test]
+    fn log_folders_differ_for_paths_that_differ_only_in_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let a = Path::new(std::ffi::OsStr::from_bytes(b"/data/\xff"));
+        let b = Path::new(std::ffi::OsStr::from_bytes(b"/data/\xfe"));
+        assert_eq!(a.display().to_string(), b.display().to_string(), "lossy alike");
+        assert_ne!(log_dir(a), log_dir(b));
+    }
+
+    #[test]
     fn an_interrupt_meant_for_the_editor_does_not_kill_roundtable() {
         let file = Path::new("/dev/null");
         let sh = |script: &str| vec!["sh".to_string(), "-c".into(), script.into()];
-        // The "editor" interrupts roundtable (its parent): ignored while it runs.
+        // The "editor" interrupts roundtable (its parent): ignored while the guard is held.
+        let guard = InterruptGuard::hold();
         assert_eq!(run_editor(&sh("kill -INT $PPID; exit 0"), file), Ok(()));
         // The editor itself still gets the default action.
         let err = run_editor(&sh("kill -INT $$; sleep 5"), file).unwrap_err();
         assert!(err.contains("exited with"), "{err}");
+        drop(guard);
     }
 
     #[test]
