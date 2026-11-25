@@ -1,0 +1,42 @@
+# 0022. `/model add`: add a free model from the chat
+
+- Status: Proposed
+- Date: 2026-11-25
+
+Adding an OpenAI-compatible model ([0005](0005-openai-compatible-models.adr)) means
+editing `models.toml` by hand today. [0008](0008-slash-commands-and-mentions.adr) lists a
+guided `/model add` as later. This ADR decides its steps and where the key goes.
+
+## Technical details
+- **Scope**: `kind = "openai"` models only. CLI agents are fixed to `claude` and `codex`
+  ([0011](0011-hot-model-registry.adr)); adding another CLI needs code.
+- **Flow**, one question per step in the input box, `Esc` aborts with nothing written:
+  1. Provider: a short preset list plus `other`:
+     `ollama` (`http://localhost:11434/v1`, no key), `lmstudio`
+     (`http://localhost:1234/v1`, no key), `openrouter`
+     (`https://openrouter.ai/api/v1`, key), `other` (asks for the base URL).
+  2. Key, when the provider needs one: `env:VAR` or `keyring:<name>`. The key itself is
+     never typed into roundtable: for `keyring:` the chat prints the command to store it
+     (`security add-generic-password -s roundtable -a <name> -w` on macOS,
+     `secret-tool store …` on Linux). Same rule as 0005 and 0011: config holds references
+     only.
+  3. Model: roundtable calls `GET <base_url>/models` with the key and shows the list to
+     pick from (completion as in 0008); if the endpoint fails, the name is typed.
+  4. Id: suggested from the model name (`llama3-8b`), editable; must be unique.
+  5. `context_window`: taken from the `/models` answer when the provider gives it,
+     otherwise asked with 8192 suggested.
+- **Then**: the entry is appended to `models.toml` with `toml_edit`, keeping comments
+  (as `/model enable|disable|use` do), enabled; the hot registry picks it up, and
+  `/model test <id>` runs once automatically.
+- **Refused**: an id that exists, a base URL that is not `http(s)`, a non-local `http`
+  URL with a key (the key would travel in clear; `https` required).
+- Consequences: a free model takes a minute to add, without the README open. Costs: a
+  small wizard state machine in `App` and provider presets to keep current.
+
+## Technologies and alternatives
+- Involved: `toml_edit` (already used), the OpenAI-compatible `/models` endpoint
+- Alternatives:
+  - Open `models.toml` in `$EDITOR` with a filled-in template: no wizard, reuses `/log`'s
+    editor launch ([0024](0024-log-command.adr)); a good fallback, `/model add --edit`.
+  - Typing the key into roundtable and storing it in the keychain: easier, but the key
+    would pass through roundtable's input, history and possibly the terminal scrollback.

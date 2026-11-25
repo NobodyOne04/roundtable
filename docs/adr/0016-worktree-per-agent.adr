@@ -1,0 +1,68 @@
+# 0016. A git worktree per read-only agent
+
+- Status: Proposed
+- Date: 2026-11-25
+
+[0004](0004-cli-agent-adapters.adr) decided (owner, 2026-11-24) that non-writers get their
+own git worktree, so whatever escapes their read-only flags (a project hook, a detached
+process) writes there and never into the writer's files. This ADR fixes the layout, how a
+worktree is kept in step with the writer's checkout, and cleanup.
+
+## Technical details
+- **Who runs where**: the `writer` always runs in the checkout, as today: its writable
+  turns with the lock, its read-only turns (broadcasts, `ask`) with the read-only flags.
+  Moving those into a worktree would split its CLI session in two (see "stable path"
+  below), and the writer is the one agent already trusted with the checkout. Every turn of
+  every other CLI agent runs in that agent's worktree. Free models ([0005](0005-openai-compatible-models.adr))
+  have no tools and need none. Outside a git checkout there is nothing to mirror: flags
+  only, as today.
+- **Layout**: `<data_root>/worktrees/<checkout-id>/<participant-id>/`, where
+  `<checkout-id>` is the 16-hex FNV-1a of the checkout's absolute git root (the same hash
+  family as identities, [0011](0011-hot-model-registry.adr)). Outside the checkout, so the
+  writer's `git status`, file watchers and build tools never see it. Folder 0700.
+  Created with `git -C <checkout> worktree add --detach <path> HEAD`.
+- **A stable path per agent** matters: Claude Code files its sessions by working
+  directory, so `--resume` only finds a session started in the same folder. One fixed path
+  per (checkout, agent) keeps resume working. Sessions started in the checkout before this
+  ADR cannot resume in the worktree: the first read-only turn after the upgrade starts a
+  new CLI session and the chat says so once.
+- **Sync before every read-only turn** (the agent must review the writer's current,
+  uncommitted work, not just `HEAD`):
+  1. `git -C <wt> checkout --detach --force <HEAD of checkout>` and
+     `git -C <wt> clean -fd` (ignored files are left alone, so `target/` or
+     `node_modules/` built there survive);
+  2. `git -C <checkout> diff HEAD --binary` applied with `git -C <wt> apply --binary`;
+  3. untracked, not-ignored files (`git ls-files -o --exclude-standard`) copied over.
+  Done by the loop as one effect before the turn's spawn; a sync failure fails that turn
+  with the git error (fail closed: no silent fallback to the checkout). Typical cost is
+  tens of milliseconds; a large untracked tree is the slow case.
+- **Not synced**: ignored files (build output, `.env`), so an agent that needs them builds
+  in its worktree; and the worktree's changes never flow back. Read-only means the
+  results come back as text only.
+- **What the agent is told**: the turn's preamble says "you are in a read-only mirror of
+  `<checkout>` at `<wt>`; give paths relative to the repo root", so replies don't point
+  the user at worktree paths.
+- **Cleanup**: worktrees are reused across turns and runs. `/model disable <id>` keeps it
+  (history and sessions stay too, as 0011 says). Startup runs `git worktree prune` for
+  each checkout seen, and removes `<data_root>/worktrees/<checkout-id>/` whose checkout no
+  longer exists. A new `/worktrees` command lists them with sizes and
+  `/worktrees clean [id]` removes them (`git worktree remove --force`).
+- **The writer lock is unchanged** ([0012](0012-checkout-writer-lock.adr)): it guards the
+  checkout; worktrees need no lock because only their own agent uses them, one turn at a
+  time.
+- Consequences: the single-writer rule becomes a filesystem fact, not only CLI flags; it
+  is also the base for giving agents writable turns in their own worktree later
+  ([0017](0017-writer-edits-from-any-message.adr)). Costs: disk (one checkout copy per agent, plus its build
+  output), a sync step before each turn, and agents can't use ignored local files.
+
+## Technologies and alternatives
+- Involved: `git worktree` (git ≥ 2.17 for `worktree remove`), `git diff --binary`, `git apply`
+- Alternatives:
+  - Worktree inside `<git dir>/roundtable/`: hidden, but tools that walk `.git` or back it
+    up pick it up; the data folder is ours.
+  - Fresh worktree per turn: no stale files, but breaks CLI resume (new path each time) and
+    rebuilds from scratch every turn.
+  - Copy-on-write clones (APFS `clonefile`, `cp --reflink`): fast, but platform-specific
+    and not git-aware.
+  - OS sandboxing per turn (`sandbox-exec`, Landlock): rejected in 0004 as heavy and
+    platform-specific.

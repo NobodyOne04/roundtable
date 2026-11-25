@@ -1,0 +1,49 @@
+# 0019. `/fork`: branch the current thread
+
+- Status: Proposed
+- Date: 2026-11-25
+
+[0008](0008-slash-commands-and-mentions.adr) lists `/fork` ("branch the current thread
+here") as later; [0010](0010-filesystem-event-log.adr) already reserves `parent_id` and
+`fork_event` in `meta.json`. This ADR decides what a fork copies and where it can branch.
+
+## Technical details
+- **`/fork [title]`**: a new thread that starts with everything the current one has, and
+  goes its own way from here. The old thread stays as it was and can be resumed.
+- **Branch point: the end of the thread only** (v1). Both CLIs fork a session as a whole
+  (Claude `--resume <id> --fork-session`, Codex `codex exec fork <id>` /
+  `codex fork`); neither can branch at an earlier message, and the 0003 rule still holds:
+  ship only what both adapters can do natively. Forking from a selected earlier line is
+  a later extension (it would need a summary seeded into fresh sessions, see
+  [0020](0020-handoff.adr)).
+- **Refused while busy**: a fork with a reply running or queued says "wait for replies to
+  finish, or Esc", because a half-finished turn can't be in both threads.
+- **Files**:
+  - new `threads/<ulid>/meta.json`: `parent_id` = old thread id, `fork_event` = the old
+    thread's last `seq`, `title` = given or `<old title> (fork)`, same `checkout`;
+  - `events.jsonl` starts with one `status` line `forked from <id>@<seq>`; parent events
+    are not copied. Opening a fork reads the parent's events up to `fork_event` first,
+    then its own (recursively for forks of forks), using the `turn`/`parent` fields so
+    ids stay distinct per thread;
+  - `sessions.json`: each CLI session forked natively on the fork's first turn per agent
+    (lazy: no CLI call at `/fork` time). Until then the parent's session id is kept with
+    a `fork_pending` flag, so the first turn runs `--resume <id> --fork-session` (Claude)
+    or `exec fork` (Codex) instead of a plain resume. Parent and child never share a
+    native session.
+  - free models: their history is rebuilt from the events, so nothing extra.
+- **Usage**: tokens of the shared part stay counted in the parent; the fork's
+  `usage.json` starts empty.
+- **Threads pane**: a fork shows under its parent, indented (`↳ title`).
+- **Writer lock**: unchanged; forks share the checkout, so one writer at a time across
+  both ([0012](0012-checkout-writer-lock.adr)).
+- Consequences: try two directions from the same point without losing either. Costs: a
+  thread's history can now span folders, so readers (`/resume`, `/log`, history builders)
+  follow `parent_id`.
+
+## Technologies and alternatives
+- Involved: claude `--fork-session`, codex `exec fork` (0.172.0)
+- Alternatives:
+  - Copying the parent's events into the fork: self-contained folders, but doubles storage
+    and breaks "append-only, one place" for usage.
+  - Fork at any line now, CLI agents restarted with a summary: works everywhere, but the
+    agents lose their real context; better as an explicit later option.

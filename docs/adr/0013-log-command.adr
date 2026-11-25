@@ -1,0 +1,67 @@
+# 0013. `/log`: read the thread in your editor
+
+- Status: Rejected (owner, 2026-11-25): not what was agreed. The whole thread is copied as
+  Markdown to a temp file deleted when the editor closes, and the editor comes from the
+  config, not hardcoded or `$EDITOR`. Replaced by [0024](0024-log-command.adr).
+- Date: 2026-11-25
+
+Copying several lines out of the TUI picks up pane borders, side panes and wrap breaks,
+because terminal copy works on screen cells. `/log` opens the thread's text in the user's
+editor instead, from a temp file that is deleted when the editor closes.
+
+## Technical details
+- **Command** (ADR 0008 table, `commands::COMMANDS` + `App::command`):
+  - `/log`: the whole current thread. `/log <n>`: the last `n` messages.
+  - Empty thread: "nothing to log yet", no file.
+- **Source**: the thread's `events.jsonl` (ADR 0010), never the screen. Already redacted by
+  `Runtime::record`, so the file carries no key values.
+- **Format**: Markdown, `.md` suffix, lines not wrapped:
+  ```
+  # <thread title> · <date>
+
+  ## you · 19:41
+  @codex review this
+
+  ## codex · 19:42
+  <reply, verbatim>
+
+  > claude → codex (ask) · 1.2k tokens
+  > <exact prompt>
+  >
+  > <reply>
+  ```
+  - Messages verbatim; `ask` exchanges in full as quotes (the user wants to read them);
+    tool calls one line each (`[tool: edit src/app.rs]`); errors and status lines as `> !`.
+  - A pure function `log::render(&[EventLine], last: Option<usize>) -> String` in the
+    library, covered by insta snapshots.
+- **State/IO split** (ADR 0002): `App::update` returns `Effect::OpenLog { last }`; the loop
+  reads the transcript, renders, writes the file, runs the editor.
+- **Editor**: `$VISUAL`, then `$EDITOR`, then `nvim`; split with shell-words (`nvim -p` works).
+  For `nvim`/`vim`, add `-R` (read-only: yank works, edits are pointless because the file is
+  deleted). Not found / non-zero exit: error line in the chat, file deleted.
+- **How it opens**:
+  - Inside tmux (`$TMUX` set): `tmux display-popup -E -w 90% -h 90% '<editor> <path>'`,
+    spawned as a child process. Roundtable keeps running and drawing underneath; nothing
+    is suspended. The command string is shell-quoted (the data dir has a space:
+    `Application Support`).
+  - Outside tmux: suspend. Stop the terminal-input task (else it steals nvim's keys), leave
+    the alternate screen, disable raw mode, run the editor and wait, then restore and force a
+    full redraw. Streams and asks keep arriving and update `App` meanwhile; only drawing
+    pauses.
+  - One `/log` at a time: a second one while the editor is open says so.
+- **Temp file**: `<data_root>/tmp/` (0700, like `threads/`), file `<title-slug>-<ulid>.md`,
+  created `create_new`, mode 0600. Deleted when the editor process exits, whatever the exit
+  code. Startup sweeps `tmp/` for leftovers from a crash.
+- **Snapshot**: the file is the thread at the moment of `/log`; new messages aren't added.
+- **Consequences**: copy, search and reading back use the user's own editor and keys; no
+  in-TUI selection or mouse capture needed, so tmux mouse/copy mode stays as is. Costs: a
+  render format to maintain next to the TUI's, and the suspend path's terminal handoff.
+
+## Technologies and alternatives
+- Involved: tmux `display-popup` (tmux ≥ 3.2), crossterm (raw mode, alternate screen),
+  `shell-words`, ulid, insta.
+- Alternatives:
+  - `/copy [n]` to the clipboard: copies whole messages only, no partial selection.
+  - In-TUI selection with mouse capture: breaks tmux mouse selection over the pane.
+  - `/export` to a kept file: leaves transcript copies around; can come later on the same render.
+  - Live view (`tail -f` style): later; a snapshot covers copying and reading back.

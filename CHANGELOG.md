@@ -27,6 +27,8 @@
 - Transcript, sessions and logs are readable by the owner only (data folder 0700, files 0600)
 
 ### Changed
+- Proposed ADRs 0014-0024: `/usage` plan limits, vim keys, worktree per agent, writer edits from any message, approvals in the chat, `/fork`, `/handoff`, `/compact`, `/model add`, ACP adapter, `/log` (0024; the first `/log` draft, 0013, rejected)
+- ADRs 0015 (vim keys) and 0024 (`/log`) accepted
 - `default = "all"` (or `/model use all`): a message without an @mention goes to everyone, read-only like `@all`; `@<id>` still picks one, and only the writer named alone may edit
 - Speaker colours: you are cyan, Codex (the reviewer) is green
 - README matches the ADRs: roadmap in build order with progress, worktree decision, hot-registry and disable behaviour, chat-only models, requirements
