@@ -126,6 +126,16 @@ pub fn sync(
         // Deleted from outside, its registration left: git would refuse the path. Ours to
         // drop only with our record for it (never `worktree prune`).
         if let Some(stale) = owned_registration(checkout, &mirror, cancel)? {
+            let record: Option<Record> = fs::read(&record_file)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok());
+            if record.is_none_or(|r| r.mirror != mirror || r.source != checkout) {
+                return Err(format!(
+                    "a mirror at {} is registered but its record is gone: `git worktree \
+                     remove -f -f` it",
+                    mirror.display()
+                ));
+            }
             fs::remove_dir_all(&stale).map_err(|e| format!("{}: {e}", stale.display()))?;
         }
         // The record first: a crash during `worktree add` leaves a mirror `/worktrees clean`
@@ -180,10 +190,13 @@ pub fn sync(
     // now), so nothing the writer has since deleted survives; build output the agent made
     // there is not on the list and stays.
     let copied_file = dir.join(format!("{id}.copied"));
-    for name in fs::read(&copied_file)
-        .unwrap_or_default()
-        .split(|b| *b == 0)
-    {
+    // Missing means a first sync; unreadable must not, or a stale copy would outlive it.
+    let listed = match fs::read(&copied_file) {
+        Ok(listed) => listed,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+        Err(e) => return Err(format!("{}: {e}", copied_file.display())),
+    };
+    for name in listed.split(|b| *b == 0) {
         if name.is_empty() {
             continue;
         }
@@ -267,7 +280,7 @@ pub fn sync(
                 None
             };
             if source.is_some() {
-                copy_entry(&from, &mirror, name)
+                copy_entry(checkout, &mirror, name)
             } else if real_dirs_exist(&mirror, parent)? {
                 clear(&mirror.join(name))
             } else {
@@ -524,22 +537,83 @@ fn resolved(path: &Path) -> Option<PathBuf> {
 /// One untracked file into the mirror; a symlink stays a symlink. Never writes through a
 /// symlink the agent may have left (an ignored one survives `clean`): every folder on the
 /// way must be a real folder, and whatever is at the target is removed first.
-fn copy_entry(from: &Path, mirror: &Path, name: &Path) -> std::io::Result<()> {
-    let meta = fs::symlink_metadata(from)?;
+fn copy_entry(checkout: &Path, mirror: &Path, name: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let from = checkout.join(name);
+    let meta = fs::symlink_metadata(&from)?;
     real_dirs(mirror, name.parent().unwrap_or(Path::new("")))?;
     let to = mirror.join(name);
     clear(&to)?;
     let to = to.as_path();
     if meta.file_type().is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(from)?, to)
+        std::os::unix::fs::symlink(fs::read_link(&from)?, to)
     } else if meta.is_file() {
-        fs::copy(from, to).map(drop)
+        // Opened through the checkout's real folders, never a link: the writer may swap
+        // one in between the checks above and this read.
+        let mut source = open_beneath(checkout, name)?;
+        let found = source.metadata()?;
+        if !found.is_file() {
+            return Err(std::io::Error::other("changed while copying"));
+        }
+        let mut target = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(found.permissions().mode() & 0o777)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(to)?;
+        std::io::copy(&mut source, &mut target).map(drop)
     } else {
         // A nested repository shows as a folder: not mirrored, and not silently missing.
         Err(std::io::Error::other(
             "a nested repository: mirrors don't carry those yet",
         ))
     }
+}
+
+/// Opens `rel` under `root` one folder at a time, refusing a symlink anywhere on the way
+/// (`O_NOFOLLOW`), so a path swapped meanwhile can't lead outside `root`.
+fn open_beneath(root: &Path, rel: &Path) -> std::io::Result<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let open = |dir: i32, name: &OsStr, flags: i32| -> std::io::Result<OwnedFd> {
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(std::io::Error::other)?;
+        // SAFETY: a valid C string and flags; the fd returned is owned by the caller.
+        let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC) };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: a fresh descriptor nobody else owns.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+    };
+    let mut dir = open(
+        libc::AT_FDCWD,
+        root.as_os_str(),
+        libc::O_DIRECTORY | libc::O_RDONLY,
+    )?;
+    let parts: Vec<_> = rel.components().collect();
+    let Some((last, parents)) = parts.split_last() else {
+        return Err(std::io::Error::other("an empty path"));
+    };
+    let nofollow = libc::O_NOFOLLOW | libc::O_RDONLY;
+    for part in parents.iter().chain([last]) {
+        if !matches!(part, std::path::Component::Normal(_)) {
+            return Err(std::io::Error::other("a path leaving the checkout"));
+        }
+    }
+    for part in parents {
+        dir = open(
+            dir.as_raw_fd(),
+            part.as_os_str(),
+            libc::O_DIRECTORY | nofollow,
+        )?;
+    }
+    // Non-blocking: a FIFO put there must not hang the sync (it then fails as not a file).
+    let file = open(
+        dir.as_raw_fd(),
+        last.as_os_str(),
+        nofollow | libc::O_NONBLOCK,
+    )?;
+    Ok(fs::File::from(file))
 }
 
 /// Git in the owner's checkout.
@@ -1080,6 +1154,32 @@ mod tests {
         let (id, record) = list(&data, &repo).remove(0);
         assert!(remove(&id, &record).is_err());
         assert_eq!(fs::read_to_string(mirror.join("work.txt")).unwrap(), "mine");
+    }
+
+    #[test]
+    fn open_beneath_never_follows_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("real")).unwrap();
+        fs::write(root.join("real/f"), "in").unwrap();
+        fs::create_dir(root.join("outside")).unwrap();
+        fs::write(root.join("outside/f"), "out").unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join("dir")).unwrap();
+        std::os::unix::fs::symlink(root.join("outside/f"), root.join("real/g")).unwrap();
+        let mut text = String::new();
+        open_beneath(root, Path::new("real/f"))
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "in");
+        assert!(
+            open_beneath(root, Path::new("dir/f")).is_err(),
+            "a linked folder"
+        );
+        assert!(
+            open_beneath(root, Path::new("real/g")).is_err(),
+            "a linked file"
+        );
     }
 
     #[test]

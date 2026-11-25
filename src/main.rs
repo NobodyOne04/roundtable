@@ -118,7 +118,9 @@ async fn start() -> Result<()> {
         checkout,
         lock,
         writers: HashMap::new(),
-        data_root: root.clone(),
+        // Canonical: mirror paths, their records and session keys are built from it, and the
+        // same folder reached through another link must give the same ones (ADR 0016).
+        data_root: root.canonicalize().unwrap_or_else(|_| root.clone()),
         secrets: vec![],
         ask_socket: ask_socket_path(&root)?,
         ask_tokens: HashMap::new(),
