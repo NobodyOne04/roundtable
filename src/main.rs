@@ -3,12 +3,13 @@
 
 mod ui;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -29,6 +30,7 @@ use roundtable::mcp::{self, AskAnswer};
 use roundtable::openai;
 use roundtable::registry::{self, Adapter, Registry};
 use roundtable::transcript::{self, NewEvent, Store, Thread};
+use roundtable::worktree;
 use roundtable::writer_lock::{
     self, Checkout, CheckoutLock, Cleared, MarkerState, Refusal, WriterGuard,
 };
@@ -87,7 +89,9 @@ async fn start() -> Result<()> {
     let models_path = config_root()?.join("models.toml");
     // The writer lock lives in the checkout (ADR 0012); anything short of a clear git
     // checkout locks edits.
-    let (checkout, lock, edit_lock) = match writer_lock::resolve(&cwd) {
+    let resolved = writer_lock::resolve(&cwd);
+    let checkout_error = resolved.as_ref().err().cloned();
+    let (checkout, lock, edit_lock) = match resolved {
         Ok(Checkout::Git { root, lock }) => {
             let crashed = lock.crashed().map(marker_lock);
             (root, Some(lock), crashed)
@@ -95,17 +99,28 @@ async fn start() -> Result<()> {
         Ok(Checkout::Outside) => (cwd.clone(), None, Some(EditLock::OutsideGit)),
         Err(why) => (cwd.clone(), None, Some(EditLock::Unknown(why))),
     };
+    let launch_sub = cwd.canonicalize().ok().and_then(|cwd| {
+        let base = checkout.canonicalize().ok()?;
+        cwd.strip_prefix(base).ok().map(Path::to_path_buf)
+    });
     let mut runtime = Runtime {
         store,
         thread: None,
         keys: HashMap::new(),
         viewing: None,
         sessions: BTreeMap::new(),
+        turn_cwd: HashMap::new(),
+        checkout_error,
+        cleaning: HashSet::new(),
+        syncs: Arc::new(()),
+        launch_sub,
         turns: HashMap::new(),
         checkout,
         lock,
         writers: HashMap::new(),
-        data_root: root.clone(),
+        // Canonical: mirror paths, their records and session keys are built from it, and the
+        // same folder reached through another link must give the same ones (ADR 0016).
+        data_root: root.canonicalize().unwrap_or_else(|_| root.clone()),
         secrets: vec![],
         ask_socket: ask_socket_path(&root)?,
         ask_tokens: HashMap::new(),
@@ -328,8 +343,21 @@ struct Runtime {
     viewing: Option<Thread>,
     /// `App`'s `Link` keys to the `seq` they were written at, for the open thread only.
     keys: HashMap<u64, u64>,
-    /// Native sessions by `id/identity`, so a new destination never resumes an old session.
+    /// Native sessions by `id/identity/cwd`, so a new destination, or a move between the
+    /// checkout and a mirror (ADR 0016), never resumes a session made elsewhere.
     sessions: BTreeMap<String, String>,
+    /// The folder each running turn runs in, for keying the session it reports.
+    turn_cwd: HashMap<String, PathBuf>,
+    /// Why the checkout couldn't be named, if git failed: then no agent gets a mirror and
+    /// non-writer turns fail rather than run in the checkout (ADR 0016).
+    checkout_error: Option<String>,
+    /// Mirrors `/worktrees clean` is removing: their agents' turns wait for it to finish.
+    cleaning: HashSet<String>,
+    /// One clone per running mirror sync or removal: quitting waits for them (ADR 0016).
+    syncs: Arc<()>,
+    /// Where roundtable was started, relative to the checkout root, fixed at startup: the
+    /// same folder in each mirror. `None` if it can't be placed (then no mirrors).
+    launch_sub: Option<PathBuf>,
     turns: HashMap<String, CancellationToken>,
     cwd: PathBuf,
     /// The git checkout root around `cwd` (or `cwd` outside git), recorded in each thread.
@@ -403,8 +431,18 @@ impl Runtime {
         Ok(())
     }
 
+    /// Mirror syncs and removals must end before the instance lock goes, or the next
+    /// roundtable could work on the same mirror (ADR 0016); a cancelled sync ends promptly.
+    async fn mirror_work_done(&self) {
+        while Arc::strong_count(&self.syncs) > 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     fn save_session(&mut self, id: &str, identity: &str, session: String) -> Result<()> {
-        self.sessions.insert(format!("{id}/{identity}"), session);
+        let cwd = self.turn_cwd.get(id).unwrap_or(&self.cwd);
+        self.sessions
+            .insert(session_key(id, identity, cwd), session);
         if let Some(thread) = &self.thread {
             thread.save_sessions(&self.sessions)?;
         }
@@ -822,6 +860,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             },
             _ = tokio::time::sleep_until(deadline), if quit_by.is_some() => {
                 tracing::warn!(left = rt.turns.len(), "turns did not stop in time");
+                rt.mirror_work_done().await;
                 return Ok(());
             }
             }
@@ -881,6 +920,12 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             }
             // Every participant's output, any model or CLI, is cleaned of every known key
             // before the app shows or records it.
+            Event::WorktreesDone { ids, report } => {
+                for id in ids {
+                    rt.cleaning.remove(&id);
+                }
+                Event::Report(report)
+            }
             Event::Agent(id, output) => match rt.redact_output(&id, output, &mut local) {
                 Some(output) => Event::Agent(id, output),
                 None => continue,
@@ -955,6 +1000,8 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     writable,
                     permission_mode,
                     ask_tool,
+                    identity,
+                    mirror,
                 } => {
                     if writable && let Some((_, why)) = refused.iter().find(|(r, _)| *r == id) {
                         // Fail closed (ADR 0012): an editable turn never starts without its
@@ -976,20 +1023,119 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     } else {
                         None
                     };
+                    // Every CLI agent but the writer runs in its own mirror (ADR 0016),
+                    // inside git only; the sync runs in the turn's task, off this loop.
+                    let refuse = if !mirror {
+                        None
+                    } else if let Some(why) = &rt.checkout_error {
+                        Some(format!("no mirror, git can't name the checkout: {why}"))
+                    } else if rt.lock.is_none()
+                        && !matches!(writer_lock::resolve(&rt.cwd), Ok(Checkout::Outside))
+                    {
+                        // Outside git at startup, but `git init` since: no running in it.
+                        Some("this folder is in a git checkout now: restart roundtable".into())
+                    } else if rt.lock.is_some() && rt.launch_sub.is_none() {
+                        Some("no mirror: the launch folder can't be placed in the checkout".into())
+                    } else if rt.cleaning.contains(&id) {
+                        Some("its mirror is being removed (/worktrees clean); try again".into())
+                    } else {
+                        None
+                    };
+                    if let Some(why) = refuse {
+                        // Fail closed: never fall back to running in the checkout.
+                        local.push_back(Event::Agent(id.clone(), PEvent::Error(why)));
+                        local.push_back(Event::Agent(id, PEvent::Done(Outcome::Failed)));
+                        continue;
+                    }
+                    let mirror = (mirror && rt.lock.is_some()).then(|| rt.launch_sub.clone());
+                    let mirror = mirror.flatten();
+                    let cwd = match &mirror {
+                        Some(sub) => worktree::cwd(&rt.data_root, &rt.checkout, &id, sub),
+                        None => rt.cwd.clone(),
+                    };
+                    // The app's session says whether to resume at all (it drops one the CLI
+                    // lost); which one is bound to the folder.
+                    let found = rt.sessions.get(&session_key(&id, &identity, &cwd)).cloned();
+                    if session.is_some() && found.is_none() {
+                        local.push_back(Event::Notice(format!(
+                            "{id}: new session, it now runs in {}",
+                            cwd.display()
+                        )));
+                    }
+                    let session = session.and(found);
+                    let prompt = match &mirror {
+                        Some(_) => format!(
+                            "[roundtable: you are in a read-only mirror of `{}` at `{}`; give \
+                             paths relative to the repo root]\n\n{prompt}",
+                            rt.checkout.display(),
+                            worktree::cwd(&rt.data_root, &rt.checkout, &id, Path::new(""))
+                                .display()
+                        ),
+                        None => prompt,
+                    };
+                    // A relative command path (`../tools/codex`) was checked from the launch
+                    // folder; from the mirror it would name another file.
+                    let cmd =
+                        if mirror.is_some() && cmd.contains('/') && Path::new(&cmd).is_relative() {
+                            rt.cwd.join(&cmd).to_string_lossy().into_owned()
+                        } else {
+                            cmd
+                        };
+                    rt.turn_cwd.insert(id.clone(), cwd.clone());
                     let token = CancellationToken::new();
                     rt.turns.insert(id.clone(), token.clone());
                     let turn = Turn {
                         cmd,
                         prompt,
                         session,
-                        cwd: rt.cwd.clone(),
+                        cwd,
                         outside_repo: rt.outside_repo,
                         model,
                         writable,
                         permission_mode,
                         ask,
+                        mirror: mirror.is_some(),
                     };
-                    tokio::spawn(agent::run(id, kind, turn, tx.clone(), token));
+                    let tx = tx.clone();
+                    let (data, checkout) = (rt.data_root.clone(), rt.checkout.clone());
+                    // Only a mirror sync holds the quit barrier, and only while it syncs.
+                    let syncing = mirror.is_some().then(|| rt.syncs.clone());
+                    tokio::spawn(async move {
+                        if let Some(sub) = mirror {
+                            let who = id.clone();
+                            // A cancel kills the sync's git and stops its copying.
+                            let stop = Arc::new(AtomicBool::new(false));
+                            let watch = tokio::spawn({
+                                let (stop, token) = (stop.clone(), token.clone());
+                                async move {
+                                    token.cancelled().await;
+                                    stop.store(true, Ordering::Relaxed);
+                                }
+                            });
+                            let synced = tokio::task::spawn_blocking(move || {
+                                worktree::sync(&data, &checkout, &who, &sub, &stop)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()));
+                            watch.abort();
+                            drop(syncing);
+                            if token.is_cancelled() {
+                                let done = PEvent::Done(Outcome::Interrupted);
+                                let _ = tx.send(Event::Agent(id, done)).await;
+                                return;
+                            }
+                            // Fail closed: never fall back to running in the checkout.
+                            if let Err(why) = synced {
+                                let why = format!("mirror sync failed: {why}");
+                                let _ = tx.send(Event::Agent(id.clone(), PEvent::Error(why))).await;
+                                let _ = tx
+                                    .send(Event::Agent(id, PEvent::Done(Outcome::Failed)))
+                                    .await;
+                                return;
+                            }
+                        }
+                        agent::run(id, kind, turn, tx, token).await;
+                    });
                 }
                 Effect::StartChat {
                     id,
@@ -1038,6 +1184,61 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     rt.thread = None;
                     rt.viewing = None;
                     rt.sessions.clear();
+                }
+                Effect::Worktrees { clean, id } => {
+                    let found = worktree::list(&rt.data_root, &rt.checkout);
+                    let found: Vec<_> = found
+                        .into_iter()
+                        .filter(|(who, _)| id.as_ref().is_none_or(|id| id == who))
+                        .collect();
+                    let busy: Vec<String> = found
+                        .iter()
+                        .filter(|(who, _)| {
+                            clean && (rt.turns.contains_key(who) || rt.cleaning.contains(who))
+                        })
+                        .map(|(who, _)| who.clone())
+                        .collect();
+                    // Reserved on this loop before any removal starts: a turn for one of
+                    // them now fails instead of syncing into a folder being deleted.
+                    let ids: Vec<String> = found
+                        .iter()
+                        .filter(|(who, _)| clean && !busy.contains(who))
+                        .map(|(who, _)| who.clone())
+                        .collect();
+                    rt.cleaning.extend(ids.iter().cloned());
+                    let tx = tx.clone();
+                    // Removals hold the quit barrier too: the next roundtable must not
+                    // sync a mirror this one is still deleting.
+                    let removing = clean.then(|| rt.syncs.clone());
+                    // Sizes and removals walk whole trees: off the loop.
+                    tokio::task::spawn_blocking(move || {
+                        let mut lines = vec![];
+                        for (who, record) in &found {
+                            if busy.contains(who) {
+                                lines
+                                    .push(format!("{who}: kept, its turn or a removal is running"));
+                            } else if clean {
+                                lines.push(match worktree::remove(who, record) {
+                                    Ok(note) => format!("{who}: {note}"),
+                                    Err(err) => format!("{who}: {err}"),
+                                });
+                            } else {
+                                let mb = worktree::size(&record.mirror) as f64 / 1e6;
+                                lines.push(format!(
+                                    "{who}: {mb:.1} MB  {}",
+                                    record.mirror.display()
+                                ));
+                            }
+                        }
+                        if lines.is_empty() {
+                            lines.push("no mirrors for this checkout".into());
+                        }
+                        let report = lines.join("\n");
+                        // Released before sending: a quitting loop waits on it and no longer
+                        // drains the channel.
+                        drop(removing);
+                        let _ = tx.blocking_send(Event::WorktreesDone { ids, report });
+                    });
                 }
                 Effect::Usage(scope) => {
                     let agents = app.cli_agents();
@@ -1183,9 +1384,26 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             local.push_back(Event::Threads(rt.thread_rows()));
         }
         if quit_by.is_some() && rt.turns.is_empty() {
+            rt.mirror_work_done().await;
             return Ok(());
         }
     }
+}
+
+/// Native sessions are bound to the folder the CLI ran in (ADR 0016): Claude Code only
+/// resumes a session from the folder it was started in.
+fn session_key(id: &str, identity: &str, cwd: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    // Lossless: `display()` would map two non-UTF-8 folders to one key.
+    let cwd = match cwd.to_str() {
+        Some(cwd) => cwd.to_string(),
+        None => cwd
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .fold("hex:".to_string(), |s, b| format!("{s}{b:02x}")),
+    };
+    format!("{id}/{identity}/{cwd}")
 }
 
 /// Where the `ask` socket lives: the owner-only data folder, unless that path is too long
@@ -1403,6 +1621,11 @@ mod tests {
             keys: HashMap::new(),
             viewing: None,
             sessions: BTreeMap::new(),
+            turn_cwd: HashMap::new(),
+            checkout_error: None,
+            cleaning: HashSet::new(),
+            syncs: Arc::new(()),
+            launch_sub: Some(PathBuf::new()),
             turns: HashMap::new(),
             cwd: root.into(),
             checkout: root.into(),

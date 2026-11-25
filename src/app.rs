@@ -64,6 +64,11 @@ pub enum Event {
     Notice(String),
     /// An answer to a command the loop had to work out (`/usage`, `/model test`).
     Report(String),
+    /// `/worktrees` finished: the loop frees the mirrors it reserved, then shows the report.
+    WorktreesDone {
+        ids: Vec<String>,
+        report: String,
+    },
     /// The threads pane's list (newest first), from the loop.
     Threads(Vec<ThreadRow>),
     /// `/resume`: the loop opened a past thread; the app rebuilds it.
@@ -176,6 +181,10 @@ pub enum Effect {
         permission_mode: Option<String>,
         /// Give this turn the `ask` tool (ADR 0007); the loop builds the bridge.
         ask_tool: bool,
+        /// The identity the turn runs with: native sessions are keyed by it (and the folder).
+        identity: String,
+        /// Not the writer: runs in its own synced worktree, inside git (ADR 0016).
+        mirror: bool,
     },
     /// Cancel the running turn of one participant.
     CancelTurn(String),
@@ -209,6 +218,11 @@ pub enum Effect {
     Resume(Option<String>),
     /// `/usage <scope>`: the loop sums the transcript's usage files.
     Usage(String),
+    /// `/worktrees [clean [id]]` (ADR 0016): list the agents' mirrors, or remove them.
+    Worktrees {
+        clean: bool,
+        id: Option<String>,
+    },
     /// Keep the CLIs' plan limits in `limits.json` (ADR 0014), so a restart shows the last
     /// known values.
     SaveLimits(BTreeMap<String, crate::limits::Limits>),
@@ -575,7 +589,7 @@ impl App {
                 self.threads = rows;
                 vec![]
             }
-            Event::Report(text) => {
+            Event::Report(text) | Event::WorktreesDone { report: text, .. } => {
                 self.push("roundtable", text, LineKind::Info);
                 vec![]
             }
@@ -1056,6 +1070,18 @@ impl App {
                 vec![]
             }
             ["/usage"] => vec![Effect::Usage("thread".into())],
+            ["/worktrees"] => vec![Effect::Worktrees {
+                clean: false,
+                id: None,
+            }],
+            ["/worktrees", "clean"] => vec![Effect::Worktrees {
+                clean: true,
+                id: None,
+            }],
+            ["/worktrees", "clean", id] => vec![Effect::Worktrees {
+                clean: true,
+                id: Some(id.to_string()),
+            }],
             ["/usage", scope @ ("thread" | "today" | "all")] => {
                 vec![Effect::Usage(scope.to_string())]
             }
@@ -1252,7 +1278,14 @@ impl App {
         }
         // Native CLI sessions, keyed by the identity they were made with.
         for p in self.registry.participants.clone() {
-            if let Some(session) = sessions.get(&format!("{}/{}", p.id, p.identity))
+            // `id/identity/cwd` (ADR 0016), or `id/identity` from before it: the loop picks
+            // the one for the folder the turn runs in, and starts over when there is none.
+            let bare = format!("{}/{}", p.id, p.identity);
+            let any = sessions
+                .iter()
+                .find(|(k, _)| **k == bare || k.starts_with(&format!("{bare}/")))
+                .map(|(_, v)| v);
+            if let Some(session) = any
                 && let Some(seat) = self.seat_mut(&p.id)
             {
                 seat.session = Some(session.clone());
@@ -1814,6 +1847,8 @@ impl App {
                 writable,
                 permission_mode: p.permission_mode.clone(),
                 ask_tool: self.may_ask(&p.id, kind),
+                identity: p.identity.clone(),
+                mirror: self.registry.writer() != Some(p.id.as_str()),
             },
         ]
     }
@@ -3583,7 +3618,8 @@ mod tests {
         let events = past_thread(&app);
         let claude = app.registry.get("claude").unwrap().identity.clone();
         let sessions = BTreeMap::from([
-            (format!("claude/{claude}"), "S-claude".to_string()),
+            // Keyed by folder too (ADR 0016); the loop picks the one for the turn's folder.
+            (format!("claude/{claude}//repo"), "S-claude".to_string()),
             ("codex/stale-identity".to_string(), "S-old".to_string()),
         ]);
         assert!(
@@ -3614,14 +3650,20 @@ mod tests {
         let effects = type_line(&mut app, "@claude hi");
         assert!(
             effects.iter().any(
-                |e| matches!(e, Effect::StartTurn { session: Some(s), .. } if s == "S-claude")
-            )
+                |e| matches!(e, Effect::StartTurn { session: Some(s), mirror: false, .. } if s == "S-claude")
+            ),
+            "the writer runs in the checkout"
         );
         let effects = type_line(&mut app, "@codex hi");
         assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::StartTurn { session: None, .. })),
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::StartTurn {
+                    session: None,
+                    mirror: true,
+                    ..
+                }
+            )),
             "a session made for another identity is not resumed"
         );
     }

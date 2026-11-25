@@ -39,6 +39,11 @@ pub const COMMANDS: &[Command] = &[
         help: "plan limits of claude and codex (5h, week), then tokens and cost per model",
     },
     Command {
+        name: "/worktrees",
+        args: "[clean [id]]",
+        help: "the read-only agents' mirrors of this checkout, with sizes; or remove them",
+    },
+    Command {
         name: "/log",
         args: "",
         help: "open the whole thread as Markdown in the configured `editor`",

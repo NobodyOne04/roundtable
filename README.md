@@ -58,8 +58,8 @@ the reply, and the tokens it cost.
   a global off switch.
 - One writer per checkout: only the `writer` agent edits files, one turn at a time across
   all threads; everyone else is read-only and runs without your own MCP servers and hooks,
-  which could write. Each non-writer will get its own git worktree, so nothing it runs can
-  touch the writer's files (decided in ADR 0004, details in a later ADR).
+  which could write. Each non-writer runs in its own git worktree, synced with the writer's
+  uncommitted work before every turn, so what slips past its flags lands there (ADR 0016).
 - Every message, handoff and blocked call is kept as plain JSONL files, one folder per
   thread (`tail -f` it to watch live): replay, resume, usage per model. A thread is tied to
   the checkout it started in; resumed elsewhere, it is read-only.
@@ -162,7 +162,12 @@ setup and the `permission_mode` you give it (`acceptEdits` lets Claude edit with
 unset means a safe explicit default, never what your own CLI config says: Claude
 `default`, which refuses edits it can't ask about, and Codex `workspace-write`). Everyone else
 is read-only: plan mode for Claude, the read-only sandbox for Codex, both without your own
-MCP servers, hooks and plugins.
+MCP servers, hooks and plugins, and each in its own mirror of the checkout
+(`<data>/worktrees/`): synced before each of its turns (HEAD, uncommitted changes and
+untracked files; ignored files like `target/` are not copied, so it builds there itself),
+never copied back (needs git 2.35 or later). `/worktrees` lists the mirrors with their sizes, `/worktrees clean [id]`
+removes them. Not mirrored yet: a checkout with no commit, a sparse checkout, a populated
+submodule, an untracked nested repository; those turns fail and say why rather than review a partial copy.
 
 **After a crash.** Only one writer edits a checkout at a time, across every roundtable on
 it, whatever its data folder: the lock and a crash marker live in the checkout's own git
@@ -231,8 +236,9 @@ Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
 | 12 | [0014](docs/adr/0014-usage-plan-limits.adr) | `/usage` shows Claude's and Codex's 5-hour and weekly limits; 80%+ in the status line | done |
 | 13 | [0017](docs/adr/0017-writer-edits-from-any-message.adr) | The writer edits from any message; `@all?` keeps everyone read-only | done |
 | 14 | [0018](docs/adr/0018-approvals-in-the-chat.adr) | Tool approvals in the chat | next |
+| 15 | [0016](docs/adr/0016-worktree-per-agent.adr) | A git worktree per read-only agent | done |
 
-Later, each with its own ADR first: git worktree per agent, `/model add` (guided),
+Later, each with its own ADR first: `/model add` (guided),
 `/compact`, `/handoff`, `/fork`, approvals, an ACP adapter.
 
 ## License

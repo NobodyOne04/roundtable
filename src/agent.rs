@@ -107,6 +107,9 @@ pub struct Turn {
     /// the user's own CLI config says (it could be bypass). The registry refuses bypass and
     /// full-access modes.
     pub permission_mode: Option<String>,
+    /// Runs in a mirror (ADR 0016): the CLI gets none of roundtable's git repository
+    /// overrides, so its git uses the mirror's own index and objects.
+    pub mirror: bool,
 }
 
 /// What a turn needs to reach roundtable's `ask` tool: the CLI launches `exe mcp`, which
@@ -148,6 +151,11 @@ const ASK_TIMEOUT_MS: &str = "900000";
 pub fn command(kind: Kind, turn: &Turn) -> (Command, Vec<u8>) {
     let mut cmd = Command::new(&turn.cmd);
     cmd.current_dir(&turn.cwd);
+    if turn.mirror {
+        for var in crate::worktree::REPO_ENV {
+            cmd.env_remove(var);
+        }
+    }
     match kind {
         Kind::Claude => {
             cmd.args([
@@ -818,6 +826,7 @@ mod tests {
             prompt: "hi".into(),
             session: Some("S1".into()),
             cwd: ".".into(),
+            mirror: false,
             outside_repo: false,
             model: Some("m1".into()),
             writable: false,
@@ -853,6 +862,7 @@ mod tests {
             prompt: "hi".into(),
             session: None,
             cwd: ".".into(),
+            mirror: false,
             outside_repo: false,
             model: None,
             writable: true,
@@ -889,6 +899,7 @@ mod tests {
             prompt: "hi".into(),
             session: None,
             cwd: ".".into(),
+            mirror: false,
             outside_repo: false,
             model: None,
             writable: false,
