@@ -1197,7 +1197,6 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     let removing = clean.then(|| rt.syncs.clone());
                     // Sizes and removals walk whole trees: off the loop.
                     tokio::task::spawn_blocking(move || {
-                        let _removing = removing;
                         let mut lines = vec![];
                         for (who, record) in &found {
                             if busy.contains(who) {
@@ -1220,6 +1219,9 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                             lines.push("no mirrors for this checkout".into());
                         }
                         let report = lines.join("\n");
+                        // Released before sending: a quitting loop waits on it and no longer
+                        // drains the channel.
+                        drop(removing);
                         let _ = tx.blocking_send(Event::WorktreesDone { ids, report });
                     });
                 }

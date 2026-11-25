@@ -118,9 +118,18 @@ pub fn sync(
     let mirror = dir.join(id);
     let record_file = dir.join(format!("{id}.json"));
     if fs::symlink_metadata(&mirror).is_err() {
-        // Deleted from outside, its registration left: git would refuse the path. It
-        // names our own folder, so it is ours to drop (never `worktree prune`).
+        // Deleted from outside, its registration left: git would refuse the path. Ours to
+        // drop only with our record for it (never `worktree prune`).
         if let Some(stale) = registration(checkout, &mirror, cancel)? {
+            let record: Option<Record> = fs::read(&record_file)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok());
+            if record.is_none_or(|r| r.mirror != mirror || r.source != checkout) {
+                return Err(format!(
+                    "git has a worktree registered at {} that roundtable didn't record",
+                    mirror.display()
+                ));
+            }
             fs::remove_dir_all(&stale).map_err(|e| format!("{}: {e}", stale.display()))?;
         }
         // The record first: a crash during `worktree add` leaves a mirror `/worktrees clean`
@@ -160,9 +169,8 @@ pub fn sync(
     };
     in_mirror(&["checkout", "-q", "--detach", "--force", &head], None)?;
     // `reset --hard` also drops what the last sync staged (a force-added ignored file),
-    // which `checkout` keeps; ignored build output stays, so a build there survives.
+    // which `checkout` keeps.
     in_mirror(&["reset", "-q", "--hard"], None)?;
-    in_mirror(&["clean", "-fdq"], None)?;
     // Staged changes go to the mirror's index and files, unstaged ones to its files only, so
     // `git diff` and `git diff --cached` there read as they do in the checkout. The staged
     // diff is taken against the commit just checked out, not a `HEAD` that moved meanwhile.
@@ -180,6 +188,26 @@ pub fn sync(
         ]);
         git(&args, None)
     };
+    // Files the patches add may be left from the last sync's untracked copy: cleared
+    // first, or `apply` refuses them. Leaf only, after checking the folders on the way.
+    let added = git(
+        &[
+            "diff",
+            "--cached",
+            &head,
+            "--name-only",
+            "--no-relative",
+            "--diff-filter=A",
+            "-z",
+        ],
+        None,
+    )?;
+    for name in added.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+        let name = Path::new(OsStr::from_bytes(name));
+        real_dirs(&mirror, name.parent().unwrap_or(Path::new("")))
+            .and_then(|()| clear(&mirror.join(name)))
+            .map_err(|e| format!("{}: {e}", name.display()))?;
+    }
     // `--whitespace=nowarn`: a configured `apply.whitespace=fix` would change the files.
     for (patch, apply) in [
         (
@@ -195,6 +223,10 @@ pub fn sync(
             in_mirror(apply, Some(&patch))?;
         }
     }
+    // Now, with the writer's ignore rules in place (its `.gitignore` edits came with the
+    // patches): ignored build output stays, so a build there survives; `-ff` also removes a
+    // repository a turn cloned there.
+    in_mirror(&["clean", "-ffdq"], None)?;
     let untracked = git(&["ls-files", "-z", "-o", "--exclude-standard"], None)?;
     for name in untracked.split(|b| *b == 0).filter(|n| !n.is_empty()) {
         if cancel.load(Ordering::Relaxed) {
@@ -296,6 +328,15 @@ fn registration(
         }))
 }
 
+/// Removes whatever is at `path` (a link itself, never what it points to).
+fn clear(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(_) => Ok(()),
+    }
+}
+
 /// `path` with links resolved; for a path that no longer exists, its folder's.
 fn resolved(path: &Path) -> Option<PathBuf> {
     path.canonicalize()
@@ -310,11 +351,7 @@ fn copy_entry(from: &Path, mirror: &Path, name: &Path) -> std::io::Result<()> {
     let meta = fs::symlink_metadata(from)?;
     real_dirs(mirror, name.parent().unwrap_or(Path::new("")))?;
     let to = mirror.join(name);
-    match fs::symlink_metadata(&to) {
-        Ok(m) if m.is_dir() => fs::remove_dir_all(&to)?,
-        Ok(_) => fs::remove_file(&to)?,
-        Err(_) => {}
-    }
+    clear(&to)?;
     let to = to.as_path();
     if meta.file_type().is_symlink() {
         std::os::unix::fs::symlink(fs::read_link(from)?, to)
@@ -347,6 +384,8 @@ fn run_git(
     cancel: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
     let mut command = Command::new("git");
+    // Its own process group, so a cancel stops git's helpers (checkout workers) too.
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     command
         .args([
             "-c",
@@ -388,6 +427,10 @@ fn run_git(
     let stderr = read(child.stderr.take().map(|p| Box::new(p) as _));
     let status = loop {
         if cancel.load(Ordering::Relaxed) {
+            if let Ok(group) = i32::try_from(child.id()) {
+                // SAFETY: kill has no memory preconditions; a negative pid names the group.
+                unsafe { libc::kill(-group, libc::SIGKILL) };
+            }
             let _ = child.kill();
             let _ = child.wait();
             return Err("cancelled".into());
@@ -541,6 +584,20 @@ mod tests {
         assert!(
             !mirror.join("target/forced").exists(),
             "unstaged: gone again"
+        );
+        // An untracked file the last sync copied is now staged: no conflict.
+        fs::write(repo.join("staged.txt"), "s").unwrap();
+        sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
+        run(&repo, &["add", "staged.txt"]);
+        // The writer ignores `build/` without committing it: the mirror's build survives.
+        fs::write(repo.join(".gitignore"), "target/\nbuild/\n").unwrap();
+        let mirror = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
+        fs::create_dir(mirror.join("build")).unwrap();
+        fs::write(mirror.join("build/out"), "o").unwrap();
+        let mirror = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
+        assert!(
+            mirror.join("build/out").exists(),
+            "the writer's ignore rules apply"
         );
         // Something the agent left in the mirror is gone after the next sync.
         fs::write(mirror.join("stray.txt"), "x").unwrap();
