@@ -130,11 +130,19 @@ cargo build --release
 ```
 
 Type to talk to Claude; start a line with `@codex` or `@all` to address others. `Esc`
-cancels running replies.
+cancels running replies and switches to Normal mode.
+
+**Keys, vim-style** ([ADR 0015](docs/adr/0015-vim-keys.adr)). Insert mode (the input box) types;
+`Esc` goes to Normal mode, shown in the status line. Normal mode: `j`/`k` move between chat
+lines, `Enter` or `o` expands a tool or handoff line, `y` copies the selected line (OSC 52:
+needs `set-clipboard on` in tmux), `gg`/`G` top and bottom, `Ctrl-U`/`Ctrl-D` scroll, `h`/`l`
+threads and chat, `x` cancels running replies, `?` help, `q` hides the side panes and quits
+when pressed twice; `i` or `a` back to typing, `/` or `:` starts a command. In both modes:
+`PgUp`/`PgDn` scroll, `Ctrl-B`/`Ctrl-K` toggle the side panes, `Ctrl-C` twice quits.
 
 **The screen.** Threads on the left (`Ctrl-B` hides it; pick one and `Enter` to resume),
 the conversation in the middle (replies rendered as Markdown; tool calls and handoffs as
-one-liners that `Enter` expands), each participant on the right (`Ctrl-K`): state, role,
+one-liners that `Enter` or `o` expands), each participant on the right (`Ctrl-K`): state, role,
 how full its window is (`~NN%` for free models, `?` for CLI agents, which keep their own
 context) and tokens this thread. The status line shows the talk switch and the latest
 message's model-to-model turns and tokens against their limits. `Tab` completes, or moves
@@ -211,7 +219,7 @@ Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
 | 8 | [0008](docs/adr/0008-slash-commands-and-mentions.adr) | Full command set and completion | done |
 | 9 | [0009](docs/adr/0009-tui-layout.adr) | Three-pane layout | done |
 | 10 | [0024](docs/adr/0024-log-command.adr) | `/log`: the whole thread as Markdown in your configured editor | done |
-| 11 | [0015](docs/adr/0015-vim-keys.adr) | Vim keys | next |
+| 11 | [0015](docs/adr/0015-vim-keys.adr) | Vim keys: Insert and Normal modes | done |
 
 Later, each with its own ADR first: git worktree per agent, `/model add` (guided),
 `/compact`, `/handoff`, `/fork`, approvals, an ACP adapter.

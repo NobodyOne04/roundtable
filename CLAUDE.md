@@ -30,6 +30,8 @@ Rust TUI console that runs Claude Code, Codex and OpenAI-compatible models in on
 
 ## Conventions
 - A new slash command goes in `commands::COMMANDS` and in `App::command`; `/help` and completion read the table.
+- Keys (ADR 0015): the mode is the focus: `Focus::Input` is Insert, `Chat`/`Threads` are Normal (`App::normal_key`). A new Normal key goes there and in the input box hint in `ui.rs`; keys for both modes go before the mode split in `App::key`.
+- Live-testing keys in tmux: send `Escape` and the next key in separate `send-keys` calls with a pause, or the terminal reads them as one Alt key.
 - `ask` (ADR 0007): the loop gives each Claude turn that may ask a one-time token (`Runtime::ask_tokens`) and only accepts asks carrying it; `App::asked` runs the checks in the ADR's order and every ask is answered exactly once (`Effect::Answer`), refusals included. Asked turns are never writable.
 - Resolved API keys reach the loop only as `Event::KeyResolved` (`Secret` hides its value in Debug) and live in `Runtime::secrets`. All participant output is cleaned by `Runtime::redact_output` before the app sees it, and transcript writes by `Runtime::record`; never log or show a key value, only its reference. Provider text is not logged.
 - Events the loop raises itself go into its `local` queue, never `try_send` on its own channel (a full channel would drop them).

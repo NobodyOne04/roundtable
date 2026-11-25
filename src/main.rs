@@ -797,6 +797,17 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                 Effect::Redraw => {
                     terminal.draw(|frame| ui::draw(frame, &app))?;
                 }
+                Effect::Copy(text) => {
+                    use crossterm::clipboard::CopyToClipboard;
+                    // OSC 52: the terminal sets the clipboard, so it works over ssh and in tmux
+                    // (with `set-clipboard on`).
+                    if let Err(err) = crossterm::execute!(
+                        std::io::stdout(),
+                        CopyToClipboard::to_clipboard_from(text)
+                    ) {
+                        local.push_back(Event::Notice(format!("copy: {err}")));
+                    }
+                }
                 Effect::OpenLog { .. } if editing.is_some() => {
                     local.push_back(Event::Notice("/log is already open".into()));
                 }
@@ -1465,8 +1476,19 @@ mod tests {
             "codex".into(),
             PEvent::Message("Yes, `ok`.".into()),
         ));
-        // Tab to the chat, Enter expands the handoff.
-        app.update(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        // Esc to Normal mode, k up to the handoff, Enter expands it (ADR 0015).
+        app.update(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        let handoff = app
+            .lines
+            .iter()
+            .position(|l| l.kind == roundtable::app::LineKind::Handoff)
+            .unwrap();
+        while app.selected_line != Some(handoff) {
+            app.update(Event::Key(KeyEvent::new(
+                KeyCode::Char('k'),
+                KeyModifiers::NONE,
+            )));
+        }
         app.update(Event::Key(KeyEvent::new(
             KeyCode::Enter,
             KeyModifiers::NONE,

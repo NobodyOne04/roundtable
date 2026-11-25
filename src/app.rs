@@ -204,6 +204,8 @@ pub enum Effect {
     Resume(Option<String>),
     /// `/usage <scope>`: the loop sums the transcript's usage files.
     Usage(String),
+    /// `y` in Normal mode (ADR 0015): put the text on the clipboard (OSC 52, by the loop).
+    Copy(String),
     /// `/log` (ADR 0024): the loop renders the thread to a temp file and runs `editor` on it.
     OpenLog {
         editor: Vec<String>,
@@ -363,8 +365,10 @@ pub struct App {
     next_origin: u64,
     /// The latest user message's origin: the status line shows its limits.
     last_origin: u64,
-    /// First Ctrl-C arms, the second quits.
+    /// First Ctrl-C (or `q` in Normal mode) arms, the second quits.
     quit_armed: bool,
+    /// Normal mode saw `g`: a second one goes to the top (`gg`, ADR 0015).
+    pending_g: bool,
 }
 
 impl Default for App {
@@ -405,6 +409,7 @@ impl App {
             next_origin: 1,
             last_origin: 0,
             quit_armed: false,
+            pending_g: false,
         };
         app.apply_registry(registry, checks, false);
         app
@@ -543,15 +548,15 @@ impl App {
 
     fn key(&mut self, key: KeyEvent) -> Vec<Effect> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let armed = std::mem::take(&mut self.quit_armed);
         if ctrl && key.code == KeyCode::Char('c') {
-            if self.quit_armed {
+            if armed {
                 return self.quit();
             }
             self.quit_armed = true;
             self.push("roundtable", "Ctrl-C again to quit".into(), LineKind::Info);
             return vec![];
         }
-        self.quit_armed = false;
         match key.code {
             KeyCode::Char('b') if ctrl => {
                 self.show_threads = !self.show_threads;
@@ -565,11 +570,16 @@ impl App {
                 self.cycle_focus();
                 return vec![];
             }
-            KeyCode::Up | KeyCode::Down | KeyCode::Enter if self.focus != Focus::Input => {
-                return self.pane_key(key.code);
+            KeyCode::PageUp => {
+                self.scroll = self.scroll.saturating_add(10);
+                return vec![];
             }
-            // Typing always goes to the input, wherever the focus was.
-            KeyCode::Char(_) if !ctrl => self.focus = Focus::Input,
+            KeyCode::PageDown => {
+                self.scroll = self.scroll.saturating_sub(10);
+                return vec![];
+            }
+            // Normal mode (ADR 0015): the panes have the keys, nothing is typed.
+            _ if self.focus != Focus::Input => return self.normal_key(key, armed),
             _ => {}
         }
         match key.code {
@@ -592,7 +602,12 @@ impl App {
                 vec![]
             }
             KeyCode::Enter => self.submit(),
-            KeyCode::Esc => self.cancel_all(),
+            // To Normal mode; running replies are cancelled as `Esc` always did.
+            KeyCode::Esc => {
+                self.focus = Focus::Chat;
+                self.select_last();
+                self.cancel_all()
+            }
             KeyCode::Tab => {
                 if let Some(first) = self.completions().into_iter().next() {
                     let keep = self.input.rfind(' ').map_or(0, |i| i + 1);
@@ -600,14 +615,6 @@ impl App {
                     self.input.push_str(&first);
                     self.input.push(' ');
                 }
-                vec![]
-            }
-            KeyCode::PageUp => {
-                self.scroll = self.scroll.saturating_add(10);
-                vec![]
-            }
-            KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_sub(10);
                 vec![]
             }
             _ => vec![],
@@ -633,29 +640,94 @@ impl App {
             _ => Focus::Input,
         };
         if self.focus == Focus::Chat && self.selected_line.is_none() {
-            self.selected_line = self.lines.iter().rposition(ChatLine::expandable);
+            self.select_last();
         }
+    }
+
+    fn select_last(&mut self) {
+        self.selected_line = self.lines.len().checked_sub(1);
+    }
+
+    /// Normal mode (ADR 0015): vim keys over the chat and threads panes.
+    fn normal_key(&mut self, key: KeyEvent, armed: bool) -> Vec<Effect> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let pending_g = std::mem::take(&mut self.pending_g);
+        match (self.focus, key.code) {
+            (_, KeyCode::Char('i' | 'a')) => self.focus = Focus::Input,
+            (_, KeyCode::Char('/' | ':')) => {
+                self.focus = Focus::Input;
+                if self.input.is_empty() {
+                    self.input.push('/');
+                }
+            }
+            (_, KeyCode::Char('?')) => return self.command("/help"),
+            (_, KeyCode::Char('x')) => return self.cancel_all(),
+            (_, KeyCode::Char('q')) if armed => return self.quit(),
+            (_, KeyCode::Char('q')) => {
+                self.show_threads = false;
+                self.show_context = false;
+                if self.focus == Focus::Threads {
+                    self.focus = Focus::Chat;
+                }
+                self.quit_armed = true;
+                self.push("roundtable", "q again to quit".into(), LineKind::Info);
+            }
+            (_, KeyCode::Char('h')) if self.show_threads && !self.threads.is_empty() => {
+                self.focus = Focus::Threads;
+            }
+            (_, KeyCode::Char('l')) => {
+                self.focus = Focus::Chat;
+                if self.selected_line.is_none() {
+                    self.select_last();
+                }
+            }
+            // shortcut: 10 lines like PgUp/PgDn, not a measured half page; App doesn't know
+            // the pane's height. Pass it in if the jump feels wrong.
+            (_, KeyCode::Char('d')) if ctrl => self.scroll = self.scroll.saturating_sub(10),
+            (_, KeyCode::Char('u')) if ctrl => self.scroll = self.scroll.saturating_add(10),
+            (Focus::Chat, KeyCode::Char('G')) => {
+                self.scroll = 0;
+                self.select_last();
+            }
+            (Focus::Chat, KeyCode::Char('g')) if pending_g => {
+                self.scroll = u16::MAX;
+                self.selected_line = (!self.lines.is_empty()).then_some(0);
+            }
+            (Focus::Threads, KeyCode::Char('G')) => {
+                self.thread_pick = self.threads.len().saturating_sub(1);
+            }
+            (Focus::Threads, KeyCode::Char('g')) if pending_g => self.thread_pick = 0,
+            (_, KeyCode::Char('g')) => self.pending_g = true,
+            (_, KeyCode::Char('j')) => return self.pane_key(KeyCode::Down),
+            (_, KeyCode::Char('k')) if !ctrl => return self.pane_key(KeyCode::Up),
+            (_, KeyCode::Char('o')) => return self.pane_key(KeyCode::Enter),
+            (Focus::Chat, KeyCode::Char('y')) => {
+                if let Some(line) = self.selected_line.and_then(|i| self.lines.get(i)) {
+                    return vec![Effect::Copy(line.text.clone())];
+                }
+            }
+            (_, KeyCode::Up | KeyCode::Down | KeyCode::Enter) => return self.pane_key(key.code),
+            _ => {}
+        }
+        vec![]
     }
 
     /// Up/Down/Enter while the chat or the threads pane has the focus.
     fn pane_key(&mut self, code: KeyCode) -> Vec<Effect> {
         match (self.focus, code) {
             (Focus::Chat, KeyCode::Up | KeyCode::Down) => {
-                let expandable: Vec<usize> = (0..self.lines.len())
-                    .filter(|&i| self.lines[i].expandable())
-                    .collect();
-                let at = self
-                    .selected_line
-                    .and_then(|i| expandable.iter().position(|&j| j == i));
-                self.selected_line = match (code, at) {
-                    (KeyCode::Up, Some(0)) | (_, None) => expandable.last().copied(),
-                    (KeyCode::Up, Some(n)) => Some(expandable[n - 1]),
-                    (_, Some(n)) => expandable.get(n + 1).or(expandable.last()).copied(),
+                let last = self.lines.len().checked_sub(1);
+                self.selected_line = match (code, self.selected_line) {
+                    (_, None) => last,
+                    (KeyCode::Up, Some(i)) => Some(i.saturating_sub(1)),
+                    (_, Some(i)) => last.map(|l| (i + 1).min(l)),
                 };
                 vec![]
             }
             (Focus::Chat, _) => {
-                if let Some(line) = self.selected_line.and_then(|i| self.lines.get_mut(i)) {
+                if let Some(line) = self.selected_line.and_then(|i| self.lines.get_mut(i))
+                    && line.expandable()
+                {
                     line.expanded = !line.expanded;
                 }
                 vec![]
@@ -3416,22 +3488,90 @@ mod tests {
         app.update(agent("codex", PEvent::Tool("ls".into())));
         app.update(key(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.focus, Focus::Chat);
-        let picked = app.selected_line.unwrap();
         assert_eq!(
-            app.lines[picked].kind,
-            LineKind::Tool,
-            "the newest expandable line"
+            app.selected_line,
+            Some(app.lines.len() - 1),
+            "the newest line"
         );
+        // Tool lines sit above the reply being streamed.
+        app.update(key(KeyCode::Up, KeyModifiers::NONE));
+        let picked = app.selected_line.unwrap();
+        assert_eq!(app.lines[picked].kind, LineKind::Tool);
         app.update(key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.lines[picked].expanded, "Enter expands, doesn't send");
-        app.update(key(KeyCode::Up, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn vim_keys_in_normal_mode() {
+        let mut app = App::default();
+        type_line(&mut app, "@claude go");
+        app.update(agent("claude", PEvent::Tool("ls".into())));
+        let press = |app: &mut App, c: char| app.update(key(KeyCode::Char(c), KeyModifiers::NONE));
+        // Esc: Normal mode on the newest line, running replies cancelled as before.
+        let effects = app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(effects, [Effect::CancelTurns]);
+        assert_eq!(app.focus, Focus::Chat);
+        let last = app.lines.len() - 1;
+        assert_eq!(app.selected_line, Some(last));
+        // Letters are keys here, not text.
+        press(&mut app, 'k');
         assert_eq!(
-            app.lines[app.selected_line.unwrap()].kind,
-            LineKind::Handoff
+            (app.selected_line, app.input.as_str()),
+            (Some(last - 1), "")
         );
-        // Typing goes back to the input.
-        app.update(key(KeyCode::Char('x'), KeyModifiers::NONE));
-        assert_eq!((app.focus, app.input.as_str()), (Focus::Input, "x"));
+        press(&mut app, 'j');
+        assert_eq!(app.selected_line, Some(last));
+        let tool = app
+            .lines
+            .iter()
+            .position(|l| l.kind == LineKind::Tool)
+            .unwrap();
+        while app.selected_line != Some(tool) {
+            press(&mut app, 'k');
+        }
+        press(&mut app, 'o');
+        assert!(app.lines[tool].expanded, "o expands the tool line");
+        assert_eq!(
+            press(&mut app, 'y'),
+            [Effect::Copy(app.lines[tool].text.clone())]
+        );
+        press(&mut app, 'g');
+        press(&mut app, 'g');
+        assert_eq!((app.selected_line, app.scroll), (Some(0), u16::MAX));
+        press(&mut app, 'G');
+        assert_eq!((app.selected_line, app.scroll), (Some(last), 0));
+        app.update(key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.scroll, 10);
+        let effects = app.update(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(
+            (app.scroll, effects.is_empty()),
+            (0, true),
+            "Ctrl-D scrolls, never quits here"
+        );
+        // `/` and `:` start a command, `i` just types.
+        press(&mut app, ':');
+        assert_eq!((app.focus, app.input.as_str()), (Focus::Input, "/"));
+        app.update(key(KeyCode::Backspace, KeyModifiers::NONE));
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        press(&mut app, 'i');
+        press(&mut app, 'q');
+        assert_eq!(
+            (app.focus, app.input.as_str()),
+            (Focus::Input, "q"),
+            "Insert types"
+        );
+        app.update(key(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.scroll, 10, "PgUp works in Insert too");
+    }
+
+    #[test]
+    fn q_closes_the_side_panes_and_twice_quits() {
+        let mut app = App::default();
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        let q = |app: &mut App| app.update(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(q(&mut app).is_empty());
+        assert!(!app.show_threads && !app.show_context);
+        assert_eq!(q(&mut app), [Effect::Quit]);
     }
 
     #[test]

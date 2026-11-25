@@ -40,6 +40,8 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
   by the owner); before each is implemented at the latest.
 - Review the `/log` PR (`feature/adr-0024-log`), skipped (Codex paused by the owner):
   especially the terminal hand-over in `run` (input task aborted, `leave_screen`/`enter_screen`).
+- Review the vim keys PR (`feature/adr-0015-vim-keys`), skipped (Codex paused by the owner):
+  `App::normal_key`, the selection-follows-scroll in `ui::draw_chat`, OSC 52 copy.
 - Record a real two-turn Codex fixture (first turn plus `exec resume`):
   `tests/fixtures/codex-0.171.0-turn1.jsonl` was cut from one turn, and resume was never
   recorded. Sanitize as CLAUDE.md says, and hand it to Claude to commit.
