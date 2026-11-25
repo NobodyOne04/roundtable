@@ -3,7 +3,7 @@
 
 mod ui;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -88,7 +88,9 @@ async fn start() -> Result<()> {
     let models_path = config_root()?.join("models.toml");
     // The writer lock lives in the checkout (ADR 0012); anything short of a clear git
     // checkout locks edits.
-    let (checkout, lock, edit_lock) = match writer_lock::resolve(&cwd) {
+    let resolved = writer_lock::resolve(&cwd);
+    let checkout_error = resolved.as_ref().err().cloned();
+    let (checkout, lock, edit_lock) = match resolved {
         Ok(Checkout::Git { root, lock }) => {
             let crashed = lock.crashed().map(marker_lock);
             (root, Some(lock), crashed)
@@ -103,6 +105,8 @@ async fn start() -> Result<()> {
         viewing: None,
         sessions: BTreeMap::new(),
         turn_cwd: HashMap::new(),
+        checkout_error,
+        cleaning: HashSet::new(),
         turns: HashMap::new(),
         checkout,
         lock,
@@ -335,6 +339,11 @@ struct Runtime {
     sessions: BTreeMap<String, String>,
     /// The folder each running turn runs in, for keying the session it reports.
     turn_cwd: HashMap<String, PathBuf>,
+    /// Why the checkout couldn't be named, if git failed: then no agent gets a mirror and
+    /// non-writer turns fail rather than run in the checkout (ADR 0016).
+    checkout_error: Option<String>,
+    /// Mirrors `/worktrees clean` is removing: their agents' turns wait for it to finish.
+    cleaning: HashSet<String>,
     turns: HashMap<String, CancellationToken>,
     cwd: PathBuf,
     /// The git checkout root around `cwd` (or `cwd` outside git), recorded in each thread.
@@ -888,6 +897,12 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             }
             // Every participant's output, any model or CLI, is cleaned of every known key
             // before the app shows or records it.
+            Event::WorktreesDone { ids, report } => {
+                for id in ids {
+                    rt.cleaning.remove(&id);
+                }
+                Event::Report(report)
+            }
             Event::Agent(id, output) => match rt.redact_output(&id, output, &mut local) {
                 Some(output) => Event::Agent(id, output),
                 None => continue,
@@ -987,17 +1002,35 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     };
                     // Every CLI agent but the writer runs in its own mirror (ADR 0016),
                     // inside git only; the sync runs in the turn's task, off this loop.
+                    let refuse = if !mirror {
+                        None
+                    } else if let Some(why) = &rt.checkout_error {
+                        Some(format!("no mirror, git can't name the checkout: {why}"))
+                    } else if rt.cleaning.contains(&id) {
+                        Some("its mirror is being removed (/worktrees clean); try again".into())
+                    } else {
+                        None
+                    };
+                    if let Some(why) = refuse {
+                        // Fail closed: never fall back to running in the checkout.
+                        local.push_back(Event::Agent(id.clone(), PEvent::Error(why)));
+                        local.push_back(Event::Agent(id, PEvent::Done(Outcome::Failed)));
+                        continue;
+                    }
                     let mirror = (mirror && rt.lock.is_some()).then(|| {
-                        let root = worktree::checkout_dir(&rt.data_root, &rt.checkout).join(&id);
-                        let sub = rt.cwd.canonicalize().ok().and_then(|cwd| {
-                            let base = rt.checkout.canonicalize().ok()?;
-                            cwd.strip_prefix(base).ok().map(Path::to_path_buf)
-                        });
-                        (root.clone(), root.join(sub.unwrap_or_default()))
+                        rt.cwd
+                            .canonicalize()
+                            .ok()
+                            .and_then(|cwd| {
+                                let base = rt.checkout.canonicalize().ok()?;
+                                cwd.strip_prefix(base).ok().map(Path::to_path_buf)
+                            })
+                            .unwrap_or_default()
                     });
-                    let cwd = mirror
-                        .as_ref()
-                        .map_or_else(|| rt.cwd.clone(), |m| m.1.clone());
+                    let cwd = match &mirror {
+                        Some(sub) => worktree::cwd(&rt.data_root, &rt.checkout, &id, sub),
+                        None => rt.cwd.clone(),
+                    };
                     // The app's session says whether to resume at all (it drops one the CLI
                     // lost); which one is bound to the folder.
                     let found = rt.sessions.get(&session_key(&id, &identity, &cwd)).cloned();
@@ -1009,11 +1042,12 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     }
                     let session = session.and(found);
                     let prompt = match &mirror {
-                        Some((root, _)) => format!(
+                        Some(_) => format!(
                             "[roundtable: you are in a read-only mirror of `{}` at `{}`; give \
                              paths relative to the repo root]\n\n{prompt}",
                             rt.checkout.display(),
-                            root.display()
+                            worktree::cwd(&rt.data_root, &rt.checkout, &id, Path::new(""))
+                                .display()
                         ),
                         None => prompt,
                     };
@@ -1034,10 +1068,12 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     let tx = tx.clone();
                     let (data, checkout) = (rt.data_root.clone(), rt.checkout.clone());
                     tokio::spawn(async move {
-                        if mirror.is_some() {
+                        if let Some(sub) = mirror {
                             let who = id.clone();
+                            // shortcut: a cancel waits for the sync to end (git isn't killed),
+                            // then the CLI is never started; kill git if large syncs show.
                             let synced = tokio::task::spawn_blocking(move || {
-                                worktree::sync(&data, &checkout, &who)
+                                worktree::sync(&data, &checkout, &who, &sub)
                             })
                             .await
                             .unwrap_or_else(|e| Err(e.to_string()));
@@ -1048,6 +1084,11 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                                 let _ = tx
                                     .send(Event::Agent(id, PEvent::Done(Outcome::Failed)))
                                     .await;
+                                return;
+                            }
+                            if token.is_cancelled() {
+                                let done = PEvent::Done(Outcome::Interrupted);
+                                let _ = tx.send(Event::Agent(id, done)).await;
                                 return;
                             }
                         }
@@ -1110,9 +1151,19 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         .collect();
                     let busy: Vec<String> = found
                         .iter()
-                        .filter(|(who, _)| clean && rt.turns.contains_key(who))
+                        .filter(|(who, _)| {
+                            clean && (rt.turns.contains_key(who) || rt.cleaning.contains(who))
+                        })
                         .map(|(who, _)| who.clone())
                         .collect();
+                    // Reserved on this loop before any removal starts: a turn for one of
+                    // them now fails instead of syncing into a folder being deleted.
+                    let ids: Vec<String> = found
+                        .iter()
+                        .filter(|(who, _)| clean && !busy.contains(who))
+                        .map(|(who, _)| who.clone())
+                        .collect();
+                    rt.cleaning.extend(ids.iter().cloned());
                     let (tx, data, checkout) =
                         (tx.clone(), rt.data_root.clone(), rt.checkout.clone());
                     // Sizes and removals walk whole trees: off the loop.
@@ -1120,7 +1171,8 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         let mut lines = vec![];
                         for (who, record) in &found {
                             if busy.contains(who) {
-                                lines.push(format!("{who}: kept, its turn is running"));
+                                lines
+                                    .push(format!("{who}: kept, its turn or a removal is running"));
                             } else if clean {
                                 lines.push(match worktree::remove(&data, &checkout, who, record) {
                                     Ok(()) => format!("{who}: removed"),
@@ -1137,7 +1189,8 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         if lines.is_empty() {
                             lines.push("no mirrors for this checkout".into());
                         }
-                        let _ = tx.blocking_send(Event::Report(lines.join("\n")));
+                        let report = lines.join("\n");
+                        let _ = tx.blocking_send(Event::WorktreesDone { ids, report });
                     });
                 }
                 Effect::Usage(scope) => {
@@ -1511,6 +1564,8 @@ mod tests {
             viewing: None,
             sessions: BTreeMap::new(),
             turn_cwd: HashMap::new(),
+            checkout_error: None,
+            cleaning: HashSet::new(),
             turns: HashMap::new(),
             cwd: root.into(),
             checkout: root.into(),

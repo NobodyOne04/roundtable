@@ -64,6 +64,11 @@ pub enum Event {
     Notice(String),
     /// An answer to a command the loop had to work out (`/usage`, `/model test`).
     Report(String),
+    /// `/worktrees` finished: the loop frees the mirrors it reserved, then shows the report.
+    WorktreesDone {
+        ids: Vec<String>,
+        report: String,
+    },
     /// The threads pane's list (newest first), from the loop.
     Threads(Vec<ThreadRow>),
     /// `/resume`: the loop opened a past thread; the app rebuilds it.
@@ -584,7 +589,7 @@ impl App {
                 self.threads = rows;
                 vec![]
             }
-            Event::Report(text) => {
+            Event::Report(text) | Event::WorktreesDone { report: text, .. } => {
                 self.push("roundtable", text, LineKind::Info);
                 vec![]
             }

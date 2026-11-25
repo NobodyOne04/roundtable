@@ -564,7 +564,11 @@ pub fn owned_private_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     match fs::symlink_metadata(path) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            fs::DirBuilder::new().mode(0o700).create(path)?;
+            // Another task may create it first: then it is checked like any found folder.
+            match fs::DirBuilder::new().mode(0o700).create(path) {
+                Err(err) if err.kind() != io::ErrorKind::AlreadyExists => return Err(err),
+                _ => {}
+            }
         }
         Err(err) => return Err(err),
         Ok(_) => {}
