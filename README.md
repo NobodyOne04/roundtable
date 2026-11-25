@@ -166,8 +166,8 @@ MCP servers, hooks and plugins, and each in its own mirror of the checkout
 (`<data>/worktrees/`): synced before each of its turns (HEAD, uncommitted changes and
 untracked files; ignored files like `target/` are not copied, so it builds there itself),
 never copied back (needs git 2.35 or later). `/worktrees` lists the mirrors with their sizes, `/worktrees clean [id]`
-removes them. Not mirrored yet: a checkout with no commit, a populated submodule, an
-untracked nested repository; those turns fail and say why rather than review a partial copy.
+removes them. Not mirrored yet: a checkout with no commit, a sparse checkout, a populated
+submodule, an untracked nested repository; those turns fail and say why rather than review a partial copy.
 
 **After a crash.** Only one writer edits a checkout at a time, across every roundtable on
 it, whatever its data folder: the lock and a crash marker live in the checkout's own git

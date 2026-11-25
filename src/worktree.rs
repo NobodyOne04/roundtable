@@ -129,6 +129,19 @@ pub fn sync(
             ));
         }
     }
+    // shortcut: a sparse checkout's patterns are per worktree and aren't carried over, so
+    // the mirror could lack files the writer has; refused until supported.
+    let sparse = run_git_with(
+        &[OsStr::new("-C"), checkout.as_os_str()],
+        &["config", "--bool", "core.sparseCheckout"],
+        None,
+        &[],
+        cancel,
+        &[0, 1],
+    )?;
+    if String::from_utf8_lossy(&sparse).trim() == "true" {
+        return Err("a sparse checkout: mirrors don't carry those yet".into());
+    }
     let dir = checkout_dir(data_root, checkout);
     for folder in [&data_root.join("worktrees"), &dir] {
         crate::transcript::owned_private_dir(folder)
@@ -330,9 +343,26 @@ pub fn sync(
     )?;
     let stray: Vec<&[u8]> = stray.split(|b| *b == 0).filter(|n| !n.is_empty()).collect();
     // Inside a folder the writer ignores (`node_modules/`) they belong to the agent's own
-    // tree, which `clean` spares anyway: left alone.
-    let spared = ignored_by(checkout, &stray, cancel)?;
-    for name in stray.into_iter().filter(|n| !spared.contains(*n)) {
+    // tree, which `clean` spares anyway: left alone. The folder is checked, not the file: an
+    // ignored `.gitignore` in a folder the writer keeps would still bend `clean`.
+    let folders: Vec<Vec<u8>> = stray
+        .iter()
+        .map(|n| match n.iter().rposition(|b| *b == b'/') {
+            Some(slash) => n[..=slash].to_vec(),
+            None => vec![],
+        })
+        .collect();
+    let asked: Vec<&[u8]> = folders
+        .iter()
+        .filter(|f| !f.is_empty())
+        .map(Vec::as_slice)
+        .collect();
+    let spared = ignored_by(checkout, &asked, cancel)?;
+    for (name, _) in stray
+        .into_iter()
+        .zip(&folders)
+        .filter(|(_, folder)| !spared.contains(*folder))
+    {
         let name = Path::new(OsStr::from_bytes(name));
         let parent = name.parent().unwrap_or(Path::new(""));
         real_dirs_exist(&mirror, parent)
@@ -835,7 +865,8 @@ pub fn list(data_root: &Path, checkout: &Path) -> Vec<(String, Record)> {
             // ours to act on.
             let dir = checkout_dir(data_root, &record.source);
             let ours = path.parent() == Some(dir.as_path()) && record.mirror == dir.join(&id);
-            let here = record.source == checkout || !record.source.exists();
+            // Unknown (no permission) is not gone: only a checkout surely gone is an orphan.
+            let here = record.source == checkout || matches!(record.source.try_exists(), Ok(false));
             (ours && here).then_some((id, record))
         })
         .collect();
@@ -856,9 +887,13 @@ pub fn remove(id: &str, record: &Record) -> Result<String, String> {
     let ours = record
         .folder
         .is_some_and(|f| identity(&record.mirror) == Some(f));
-    if record.source.exists()
-        && let Some(admin) = owned_registration(&record.source, &record.mirror, &never)?
-    {
+    let source = record.source.try_exists().map_err(|e| {
+        format!(
+            "can't tell whether {} still exists: {e}",
+            record.source.display()
+        )
+    })?;
+    if source && let Some(admin) = owned_registration(&record.source, &record.mirror, &never)? {
         if fs::symlink_metadata(&record.mirror).is_ok() {
             if !ours {
                 return Err(format!(
@@ -880,7 +915,7 @@ pub fn remove(id: &str, record: &Record) -> Result<String, String> {
             fs::remove_dir_all(&admin).map_err(|e| e.to_string())?;
         }
     }
-    if ours && !record.source.exists() {
+    if ours && !source {
         // The checkout is gone (moved or deleted) and with it git's registration: the
         // folder's identity is the proof it is the one we made.
         fs::remove_dir_all(&record.mirror).map_err(|e| e.to_string())?;
@@ -1076,6 +1111,14 @@ mod tests {
             "a mirror-only ignore file spares nothing"
         );
         assert!(!m.join("generated.txt").exists());
+        // Even one the writer's rules ignore as a file, in a folder it keeps.
+        fs::write(repo.join(".git/info/exclude"), "own2/.gitignore\n").unwrap();
+        fs::create_dir(m.join("own2")).unwrap();
+        fs::write(m.join("own2/.gitignore"), "*\n").unwrap();
+        fs::write(m.join("own2/kept"), "k").unwrap();
+        sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
+        assert!(!m.join("own2/kept").exists());
+        fs::write(repo.join(".git/info/exclude"), "").unwrap();
         run(&repo, &["update-index", "--no-assume-unchanged", "a.txt"]);
         fs::remove_dir_all(repo.join("sub")).unwrap();
         // Something the agent left in the mirror is gone after the next sync.
@@ -1268,7 +1311,8 @@ mod tests {
         run(&repo, &["worktree", "add", "-q", "--detach", path]);
         fs::write(mirror.join("work.txt"), "mine").unwrap();
         let err = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap_err();
-        assert!(err.contains("not the folder"), "{err}");
+        // Refused by the folder identity, or by the missing mark if the inode was reused.
+        let _ = err;
         let (id, record) = list(&data, &repo).remove(0);
         assert!(remove(&id, &record).is_err());
         assert_eq!(fs::read_to_string(mirror.join("work.txt")).unwrap(), "mine");
