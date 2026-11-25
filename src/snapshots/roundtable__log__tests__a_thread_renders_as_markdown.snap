@@ -1,0 +1,34 @@
+---
+source: src/log.rs
+expression: "render(\"review\", &events, 0)"
+---
+# review · 2026-11-25
+
+## you · 19:41
+
+@claude review src/app.rs
+
+`[claude: Read src/app.rs]`
+
+> claude → codex (ask) · 19:44
+>
+> Is `submit` safe?
+>
+> Check the lock.
+
+> codex → claude · 19:45
+>
+> Yes.
+> The lock covers it.
+
+> ! codex: usage limit
+
+## claude · 19:47
+
+Looks fine:
+
+```rust
+fn submit() {}
+```
+
+## codex (failed) · 19:48

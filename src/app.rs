@@ -50,6 +50,9 @@ pub enum Event {
     /// The watcher saw `models.toml` change. The loop reads it (I/O) and turns this into
     /// `Registry`, so `update` never sees it.
     RegistryFileChanged,
+    /// `/log`'s editor exited (ADR 0024), with why it failed. The loop restores the screen
+    /// and turns a failure into `Notice`, so `update` never sees it.
+    EditorClosed(Option<String>),
     /// `models.toml` changed on disk: the new registry, or why it was not applied.
     Registry(Result<(Registry, Checks), String>),
     /// Something the loop failed to do, shown in the chat.
@@ -201,6 +204,10 @@ pub enum Effect {
     Resume(Option<String>),
     /// `/usage <scope>`: the loop sums the transcript's usage files.
     Usage(String),
+    /// `/log` (ADR 0024): the loop renders the thread to a temp file and runs `editor` on it.
+    OpenLog {
+        editor: Vec<String>,
+    },
     /// `/model test <id>`: ping it and report latency or the error.
     TestModel {
         id: String,
@@ -472,6 +479,7 @@ impl App {
             | Event::Resize
             | Event::Tick
             | Event::RegistryFileChanged
+            | Event::EditorClosed(_)
             | Event::KeyResolved { .. }
             | Event::AskIncoming { .. } => vec![],
             Event::InputClosed(reason) => {
@@ -848,6 +856,17 @@ impl App {
             ["/usage", scope @ ("thread" | "today" | "all")] => {
                 vec![Effect::Usage(scope.to_string())]
             }
+            ["/log"] if self.registry.editor.is_empty() => {
+                self.push(
+                    "roundtable",
+                    "set `editor` in models.toml, e.g. editor = \"nvim\"".into(),
+                    LineKind::Error,
+                );
+                vec![]
+            }
+            ["/log"] => vec![Effect::OpenLog {
+                editor: self.registry.editor.clone(),
+            }],
             ["/context"] => self.context(None),
             ["/context", id] => self.context(Some(id)),
             ["/model", "test", id] => {
@@ -2867,6 +2886,20 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn log_opens_the_configured_editor_or_says_how_to_set_one() {
+        let mut app = App::default();
+        assert_eq!(
+            type_line(&mut app, "/log"),
+            [Effect::OpenLog {
+                editor: vec!["nvim".into()]
+            }]
+        );
+        reload(&mut app, &DEFAULT_FILE.replace("editor = \"nvim\"\n", ""));
+        assert!(type_line(&mut app, "/log").is_empty());
+        assert!(last_text(&app).contains("set `editor` in models.toml"));
     }
 
     #[test]

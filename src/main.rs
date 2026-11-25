@@ -141,6 +141,11 @@ async fn start() -> Result<()> {
         );
     }
 
+    // A `/log` file left by a crash (ADR 0024). shortcut: a second roundtable with another
+    // data folder would lose its open log file too; scope the name if that happens.
+    for file in log_files() {
+        let _ = fs::remove_file(file);
+    }
     // Enters raw mode and the alternate screen, and installs a panic hook that restores the
     // terminal first, so a crash never leaves the user's shell broken.
     let terminal = ratatui::init();
@@ -155,6 +160,69 @@ async fn start() -> Result<()> {
     let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
+}
+
+/// Hands the terminal to another program: what `ratatui::init` and bracketed paste set up,
+/// undone.
+fn leave_screen() -> Result<()> {
+    crossterm::execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )?;
+    crossterm::terminal::disable_raw_mode()?;
+    Ok(())
+}
+
+/// Takes the terminal back after `leave_screen`.
+fn enter_screen() -> Result<()> {
+    crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        EnableBracketedPaste
+    )?;
+    Ok(())
+}
+
+/// Runs `/log`'s editor on `file` and waits (ADR 0024). `Err` says why it failed.
+fn run_editor(editor: &[String], file: &Path) -> Result<(), String> {
+    let (program, args) = editor.split_first().ok_or("no editor set")?;
+    match std::process::Command::new(program)
+        .args(args)
+        .arg(file)
+        .status()
+    {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("/log: editor `{program}` exited with {status}")),
+        Err(err) => Err(format!("/log: editor `{program}`: {err}")),
+    }
+}
+
+/// `/log` temp files: `roundtable-<ulid>.md` in the system temp folder.
+fn log_files() -> impl Iterator<Item = PathBuf> {
+    fs::read_dir(std::env::temp_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("roundtable-") && n.ends_with(".md"))
+        })
+}
+
+/// The local time zone's offset from UTC now, in seconds.
+fn utc_offset_s() -> i64 {
+    // SAFETY: `localtime_r` only writes into the `tm` we pass; a null result leaves it zeroed.
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&now, &mut tm);
+        tm.tm_gmtoff
+    }
 }
 
 /// `Ok(None)` means help was asked for.
@@ -555,6 +623,30 @@ impl Runtime {
             .collect()
     }
 
+    /// `/log` (ADR 0024): the open thread as Markdown in a new owner-only temp file;
+    /// `None` when there is no message to log yet.
+    // shortcut: a thread resumed from another checkout is not open here, so it logs as
+    // empty; keep its id for `/log` if that gets used.
+    fn write_log(&self) -> Result<Option<PathBuf>> {
+        let Some(thread) = &self.thread else {
+            return Ok(None);
+        };
+        let events = thread.events()?;
+        if !events.iter().any(|e| e.kind == transcript::Kind::Msg) {
+            return Ok(None);
+        }
+        let text = roundtable::log::render(&thread.meta.title, &events, utc_offset_s());
+        let path = std::env::temp_dir().join(format!("roundtable-{}.md", ulid::Ulid::generate()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        std::io::Write::write_all(&mut file, text.as_bytes())?;
+        Ok(Some(path))
+    }
+
     /// `/usage <scope>`: tokens and cost per model from `usage.json` (ADR 0010).
     fn usage_report(&self, scope: &str) -> String {
         let totals = match scope {
@@ -611,7 +703,9 @@ impl Runtime {
 
 async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-    tokio::spawn(read_terminal(tx.clone()));
+    let mut input = tokio::spawn(read_terminal(tx.clone()));
+    // `/log`'s temp file while its editor has the terminal (ADR 0024): no drawing then.
+    let mut editing: Option<PathBuf> = None;
     tokio::spawn(tick(tx.clone()));
     // Held for the whole run: dropping it stops the watch.
     let _watcher = watch_registry(&rt.models_path, tx.clone())?;
@@ -638,6 +732,18 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             }
         };
         let event = match event {
+            Event::EditorClosed(failure) => {
+                if let Some(path) = editing.take() {
+                    let _ = fs::remove_file(path);
+                }
+                enter_screen()?;
+                terminal.clear()?;
+                input = tokio::spawn(read_terminal(tx.clone()));
+                match failure {
+                    Some(why) => Event::Notice(why),
+                    None => Event::Resize,
+                }
+            }
             Event::RegistryFileChanged => match rt.reload_registry() {
                 Some(result) => Event::Registry(result),
                 None => continue,
@@ -687,9 +793,29 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
         let mut refused: Vec<(String, String)> = vec![];
         for effect in app.update(event) {
             match effect {
+                Effect::Redraw if editing.is_some() => {}
                 Effect::Redraw => {
                     terminal.draw(|frame| ui::draw(frame, &app))?;
                 }
+                Effect::OpenLog { .. } if editing.is_some() => {
+                    local.push_back(Event::Notice("/log is already open".into()));
+                }
+                Effect::OpenLog { editor } => match rt.write_log() {
+                    Ok(None) => local.push_back(Event::Report("nothing to log yet".into())),
+                    Err(err) => local.push_back(Event::Notice(format!("/log: {err:#}"))),
+                    Ok(Some(path)) => {
+                        // The editor gets the keyboard: stop reading it, then leave the screen.
+                        input.abort();
+                        let _ = (&mut input).await;
+                        leave_screen()?;
+                        let (tx, file) = (tx.clone(), path.clone());
+                        tokio::task::spawn_blocking(move || {
+                            let failure = run_editor(&editor, &file).err();
+                            let _ = tx.blocking_send(Event::EditorClosed(failure));
+                        });
+                        editing = Some(path);
+                    }
+                },
                 Effect::Quit => {
                     tracing::info!("quit");
                     // Let cancelled turns report `Done`, so no CLI outlives roundtable and
@@ -1153,6 +1279,35 @@ mod tests {
             models_hash: None,
             checked: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn log_writes_the_thread_to_an_owner_only_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime(dir.path());
+        assert!(rt.write_log().unwrap().is_none(), "no thread yet");
+        let mut app = App::default();
+        for code in [KeyCode::Char('h'), KeyCode::Char('i'), KeyCode::Enter] {
+            for effect in app.update(Event::Key(KeyEvent::new(code, KeyModifiers::NONE))) {
+                if let Effect::Record {
+                    event,
+                    durable,
+                    link,
+                } = effect
+                {
+                    rt.record(event, durable, link).unwrap();
+                }
+            }
+        }
+        let path = rt.write_log().unwrap().expect("a file");
+        let text = fs::read_to_string(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        fs::remove_file(&path).unwrap();
+        assert!(text.starts_with("# hi · "), "{text}");
+        assert!(text.contains("\n\nhi\n"), "{text}");
+        assert_eq!(mode, 0o600);
+        assert!(log_files().all(|f| f != path));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- `/log` (ADR 0024): the whole thread as Markdown in a temp file, opened in the `editor` set in `models.toml` (new files get `editor = "nvim"`), deleted when the editor closes
 - Three-pane layout (ADR 0009): threads (`Ctrl-B`, `Enter` resumes), context per participant (`Ctrl-K`), status line, collapsible tool and handoff lines, Markdown replies, `Tab` focus
 - `/resume` (ADR 0008, 0010): reopen a past thread with its chat, CLI sessions and model histories (only for participants still pointing where they did); threads from another checkout open read-only
 - Commands (ADR 0008): `/help`, `/clear`, `/exit`, `/status`, `/usage`, `/context`, `/model test`, `/talk show|allow|deny`, `/budget`, `/turns`; `Tab` completion for commands and `@` ids, `Alt-Enter` new lines, `PgUp`/`PgDn` scrolling, `\/` escape; per-thread `usage.json`

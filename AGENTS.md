@@ -38,6 +38,8 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
   (Codex paused by the owner): `Link` keys in `App`, resolved to `seq` in `Runtime::record`.
 - Critique the proposed ADRs 0014-0024 (0013 rejected) (`docs/proposed-adrs-0013-0023`), skipped (Codex paused
   by the owner); before each is implemented at the latest.
+- Review the `/log` PR (`feature/adr-0024-log`), skipped (Codex paused by the owner):
+  especially the terminal hand-over in `run` (input task aborted, `leave_screen`/`enter_screen`).
 - Record a real two-turn Codex fixture (first turn plus `exec resume`):
   `tests/fixtures/codex-0.171.0-turn1.jsonl` was cut from one turn, and resume was never
   recorded. Sanitize as CLAUDE.md says, and hand it to Claude to commit.
