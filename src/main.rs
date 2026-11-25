@@ -251,15 +251,20 @@ fn run_editor(editor: &[String], file: &Path) -> Result<(), String> {
 /// `root` (ADR 0024): one per data folder, so instances never touch each other's files.
 fn log_dir(root: &Path) -> PathBuf {
     use std::os::unix::ffi::OsStrExt;
-    // The raw path bytes, hex-encoded: `display()` is lossy for non-UTF-8 paths, and two
-    // data folders must never share a log folder.
-    let raw: String = root
-        .as_os_str()
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let id = roundtable::registry::fingerprint(&raw);
+    use std::os::unix::fs::MetadataExt;
+    // The data folder itself, as the instance lock sees it (device and inode), so any
+    // spelling of its path (a symlink, `XDG_DATA_HOME`) names the same log folder. A path
+    // that doesn't exist yet falls back to its raw bytes (`display()` would be lossy).
+    let key = match fs::metadata(root) {
+        Ok(meta) => format!("dev{}ino{}", meta.dev(), meta.ino()),
+        Err(_) => root
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    };
+    let id = roundtable::registry::fingerprint(&key);
     std::env::temp_dir().join(format!("roundtable-log-{id}"))
 }
 
@@ -273,7 +278,14 @@ fn log_files(root: &Path) -> impl Iterator<Item = PathBuf> {
         .flatten()
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|e| e == "md"))
+        // Only names roundtable makes, `<ULID>.md`: a copy the owner saved there stays.
+        .filter(|path| {
+            path.extension().is_some_and(|e| e == "md")
+                && path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.len() == 26 && ulid::Ulid::from_string(s).is_ok())
+        })
 }
 
 fn now_ms() -> u64 {
@@ -1639,6 +1651,16 @@ mod tests {
         assert!(text.contains("\n\nhi\n"), "{text}");
         assert_eq!(mode, 0o600);
         assert!(path.starts_with(log_dir(dir.path())));
+        // Something the owner saved beside it is never treated as a snapshot.
+        let notes = log_dir(dir.path()).join("notes.md");
+        fs::write(&notes, "mine").unwrap();
+        assert!(log_files(dir.path()).all(|f| f != notes));
+        fs::remove_file(&notes).unwrap();
+        // Another spelling of the same data folder (a symlink) names the same log folder.
+        let link = tempfile::tempdir().unwrap();
+        let alias = link.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+        assert_eq!(log_dir(&alias), log_dir(dir.path()));
         assert!(log_files(dir.path()).all(|f| f != path));
         assert!(
             log_files(Path::new("/elsewhere")).all(|f| !f.starts_with(log_dir(dir.path()))),
