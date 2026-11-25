@@ -342,18 +342,22 @@ fn draw_context(frame: &mut Frame, app: &App, area: Rect) {
             .and_then(|l| roundtable::limits::blocked_until(l, now))
             .map(|until| {
                 let local = |s: i64| roundtable::limits::local_ms(s, crate::utc_offset_at);
-                // Its own row: the pane is 28 columns inside, too narrow beside the state.
-                format!(
-                    "  limited until {}",
-                    roundtable::limits::when(local(until), local(now as i64 / 1000))
-                )
+                roundtable::limits::when(local(until), local(now as i64 / 1000))
             });
         rows.push(Line::from(vec![
             Span::styled(r.id.clone(), name),
             Span::styled(format!(" {}", r.state), state),
         ]));
-        if let Some(limited) = limited {
-            rows.push(Line::styled(limited, Style::new().fg(Color::Yellow)));
+        // Own rows: the pane is 28 columns inside. A date (a week away) doesn't fit beside
+        // the label, so it goes on the next row.
+        if let Some(when) = limited {
+            let yellow = Style::new().fg(Color::Yellow);
+            if when.len() <= 9 {
+                rows.push(Line::styled(format!("  limited until {when}"), yellow));
+            } else {
+                rows.push(Line::styled("  limited until", yellow));
+                rows.push(Line::styled(format!("    {when}"), yellow));
+            }
         }
         // A bar only when the fill is knowable (ADR 0009); `?` for CLI agents.
         let fill = match r.fill {

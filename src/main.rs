@@ -1496,6 +1496,19 @@ mod tests {
         };
         app.update(key(KeyCode::PageUp));
         assert!(up(&draw(&mut app)) > up(&before), "{before}");
+        // gg then PgDn before any redraw: the PgDn is not lost.
+        app.update(key(KeyCode::Char('g')));
+        app.update(key(KeyCode::Char('g')));
+        app.update(key(KeyCode::PageDown));
+        let top = up(&draw(&mut app));
+        assert!(top > 0, "drawn once: at the top");
+        assert_eq!(
+            up(&draw(&mut app)),
+            top - 10,
+            "the PgDn is applied once the top is known"
+        );
+        app.update(key(KeyCode::Char('G')));
+        draw(&mut app);
         // At the top after gg, PgDn comes down at once.
         app.update(key(KeyCode::Char('g')));
         app.update(key(KeyCode::Char('g')));

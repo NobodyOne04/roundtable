@@ -364,6 +364,8 @@ pub struct App {
     pub selected_line: Option<usize>,
     /// The view keeps `selected_line` in sight; paging keys turn this off so they page.
     pub follow_selection: bool,
+    /// Paging typed after `gg` and before the top offset was drawn, applied once it is.
+    pending_page: isize,
     /// The threads pane: past threads, newest first, and the picked one.
     pub threads: Vec<ThreadRow>,
     pub thread_pick: usize,
@@ -420,6 +422,7 @@ impl App {
             selected_line: None,
             width: WIDE,
             follow_selection: true,
+            pending_page: 0,
             threads: vec![],
             thread_pick: 0,
             show_threads: true,
@@ -496,7 +499,10 @@ impl App {
         }
         // Where the chat was actually shown: paging starts from there. Not a change to draw.
         if let Event::Viewport(shown) = event {
-            self.scroll = shown;
+            self.scroll = shown.saturating_add_signed(std::mem::take(&mut self.pending_page));
+            if self.scroll != shown {
+                self.dirty = true;
+            }
             return vec![];
         }
         self.dirty = true;
@@ -708,9 +714,14 @@ impl App {
         self.follow_selection = true;
     }
 
-    /// Scrolls `lines` up (positive) or down; the view stops following the selection.
+    /// Scrolls `lines` up (positive) or down; the view stops following the selection. After
+    /// `gg` the real top offset is only known once drawn: paging waits for it.
     fn page(&mut self, lines: i32) {
-        self.scroll = self.scroll.saturating_add_signed(lines as isize);
+        if self.scroll == usize::MAX {
+            self.pending_page += lines as isize;
+        } else {
+            self.scroll = self.scroll.saturating_add_signed(lines as isize);
+        }
         self.follow_selection = false;
     }
 
