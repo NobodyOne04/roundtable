@@ -42,6 +42,9 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
   especially the terminal hand-over in `run` (input task aborted, `leave_screen`/`enter_screen`).
 - Review the vim keys PR (`feature/adr-0015-vim-keys`), skipped (Codex paused by the owner):
   `App::normal_key`, the selection-follows-scroll in `ui::draw_chat`, OSC 52 copy.
+- Review the plan limits PR (`feature/adr-0014-usage-limits`), skipped (Codex paused by the
+  owner); also confirm `~/.codex/sessions` rollout `token_count.rate_limits` is the right source
+  and whether `exec --json` will ever carry limits.
 - Record a real two-turn Codex fixture (first turn plus `exec resume`):
   `tests/fixtures/codex-0.171.0-turn1.jsonl` was cut from one turn, and resume was never
   recorded. Sanitize as CLAUDE.md says, and hand it to Claude to commit.

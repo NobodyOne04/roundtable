@@ -62,6 +62,9 @@ pub enum PEvent {
         estimated: bool,
     },
     Error(String),
+    /// The CLI's plan limits (ADR 0014): Claude reports them in its stream, Codex in its
+    /// session file, read when the turn ends.
+    Limits(crate::limits::Limits),
     /// Always the last event of a turn, sent after the process and its group are gone.
     Done(Outcome),
 }
@@ -274,6 +277,9 @@ fn parse_claude(v: &Value) -> Vec<PEvent> {
                 PEvent::Tool(format!("{name} {}", truncate(&input, 80)))
             })
             .collect(),
+        (Some("rate_limit_event"), _) => crate::limits::from_claude(v, now_ms())
+            .map(|l| vec![PEvent::Limits(l)])
+            .unwrap_or_default(),
         (Some("result"), _) => {
             let mut out = vec![PEvent::Usage {
                 input: u64_at(v, &["usage", "input_tokens"])
@@ -323,6 +329,27 @@ fn parse_codex(v: &Value) -> Vec<PEvent> {
         )],
         _ => vec![],
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Codex's limits for `thread_id` from its own session file (ADR 0014), or `None` when the
+/// file or its shape is not what 0.172 writes: never an error.
+fn codex_limits(thread_id: &str) -> Option<crate::limits::Limits> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?;
+    let file = crate::limits::codex_session_file(&home, thread_id)?;
+    let text = std::fs::read_to_string(&file).ok()?;
+    let limits = crate::limits::from_codex_session(&text, now_ms());
+    if limits.is_none() {
+        tracing::debug!(file = %file.display(), "no Codex limits in the session file");
+    }
+    limits
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -407,12 +434,16 @@ pub async fn run_command(
     let stderr_task = tokio::spawn(stderr_tail(stderr));
     let mut lines = BufReader::new(child.stdout.take().expect("stdout is piped")).lines();
 
+    let mut session: Option<String> = None;
     let mut outcome = loop {
         tokio::select! {
             _ = cancel.cancelled() => break Outcome::Interrupted,
             line = lines.next_line() => match line {
                 Ok(Some(line)) => {
                     for event in parse(kind, &line) {
+                        if let PEvent::Session(thread) = &event {
+                            session = Some(thread.clone());
+                        }
                         emit(event).await;
                     }
                 }
@@ -461,6 +492,14 @@ pub async fn run_command(
         if !tail.is_empty() {
             emit(PEvent::Error(tail)).await;
         }
+    }
+    // Codex writes its limits to its own session file, done by now (ADR 0014); a failed
+    // turn (e.g. the usage limit itself) still updated them.
+    if kind == Kind::Codex
+        && let Some(thread) = session
+        && let Ok(Some(limits)) = tokio::task::spawn_blocking(move || codex_limits(&thread)).await
+    {
+        emit(PEvent::Limits(limits)).await;
     }
     emit(PEvent::Done(outcome)).await;
 }
@@ -610,6 +649,17 @@ mod tests {
                 estimated: false
             })
         );
+    }
+
+    #[test]
+    fn claude_rate_limit_events_become_limits() {
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.5,"resetsAt":1795620000,"status":"allowed"}}}}"#;
+        let [PEvent::Limits(l)] = &parse(Kind::Claude, line)[..] else {
+            panic!("{:?}", parse(Kind::Claude, line))
+        };
+        assert_eq!(l.five_hour.unwrap().resets_at, 1795620000);
+        // The recorded fixtures carry the event without data: nothing comes of it.
+        assert!(parse(Kind::Claude, r#"{"type":"rate_limit_event"}"#).is_empty());
     }
 
     #[test]

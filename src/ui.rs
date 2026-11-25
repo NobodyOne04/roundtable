@@ -113,6 +113,19 @@ pub fn draw(frame: &mut Frame, app: &App) {
             format!("· {}", app.status_line()),
             Style::new().add_modifier(Modifier::DIM),
         ),
+        // Plan windows at 80% or more (ADR 0014); the clock is read here, not in `App`.
+        Span::styled(
+            roundtable::limits::warnings(
+                &app.limits,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64),
+            )
+            .iter()
+            .map(|w| format!(" · {w}"))
+            .collect::<String>(),
+            Style::new().fg(Color::Yellow),
+        ),
     ]));
     frame.render_widget(status, status_area);
     if app.focus == Focus::Input {

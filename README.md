@@ -132,6 +132,11 @@ cargo build --release
 Type to talk to Claude; start a line with `@codex` or `@all` to address others. `Esc`
 cancels running replies and switches to Normal mode.
 
+`/usage` starts with each CLI's plan limits, as Claude's `/usage` and Codex's `/status`
+show them: how much of the 5-hour and weekly window is used and when it resets, from
+Claude's stream and Codex's own session files (`~/.codex/sessions`, or `$CODEX_HOME`).
+A window at 80% or more also shows in the status line.
+
 **Keys, vim-style** ([ADR 0015](docs/adr/0015-vim-keys.adr)). Insert mode (the input box) types;
 `Esc` goes to Normal mode, shown in the status line. Normal mode: `j`/`k` move between chat
 lines, `Enter` or `o` expands a tool or handoff line, `y` copies the selected line (OSC 52:
@@ -220,6 +225,7 @@ Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
 | 9 | [0009](docs/adr/0009-tui-layout.adr) | Three-pane layout | done |
 | 10 | [0024](docs/adr/0024-log-command.adr) | `/log`: the whole thread as Markdown in your configured editor | done |
 | 11 | [0015](docs/adr/0015-vim-keys.adr) | Vim keys: Insert and Normal modes | done |
+| 12 | [0014](docs/adr/0014-usage-plan-limits.adr) | `/usage` shows Claude's and Codex's 5-hour and weekly limits; 80%+ in the status line | done |
 
 Later, each with its own ADR first: git worktree per agent, `/model add` (guided),
 `/compact`, `/handoff`, `/fork`, approvals, an ACP adapter.

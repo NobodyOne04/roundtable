@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod app;
 pub mod commands;
+pub mod limits;
 pub mod log;
 pub mod mcp;
 pub mod openai;

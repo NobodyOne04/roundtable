@@ -204,6 +204,9 @@ pub enum Effect {
     Resume(Option<String>),
     /// `/usage <scope>`: the loop sums the transcript's usage files.
     Usage(String),
+    /// Keep the CLIs' plan limits in `limits.json` (ADR 0014), so a restart shows the last
+    /// known values.
+    SaveLimits(BTreeMap<String, crate::limits::Limits>),
     /// `y` in Normal mode (ADR 0015): put the text on the clipboard (OSC 52, by the loop).
     Copy(String),
     /// `/log` (ADR 0024): the loop renders the thread to a temp file and runs `editor` on it.
@@ -367,6 +370,8 @@ pub struct App {
     last_origin: u64,
     /// First Ctrl-C (or `q` in Normal mode) arms, the second quits.
     quit_armed: bool,
+    /// Each CLI agent's plan limits as last reported (ADR 0014), by participant id.
+    pub limits: BTreeMap<String, crate::limits::Limits>,
     /// Normal mode saw `g`: a second one goes to the top (`gg`, ADR 0015).
     pending_g: bool,
 }
@@ -410,6 +415,7 @@ impl App {
             last_origin: 0,
             quit_armed: false,
             pending_g: false,
+            limits: BTreeMap::new(),
         };
         app.apply_registry(registry, checks, false);
         app
@@ -795,6 +801,16 @@ impl App {
                     tokens: seat.thread_tokens,
                 })
             })
+            .collect()
+    }
+
+    /// Enabled CLI agents, whose plan limits `/usage` shows (ADR 0014).
+    pub fn cli_agents(&self) -> Vec<String> {
+        self.registry
+            .participants
+            .iter()
+            .filter(|p| p.enabled && matches!(p.adapter, crate::registry::Adapter::Cli(_)))
+            .map(|p| p.id.clone())
             .collect()
     }
 
@@ -1780,6 +1796,10 @@ impl App {
             } => {
                 seat.usage = Some((input, output, cost_usd, estimated));
                 vec![]
+            }
+            PEvent::Limits(limits) => {
+                self.limits.insert(id.to_string(), limits);
+                vec![Effect::SaveLimits(self.limits.clone())]
             }
             PEvent::Error(text) => {
                 self.push(id, text.clone(), LineKind::Error);
@@ -3499,6 +3519,24 @@ mod tests {
         assert_eq!(app.lines[picked].kind, LineKind::Tool);
         app.update(key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.lines[picked].expanded, "Enter expands, doesn't send");
+    }
+
+    #[test]
+    fn reported_limits_are_kept_and_saved() {
+        let mut app = App::default();
+        let limits = crate::limits::Limits {
+            five_hour: None,
+            weekly: Some(crate::limits::Window {
+                used_percent: 66.0,
+                resets_at: 1,
+            }),
+            limited: false,
+            seen_at: 5,
+        };
+        let effects = app.update(agent("codex", PEvent::Limits(limits)));
+        assert_eq!(app.limits["codex"], limits);
+        assert_eq!(effects, [Effect::SaveLimits(app.limits.clone())]);
+        assert_eq!(app.cli_agents(), ["claude", "codex"]);
     }
 
     #[test]
