@@ -1,0 +1,20 @@
+---
+source: src/main.rs
+expression: screen
+---
+"┌ roundtable ──────────────────────────────────────────────┐"
+"│Nothing at the table yet. Type to Claude, start with      │"
+"│@codex or @all, or /help.                                 │"
+"│                                                          │"
+"└──────────────────────────────────────────────────────────┘"
+"┌──────────────────────────────────────────────────────────┐"
+"│line 5                                                    │"
+"│line 6                                                    │"
+"│line 7                                                    │"
+"│line 8                                                    │"
+"│line 9                                                    │"
+"│line 10                                                   │"
+"│line 11                                                   │"
+"│line 12                                                   │"
+"└ Enter send · Alt-Enter new line · Tab panes · /help · Esc┘"
+" talk:on · 0/6 turns · 0/50000 tokens                       "

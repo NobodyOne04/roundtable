@@ -12,7 +12,8 @@ pub const DEFAULT_FILE: &str = r#"# roundtable model registry (ADR 0011).
 # Edits apply live while roundtable runs. A file with an error is not applied at all:
 # the chat shows the error and the previous registry stays in use.
 
-# Who gets a message without an @mention.
+# Who gets a message without an @mention; "all" sends to everyone (read-only, so nobody
+# edits: address the writer alone, @claude, to let it edit).
 default = "claude"
 # The only participant that may edit files; remove the line and everyone is read-only.
 writer = "claude"
@@ -222,8 +223,12 @@ impl Registry {
     }
 
     /// Who gets a message without an `@mention`: `None` when unset, unknown or disabled.
+    /// `"all"` means every enabled participant (a broadcast, so read-only).
     pub fn default(&self) -> Option<&str> {
         let id = self.default.as_deref()?;
+        if id == "all" {
+            return self.participants.iter().any(|p| p.enabled).then_some("all");
+        }
         self.get(id).filter(|p| p.enabled).map(|p| p.id.as_str())
     }
 
@@ -458,6 +463,19 @@ mod tests {
         assert_eq!(reg.default(), Some("claude"));
         assert_eq!(reg.writer(), Some("claude"));
         assert!(reg.warnings.is_empty());
+    }
+
+    #[test]
+    fn the_default_may_be_everyone() {
+        let reg =
+            Registry::parse(&DEFAULT_FILE.replace("default = \"claude\"", "default = \"all\""))
+                .unwrap();
+        assert_eq!(reg.default(), Some("all"));
+        assert!(reg.warnings.is_empty());
+        let none = DEFAULT_FILE
+            .replace("default = \"claude\"", "default = \"all\"")
+            .replace("enabled = true", "enabled = false");
+        assert_eq!(Registry::parse(&none).unwrap().default(), None);
     }
 
     fn entry(extra: &str) -> String {

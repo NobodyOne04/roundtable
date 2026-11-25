@@ -1,0 +1,16 @@
+---
+source: src/main.rs
+expression: screen
+---
+"┌ roundtable ──────────────────────────────────────────────┐"
+"│Nothing at the table yet. Type to Claude, start with      │"
+"│@codex or @all, or /help.                                 │"
+"│                                                          │"
+"│                                                          │"
+"│                                                          │"
+"└──────────────────────────────────────────────────────────┘"
+"┌──────────────────────────────────────────────────────────┐"
+"│> please review the writer lock and tell me whether a cras│"
+"│h mid-turn leaves the marker behind                       │"
+"└ Enter send · Alt-Enter new line · Tab panes · /help · Esc┘"
+" talk:on · 0/6 turns · 0/50000 tokens                       "
