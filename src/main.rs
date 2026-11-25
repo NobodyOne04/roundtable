@@ -1164,8 +1164,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         .map(|(who, _)| who.clone())
                         .collect();
                     rt.cleaning.extend(ids.iter().cloned());
-                    let (tx, data, checkout) =
-                        (tx.clone(), rt.data_root.clone(), rt.checkout.clone());
+                    let tx = tx.clone();
                     // Sizes and removals walk whole trees: off the loop.
                     tokio::task::spawn_blocking(move || {
                         let mut lines = vec![];
@@ -1174,7 +1173,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                                 lines
                                     .push(format!("{who}: kept, its turn or a removal is running"));
                             } else if clean {
-                                lines.push(match worktree::remove(&data, &checkout, who, record) {
+                                lines.push(match worktree::remove(who, record) {
                                     Ok(()) => format!("{who}: removed"),
                                     Err(err) => format!("{who}: {err}"),
                                 });

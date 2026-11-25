@@ -87,7 +87,17 @@ pub fn sync(data_root: &Path, checkout: &Path, id: &str, sub: &Path) -> Result<P
         crate::transcript::write_atomic(&record_file, &bytes).map_err(|e| e.to_string())?;
     }
     let admin = verify(&mirror, &record_file, checkout)?;
-    let in_mirror = |args: &[&str], input| {
+    // The CLI runs plain git in the mirror: its pointer must name this registration, whatever
+    // the last turn wrote there.
+    let pointer = mirror.join(".git");
+    match fs::symlink_metadata(&pointer) {
+        Ok(m) if m.is_dir() => fs::remove_dir_all(&pointer),
+        Ok(_) => fs::remove_file(&pointer),
+        Err(_) => Ok(()),
+    }
+    .and_then(|()| fs::write(&pointer, format!("gitdir: {}\n", admin.display())))
+    .map_err(|e| format!("{}: {e}", pointer.display()))?;
+    let in_mirror = |args: &[&str], input: Option<&[u8]>| {
         let base = [
             OsStr::new("--git-dir"),
             admin.as_os_str(),
@@ -103,11 +113,13 @@ pub fn sync(data_root: &Path, checkout: &Path, id: &str, sub: &Path) -> Result<P
     // which `checkout` keeps; ignored build output stays, so a build there survives.
     in_mirror(&["reset", "-q", "--hard"], None)?;
     in_mirror(&["clean", "-fdq"], None)?;
-    let diff = git(
-        checkout,
-        &[
-            "diff",
-            "HEAD",
+    // Staged changes go to the mirror's index and files, unstaged ones to its files only, so
+    // `git diff` and `git diff --cached` there read as they do in the checkout. The staged
+    // diff is taken against the commit just checked out, not a `HEAD` that moved meanwhile.
+    let diff = |extra: &[&str]| {
+        let mut args = vec!["diff"];
+        args.extend_from_slice(extra);
+        args.extend([
             "--binary",
             "--no-color",
             "--no-ext-diff",
@@ -115,11 +127,19 @@ pub fn sync(data_root: &Path, checkout: &Path, id: &str, sub: &Path) -> Result<P
             "--no-relative",
             "--src-prefix=a/",
             "--dst-prefix=b/",
-        ],
-        None,
-    )?;
-    if !diff.is_empty() {
-        in_mirror(&["apply", "--binary", "--index"], Some(&diff))?;
+        ]);
+        git(checkout, &args, None)
+    };
+    for (patch, apply) in [
+        (
+            diff(&["--cached", &head])?,
+            &["apply", "--binary", "--index"][..],
+        ),
+        (diff(&[])?, &["apply", "--binary"][..]),
+    ] {
+        if !patch.is_empty() {
+            in_mirror(apply, Some(&patch))?;
+        }
     }
     let untracked = git(
         checkout,
@@ -131,9 +151,35 @@ pub fn sync(data_root: &Path, checkout: &Path, id: &str, sub: &Path) -> Result<P
         copy_entry(&checkout.join(name), &mirror, name)
             .map_err(|e| format!("copying {}: {e}", name.display()))?;
     }
-    let cwd = cwd(data_root, checkout, id, sub);
-    fs::create_dir_all(&cwd).map_err(|e| format!("{}: {e}", cwd.display()))?;
-    Ok(cwd)
+    // Through real folders only: an ignored symlink left there could lead the CLI out.
+    real_dirs(&mirror, sub).map_err(|e| format!("the launch folder: {e}"))?;
+    Ok(cwd(data_root, checkout, id, sub))
+}
+
+/// Makes `rel` a chain of real folders under `root`, creating missing ones; refuses a
+/// symlink, a file or a `..` on the way.
+fn real_dirs(root: &Path, rel: &Path) -> std::io::Result<()> {
+    let mut at = root.to_path_buf();
+    for part in rel.components() {
+        if !matches!(part, std::path::Component::Normal(_)) {
+            return Err(std::io::Error::other(format!(
+                "{} leaves the mirror",
+                rel.display()
+            )));
+        }
+        at.push(part);
+        match fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(std::io::Error::other(format!(
+                    "{} in the mirror is not a folder",
+                    at.display()
+                )));
+            }
+            Err(_) => fs::create_dir(&at)?,
+        }
+    }
+    Ok(())
 }
 
 /// Before forcing a checkout and a clean in it: the path is a real folder, recorded by us
@@ -169,7 +215,8 @@ fn verify(mirror: &Path, record_file: &Path, checkout: &Path) -> Result<PathBuf,
         .map(|e| e.path())
         .find(|admin| {
             fs::read_to_string(admin.join("gitdir")).is_ok_and(|gitdir| {
-                let gitdir = Path::new(gitdir.trim());
+                // Relative with `worktree.useRelativePaths`: to the admin folder.
+                let gitdir = admin.join(gitdir.trim());
                 gitdir.file_name() == Some(OsStr::new(".git"))
                     && gitdir.parent().and_then(|p| p.canonicalize().ok()) == want
             })
@@ -185,25 +232,7 @@ fn verify(mirror: &Path, record_file: &Path, checkout: &Path) -> Result<PathBuf,
 /// way must be a real folder, and whatever is at the target is removed first.
 fn copy_entry(from: &Path, mirror: &Path, name: &Path) -> std::io::Result<()> {
     let meta = fs::symlink_metadata(from)?;
-    let mut at = mirror.to_path_buf();
-    let parents: Vec<_> = name
-        .parent()
-        .into_iter()
-        .flat_map(Path::components)
-        .collect();
-    for part in parents {
-        at.push(part);
-        match fs::symlink_metadata(&at) {
-            Ok(m) if m.file_type().is_dir() => {}
-            Ok(_) => {
-                return Err(std::io::Error::other(format!(
-                    "{} in the mirror is not a folder",
-                    at.display()
-                )));
-            }
-            Err(_) => fs::create_dir(&at)?,
-        }
-    }
+    real_dirs(mirror, name.parent().unwrap_or(Path::new("")))?;
     let to = mirror.join(name);
     match fs::symlink_metadata(&to) {
         Ok(m) if m.is_dir() => fs::remove_dir_all(&to)?,
@@ -279,38 +308,47 @@ fn run_git(base: &[&OsStr], args: &[&str], input: Option<&[u8]>) -> Result<Vec<u
     }
 }
 
-/// The mirrors recorded for `checkout`, by participant id.
+/// The mirrors recorded for `checkout`, plus those of checkouts that no longer exist (moved
+/// or deleted: nothing else would ever find them), by participant id.
 pub fn list(data_root: &Path, checkout: &Path) -> Vec<(String, Record)> {
-    let dir = checkout_dir(data_root, checkout);
-    let mut found: Vec<(String, Record)> = fs::read_dir(&dir)
+    let mut found: Vec<(String, Record)> = fs::read_dir(data_root.join("worktrees"))
         .into_iter()
         .flatten()
         .flatten()
+        .flat_map(|dir| fs::read_dir(dir.path()).into_iter().flatten().flatten())
         .filter_map(|entry| {
             let path = entry.path();
             let id = path.file_stem()?.to_str()?.to_string();
             (path.extension()? == "json").then_some(())?;
             let record: Record = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
-            // A record naming another folder or another source is not ours to delete.
-            (record.mirror == dir.join(&id) && record.source == checkout).then_some((id, record))
+            // Only a record in its own source's folder, naming the mirror beside it, is
+            // ours to act on.
+            let dir = checkout_dir(data_root, &record.source);
+            let ours = path.parent() == Some(dir.as_path()) && record.mirror == dir.join(&id);
+            let here = record.source == checkout || !record.source.exists();
+            (ours && here).then_some((id, record))
         })
         .collect();
-    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found.sort_by(|a, b| (&a.0, &a.1.mirror).cmp(&(&b.0, &b.1.mirror)));
     found
 }
 
-/// Removes one recorded mirror and its record.
-pub fn remove(data_root: &Path, checkout: &Path, id: &str, record: &Record) -> Result<(), String> {
-    let path = record.mirror.to_string_lossy();
-    if checkout.exists() && record.source == checkout {
+/// Removes one mirror `list` returned, and its record.
+pub fn remove(id: &str, record: &Record) -> Result<(), String> {
+    if record.source.exists() {
         // Never `worktree prune`: it would touch the owner's own registrations.
-        git(checkout, &["worktree", "remove", "--force", &path], None)?;
+        let path = record.mirror.to_string_lossy();
+        git(
+            &record.source,
+            &["worktree", "remove", "--force", &path],
+            None,
+        )?;
     }
-    if record.mirror.exists() {
+    if fs::symlink_metadata(&record.mirror).is_ok() {
         fs::remove_dir_all(&record.mirror).map_err(|e| e.to_string())?;
     }
-    fs::remove_file(checkout_dir(data_root, checkout).join(format!("{id}.json")))
-        .map_err(|e| e.to_string())
+    let dir = record.mirror.parent().unwrap_or(Path::new(""));
+    fs::remove_file(dir.join(format!("{id}.json"))).map_err(|e| e.to_string())
 }
 
 /// Bytes under `path`, symlinks not followed.
@@ -409,6 +447,16 @@ mod tests {
             "the launch folder exists"
         );
         assert!(!mirror.join("stray.txt").exists());
+        let unstaged = Command::new("git")
+            .arg("-C")
+            .arg(&mirror)
+            .args(["diff", "--name-only"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&unstaged.stdout).contains("a.txt"),
+            "an unstaged edit stays unstaged in the mirror"
+        );
         assert_eq!(
             fs::read_to_string(repo.join("a.txt")).unwrap(),
             "two\n",
@@ -419,7 +467,7 @@ mod tests {
         assert_eq!(found.len(), 1);
         let (id, record) = &found[0];
         assert!(size(&record.mirror) > 0);
-        remove(&data, &repo, id, record).unwrap();
+        remove(id, record).unwrap();
         assert!(!mirror.exists());
         assert!(list(&data, &repo).is_empty());
         let worktrees = Command::new("git")
@@ -450,6 +498,16 @@ mod tests {
         // The agent rewrites the mirror's `.git` pointer: git is never steered by it.
         fs::write(mirror.join(".git"), "gitdir: /nonexistent\n").unwrap();
         sync(&data, &repo, "codex", Path::new("")).unwrap();
+        run(&mirror, &["status", "-s"]);
+        // A symlink where the launch folder goes is refused, not followed.
+        // (Ignored, so `clean` leaves it, as it would a build folder.)
+        fs::write(repo.join(".gitignore"), "target/\nout\n").unwrap();
+        sync(&data, &repo, "codex", Path::new("")).unwrap();
+        std::os::unix::fs::symlink(&repo, mirror.join("out")).unwrap();
+        let err = sync(&data, &repo, "codex", Path::new("out/x")).unwrap_err();
+        assert!(err.contains("not a folder"), "{err}");
+        assert!(!repo.join("x").exists(), "nothing created through the link");
+        fs::remove_file(mirror.join("out")).unwrap();
         fs::write(repo.join("a.txt"), "writer's work\n").unwrap();
         fs::remove_dir_all(&mirror).unwrap();
         std::os::unix::fs::symlink(&repo, &mirror).unwrap();
