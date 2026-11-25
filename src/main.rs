@@ -24,7 +24,7 @@ use tracing_subscriber::EnvFilter;
 use notify_debouncer_mini::notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, DebouncedEventBatch, new_debouncer};
 use roundtable::agent::{self, AskBridge, Outcome, PEvent, Turn};
-use roundtable::app::{App, Checks, EditLock, Effect, Event, FileEdit, Link, TestTarget};
+use roundtable::app::{App, Checks, EditLock, Effect, Event, FileEdit, Link, TestTarget, WIDE};
 use roundtable::mcp::{self, AskAnswer};
 use roundtable::openai;
 use roundtable::registry::{self, Adapter, Registry};
@@ -77,6 +77,11 @@ async fn start() -> Result<()> {
     init_logging(&root)?;
     // Before the terminal is taken over, so "already running" prints plainly.
     let store = Store::open(&root)?;
+    // `/log` files left by a crash (ADR 0024): only this data folder's own, and only now
+    // that its instance lock is held, so no running roundtable still has one open.
+    for file in log_files(&root) {
+        let _ = fs::remove_file(file);
+    }
     let cwd = std::env::current_dir().context("reading the current directory")?;
 
     let models_path = config_root()?.join("models.toml");
@@ -94,6 +99,7 @@ async fn start() -> Result<()> {
         store,
         thread: None,
         keys: HashMap::new(),
+        viewing: None,
         sessions: BTreeMap::new(),
         turns: HashMap::new(),
         checkout,
@@ -147,11 +153,6 @@ async fn start() -> Result<()> {
         );
     }
 
-    // A `/log` file left by a crash (ADR 0024). shortcut: a second roundtable with another
-    // data folder would lose its open log file too; scope the name if that happens.
-    for file in log_files() {
-        let _ = fs::remove_file(file);
-    }
     // Enters raw mode and the alternate screen, and installs a panic hook that restores the
     // terminal first, so a crash never leaves the user's shell broken.
     let terminal = ratatui::init();
@@ -194,30 +195,53 @@ fn enter_screen() -> Result<()> {
 
 /// Runs `/log`'s editor on `file` and waits (ADR 0024). `Err` says why it failed.
 fn run_editor(editor: &[String], file: &Path) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
     let (program, args) = editor.split_first().ok_or("no editor set")?;
-    match std::process::Command::new(program)
-        .args(args)
-        .arg(file)
-        .status()
-    {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args).arg(file);
+    // Out of raw mode, Ctrl-C reaches the whole foreground group: roundtable must not die
+    // of an interrupt meant for the editor (e.g. `code --wait`), as `system(3)` does it.
+    // SAFETY: `signal` only swaps dispositions; the old ones are put back below. In the
+    // child, between fork and exec, it is async-signal-safe.
+    let (int, quit) = unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+            Ok(())
+        });
+        (
+            libc::signal(libc::SIGINT, libc::SIG_IGN),
+            libc::signal(libc::SIGQUIT, libc::SIG_IGN),
+        )
+    };
+    let status = cmd.status();
+    // SAFETY: as above.
+    unsafe {
+        libc::signal(libc::SIGINT, int);
+        libc::signal(libc::SIGQUIT, quit);
+    }
+    match status {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(format!("/log: editor `{program}` exited with {status}")),
         Err(err) => Err(format!("/log: editor `{program}`: {err}")),
     }
 }
 
-/// `/log` temp files: `roundtable-<ulid>.md` in the system temp folder.
-fn log_files() -> impl Iterator<Item = PathBuf> {
-    fs::read_dir(std::env::temp_dir())
+/// The owner-only folder in the system temp dir that holds `/log` files of the data folder
+/// `root` (ADR 0024): one per data folder, so instances never touch each other's files.
+fn log_dir(root: &Path) -> PathBuf {
+    let id = roundtable::registry::fingerprint(&root.display().to_string());
+    std::env::temp_dir().join(format!("roundtable-log-{id}"))
+}
+
+/// The `/log` files of data folder `root`.
+fn log_files(root: &Path) -> impl Iterator<Item = PathBuf> {
+    fs::read_dir(log_dir(root))
         .into_iter()
         .flatten()
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("roundtable-") && n.ends_with(".md"))
-        })
+        .filter(|path| path.extension().is_some_and(|e| e == "md"))
 }
 
 fn now_ms() -> u64 {
@@ -255,6 +279,8 @@ struct Runtime {
     store: Store,
     /// Opened on the first message, so starting and quitting leaves no empty thread.
     thread: Option<Thread>,
+    /// A thread resumed from another checkout: shown and readable (`/log`), never written.
+    viewing: Option<Thread>,
     /// `App`'s `Link` keys to the `seq` they were written at, for the open thread only.
     keys: HashMap<u64, u64>,
     /// Native sessions by `id/identity`, so a new destination never resumes an old session.
@@ -318,6 +344,7 @@ impl Runtime {
                 let thread = self.store.create_thread(&title, &self.checkout)?;
                 self.threads_changed = true;
                 tracing::info!(thread = %thread.meta.id, "thread opened");
+                self.viewing = None;
                 self.thread.insert(thread)
             }
         };
@@ -609,7 +636,13 @@ impl Runtime {
         self.sessions = sessions.clone();
         // Further messages go into this thread (ADR 0010); nothing is sent into one from
         // another checkout, so it is not opened for writing then.
-        self.thread = elsewhere.is_none().then_some(thread);
+        if elsewhere.is_none() {
+            self.thread = Some(thread);
+            self.viewing = None;
+        } else {
+            self.thread = None;
+            self.viewing = Some(thread);
+        }
         self.keys.clear();
         Event::Resumed {
             title: meta.title.clone(),
@@ -637,10 +670,8 @@ impl Runtime {
 
     /// `/log` (ADR 0024): the open thread as Markdown in a new owner-only temp file;
     /// `None` when there is no message to log yet.
-    // shortcut: a thread resumed from another checkout is not open here, so it logs as
-    // empty; keep its id for `/log` if that gets used.
     fn write_log(&self) -> Result<Option<PathBuf>> {
-        let Some(thread) = &self.thread else {
+        let Some(thread) = self.thread.as_ref().or(self.viewing.as_ref()) else {
             return Ok(None);
         };
         let events = thread.events()?;
@@ -648,7 +679,10 @@ impl Runtime {
             return Ok(None);
         }
         let text = roundtable::log::render(&thread.meta.title, &events, utc_offset_s());
-        let path = std::env::temp_dir().join(format!("roundtable-{}.md", ulid::Ulid::generate()));
+        let dir = log_dir(&self.data_root);
+        // private_dir sets 0700, which fails on a folder another user owns: never shared.
+        transcript::private_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = dir.join(format!("{}.md", ulid::Ulid::generate()));
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -715,6 +749,11 @@ impl Runtime {
 
 async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+    // Events the loop raises itself: handled before the channel, never dropped (a full
+    // channel must not lose, say, the `Done` of a turn that never started). The first is
+    // the start width: the pane layout and `h`/`Tab` depend on it.
+    let mut local: VecDeque<Event> = VecDeque::new();
+    local.push_back(Event::Resize(terminal.size().map_or(WIDE, |s| s.width)));
     let mut input = tokio::spawn(read_terminal(tx.clone()));
     // `/log`'s temp file while its editor has the terminal (ADR 0024): no drawing then.
     let mut editing: Option<PathBuf> = None;
@@ -724,9 +763,6 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
     listen_for_asks(&rt.ask_socket, tx.clone())?;
 
     let mut quit_by: Option<tokio::time::Instant> = None;
-    // Events the loop raises itself: handled before the channel, never dropped (a full
-    // channel must not lose, say, the `Done` of a turn that never started).
-    let mut local: VecDeque<Event> = VecDeque::new();
     loop {
         let deadline = quit_by.unwrap_or_else(tokio::time::Instant::now);
         let event = if let Some(event) = local.pop_front() {
@@ -753,7 +789,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                 input = tokio::spawn(read_terminal(tx.clone()));
                 match failure {
                     Some(why) => Event::Notice(why),
-                    None => Event::Resize,
+                    None => Event::Resize(crossterm::terminal::size().map_or(WIDE, |s| s.0)),
                 }
             }
             Event::RegistryFileChanged => match rt.reload_registry() {
@@ -937,13 +973,18 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                 Effect::NewThread => {
                     // The next message opens a new thread; native sessions start over.
                     rt.thread = None;
+                    rt.viewing = None;
                     rt.sessions.clear();
                 }
                 Effect::Usage(scope) => {
                     let agents = app.cli_agents();
                     let agents: Vec<&str> = agents.iter().map(String::as_str).collect();
-                    let limits =
-                        roundtable::limits::report(&agents, &app.limits, now_ms(), utc_offset_s());
+                    let limits = roundtable::limits::report(
+                        &agents,
+                        &app.shown_limits(),
+                        now_ms(),
+                        utc_offset_s(),
+                    );
                     let usage = rt.usage_report(&scope);
                     local.push_back(Event::Report(format!("{limits}\n{usage}")));
                 }
@@ -1198,7 +1239,7 @@ async fn read_terminal(tx: mpsc::Sender<Event>) {
         let event = match input.next().await {
             Some(Ok(TermEvent::Key(key))) => Event::Key(key),
             Some(Ok(TermEvent::Paste(text))) => Event::Paste(text),
-            Some(Ok(TermEvent::Resize(..))) => Event::Resize,
+            Some(Ok(TermEvent::Resize(width, _))) => Event::Resize(width),
             Some(Ok(_)) => continue,
             Some(Err(err)) => break err.to_string(),
             None => break "end of input".to_string(),
@@ -1298,6 +1339,7 @@ mod tests {
             store: Store::open(root).unwrap(),
             thread: None,
             keys: HashMap::new(),
+            viewing: None,
             sessions: BTreeMap::new(),
             turns: HashMap::new(),
             cwd: root.into(),
@@ -1318,6 +1360,82 @@ mod tests {
             models_hash: None,
             checked: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn log_reads_a_thread_resumed_from_another_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let mut rt = runtime(dir.path());
+        let mut thread = rt.store.create_thread("elsewhere", other.path()).unwrap();
+        let mut app = App::default();
+        for code in [KeyCode::Char('h'), KeyCode::Char('i'), KeyCode::Enter] {
+            for effect in app.update(Event::Key(KeyEvent::new(code, KeyModifiers::NONE))) {
+                if let Effect::Record { event, durable, .. } = effect {
+                    thread.append(event, durable).unwrap();
+                }
+            }
+        }
+        drop(thread);
+        assert!(matches!(
+            rt.resume(Some("1")),
+            Event::Resumed {
+                elsewhere: Some(_),
+                ..
+            }
+        ));
+        assert!(rt.thread.is_none(), "never opened for writing");
+        let path = rt.write_log().unwrap().expect("the shown thread is logged");
+        let text = fs::read_to_string(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(text.starts_with("# elsewhere · "), "{text}");
+    }
+
+    #[test]
+    fn paging_moves_the_view_even_with_a_line_selected() {
+        let mut app = App::default();
+        for n in 0..40 {
+            app.note(format!("line {n}"), false);
+        }
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        app.update(key(KeyCode::Esc));
+        let title = |app: &App| {
+            let screen = render(app, 60, 16);
+            screen.buffer().content[..60]
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+        assert!(!title(&app).contains("scrolled up"), "{}", title(&app));
+        app.update(key(KeyCode::PageUp));
+        assert!(
+            title(&app).contains("scrolled up 10 lines"),
+            "{}",
+            title(&app)
+        );
+        app.update(Event::Key(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(
+            title(&app).contains("scrolled up 20 lines"),
+            "{}",
+            title(&app)
+        );
+        // Moving the selection brings it back into view.
+        app.update(key(KeyCode::Char('G')));
+        assert!(!title(&app).contains("scrolled up"), "{}", title(&app));
+    }
+
+    #[test]
+    fn an_interrupt_meant_for_the_editor_does_not_kill_roundtable() {
+        let file = Path::new("/dev/null");
+        let sh = |script: &str| vec!["sh".to_string(), "-c".into(), script.into()];
+        // The "editor" interrupts roundtable (its parent): ignored while it runs.
+        assert_eq!(run_editor(&sh("kill -INT $PPID; exit 0"), file), Ok(()));
+        // The editor itself still gets the default action.
+        let err = run_editor(&sh("kill -INT $$; sleep 5"), file).unwrap_err();
+        assert!(err.contains("exited with"), "{err}");
     }
 
     #[test]
@@ -1346,7 +1464,12 @@ mod tests {
         assert!(text.starts_with("# hi · "), "{text}");
         assert!(text.contains("\n\nhi\n"), "{text}");
         assert_eq!(mode, 0o600);
-        assert!(log_files().all(|f| f != path));
+        assert!(path.starts_with(log_dir(dir.path())));
+        assert!(log_files(dir.path()).all(|f| f != path));
+        assert!(
+            log_files(Path::new("/elsewhere")).all(|f| !f.starts_with(log_dir(dir.path()))),
+            "another data folder's files are never listed"
+        );
     }
 
     #[test]

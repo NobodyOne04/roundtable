@@ -9,13 +9,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use roundtable::agent::Outcome;
 use roundtable::app::{App, ChatLine, Focus, LineKind};
 
 /// Side panes only where the chat keeps at least 60 columns (ADR 0009).
-const WIDE: u16 = 100;
+use roundtable::app::WIDE;
 const THREADS_WIDTH: u16 = 26;
 const CONTEXT_WIDTH: u16 = 30;
 /// The input box's most rows of text; a longer input shows its last rows.
@@ -116,7 +117,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         // Plan windows at 80% or more (ADR 0014); the clock is read here, not in `App`.
         Span::styled(
             roundtable::limits::warnings(
-                &app.limits,
+                &app.shown_limits(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis() as u64),
@@ -148,13 +149,14 @@ fn input_lines(input: &str, width: usize) -> Vec<String> {
     for line in format!("> {input}").split('\n') {
         let mut row = String::new();
         let mut used = 0;
-        for c in line.chars() {
-            let w = c.width().unwrap_or(0);
+        // By grapheme, as the terminal draws them: `👩‍💻` is one two-column cell pair.
+        for g in line.graphemes(true) {
+            let w = g.width();
             if used + w > width && !row.is_empty() {
                 rows.push(std::mem::take(&mut row));
                 used = 0;
             }
-            row.push(c);
+            row.push_str(g);
             used += w;
         }
         rows.push(row);
@@ -202,7 +204,7 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
     let bottom = total.saturating_sub(inner_height);
     let mut top = bottom.saturating_sub(app.scroll);
     // In Normal mode the selected line stays in view (j/k move it, ADR 0015).
-    if let Some(i) = (app.focus == Focus::Chat)
+    if let Some(i) = (app.focus == Focus::Chat && app.follow_selection)
         .then_some(app.selected_line)
         .flatten()
         .filter(|&i| i < app.lines.len())
@@ -262,8 +264,11 @@ fn draw_threads(frame: &mut Frame, app: &App, area: Rect) {
             })
             .collect()
     };
+    // The picked thread stays in view (`G` in a long list).
+    let inner = area.height.saturating_sub(2) as usize;
+    let top = (app.thread_pick + 1).saturating_sub(inner) as u16;
     let block = focused(Block::bordered().title(" threads "), focus);
-    frame.render_widget(Paragraph::new(rows).block(block), area);
+    frame.render_widget(Paragraph::new(rows).scroll((top, 0)).block(block), area);
 }
 
 fn draw_context(frame: &mut Frame, app: &App, area: Rect) {
@@ -275,9 +280,25 @@ fn draw_context(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             Modifier::DIM
         });
+        // A full plan window blocks the CLI until it resets (ADR 0014).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let limited = app
+            .shown_limits()
+            .get(&r.id)
+            .and_then(|l| roundtable::limits::blocked_until(l, now))
+            .map(|until| {
+                let local = |s: i64| (s + crate::utc_offset_s()).max(0) as u64 * 1000;
+                format!(
+                    " limited until {}",
+                    roundtable::limits::when(local(until), local(now as i64 / 1000))
+                )
+            });
         rows.push(Line::from(vec![
             Span::styled(r.id.clone(), name),
             Span::styled(format!(" {}", r.state), state),
+            Span::styled(limited.unwrap_or_default(), Style::new().fg(Color::Yellow)),
         ]));
         // A bar only when the fill is knowable (ADR 0009); `?` for CLI agents.
         let fill = match r.fill {
@@ -507,6 +528,8 @@ mod tests {
         assert_eq!(input_lines("ab\n", 10), ["> ab", ""]);
         // Wide characters take two columns and never split across rows.
         assert_eq!(input_lines("日本語です", 7), ["> 日本", "語です"]);
+        // A joined emoji is one grapheme: it moves to the next row whole.
+        assert_eq!(input_lines("abc👩‍💻", 6), ["> abc", "👩‍💻"]);
         // A width of zero still makes progress.
         assert_eq!(input_lines("ab", 0).len(), 5);
     }

@@ -17,7 +17,7 @@ pub struct Window {
     pub resets_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Limits {
     pub five_hour: Option<Window>,
     pub weekly: Option<Window>,
@@ -25,6 +25,10 @@ pub struct Limits {
     pub limited: bool,
     /// Unix milliseconds when the CLI reported these.
     pub seen_at: u64,
+    /// The destination that reported them (the participant's identity, ADR 0011): a
+    /// reading never carries over to a repointed id.
+    #[serde(default)]
+    pub identity: Option<String>,
 }
 
 /// Claude's `rate_limit_event` (stream-json, seen with 2.1.332).
@@ -43,28 +47,37 @@ pub fn from_claude(event: &Value, seen_at: u64) -> Option<Limits> {
             .and_then(Value::as_str)
             .is_some_and(|s| !s.starts_with("allowed"))
     };
+    let (five_hour, weekly) = (window("five_hour"), window("seven_day"));
+    // An event without usable windows says nothing: keep the last good reading.
+    if five_hour.is_none() && weekly.is_none() {
+        return None;
+    }
     Some(Limits {
-        five_hour: window("five_hour"),
-        weekly: window("seven_day"),
+        five_hour,
+        weekly,
         limited: blocked("five_hour") || blocked("seven_day"),
         seen_at,
+        identity: None,
     })
 }
 
-/// The last `rate_limits` with data in a Codex session file (`token_count` events, seen
-/// with 0.172.0). Windows are told apart by length: 300 minutes and 10080 minutes.
-pub fn from_codex_session(text: &str, seen_at: u64) -> Option<Limits> {
+/// The last `rate_limits` with data in (the end of) a Codex session file (`token_count`
+/// events, seen with 0.172.0). Windows are told apart by length: 300 and 10080 minutes.
+/// Its age is the line's own `timestamp`, so an old sample is never passed off as new.
+pub fn from_codex_session(text: &str) -> Option<Limits> {
     text.lines().rev().find_map(|line| {
         if !line.contains("\"rate_limits\"") {
             return None;
         }
         let v: Value = serde_json::from_str(line).ok()?;
         let limits = v.pointer("/payload/rate_limits")?;
+        let seen_at = iso_ms(v.get("timestamp")?.as_str()?)?;
         let mut out = Limits {
             five_hour: None,
             weekly: None,
             limited: !limits["rate_limit_reached_type"].is_null(),
             seen_at,
+            identity: None,
         };
         for key in ["primary", "secondary"] {
             let w = &limits[key];
@@ -92,6 +105,43 @@ pub fn from_codex_session(text: &str, seen_at: u64) -> Option<Limits> {
             .any(|w| w.used_percent >= 100.0);
         (out.five_hour.is_some() || out.weekly.is_some()).then_some(out)
     })
+}
+
+/// Unix milliseconds of an RFC 3339 UTC time as Codex writes it (`2026-11-25T15:42:05.550Z`).
+fn iso_ms(text: &str) -> Option<u64> {
+    let b = text.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[10] != b'T' || !text.ends_with('Z') {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| text.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, min, s) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    let millis = match text.get(19..text.len() - 1) {
+        Some("") => 0,
+        Some(frac) => {
+            let digits = frac.strip_prefix('.')?;
+            format!("{digits:0<3}").get(..3)?.parse::<i64>().ok()?
+        }
+        None => return None,
+    };
+    // Days from civil (Howard Hinnant), the inverse of `day_of`.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(((days * 24 + h) * 60 + min) * 60_000 + s * 1000 + millis).ok()
+}
+
+/// Until when (Unix seconds) a full window blocks this CLI, if one still does at `now_ms`.
+pub fn blocked_until(l: &Limits, now_ms: u64) -> Option<i64> {
+    [l.five_hour, l.weekly]
+        .into_iter()
+        .flatten()
+        .filter(|w| w.used_percent >= 100.0 && w.resets_at * 1000 > now_ms as i64)
+        .map(|w| w.resets_at)
+        .max()
 }
 
 /// The session file of Codex thread `thread_id` under `codex_home`
@@ -197,7 +247,7 @@ pub fn warnings(limits: &BTreeMap<String, Limits>, now_ms: u64) -> Vec<String> {
 }
 
 /// `HH:MM` today, else `Mon HH:MM` within a week, else the date; both in local milliseconds.
-fn when(at_ms: u64, now_ms: u64) -> String {
+pub fn when(at_ms: u64, now_ms: u64) -> String {
     let minutes = at_ms / 60_000;
     let clock = format!("{:02}:{:02}", minutes / 60 % 24, minutes % 60);
     let (day, today) = (at_ms / 86_400_000, now_ms / 86_400_000);
@@ -233,12 +283,22 @@ mod tests {
         let blocked = json!({"rate_limit_info":{"unifiedWindows":{"five_hour":{"utilization":1.0,"resetsAt":1,"status":"rejected"}}}});
         assert!(from_claude(&blocked, NOW).unwrap().limited);
         assert_eq!(from_claude(&json!({"type":"rate_limit_event"}), NOW), None);
+        let empty = json!({"rate_limit_info":{"unifiedWindows":{}}});
+        assert_eq!(
+            from_claude(&empty, NOW),
+            None,
+            "no windows: keep the last reading"
+        );
+        assert_eq!(
+            from_claude(&json!({"rate_limit_info":{"unifiedWindows":null}}), NOW),
+            None
+        );
     }
 
     #[test]
     fn codex_session_lines() {
         let line = |primary: Value| {
-            json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{
+            json!({"timestamp":"2026-11-25T20:44:00.250Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{
                 "primary": primary,
                 "secondary":{"used_percent":66.0,"window_minutes":10080,"resets_at":1795965214},
                 "rate_limit_reached_type": null}}})
@@ -252,7 +312,8 @@ mod tests {
             json!({"payload":{"rate_limits":{"primary":null,"secondary":null}}}).to_string(),
         ]
         .join("\n");
-        let l = from_codex_session(&text, NOW).unwrap();
+        let l = from_codex_session(&text).unwrap();
+        assert_eq!(l.seen_at, NOW - 60_000 + 250, "the line's own time");
         assert_eq!(
             l.five_hour,
             Some(Window {
@@ -264,10 +325,64 @@ mod tests {
         assert!(!l.limited);
         let full = line(json!({"used_percent":100.0,"window_minutes":300,"resets_at":1}));
         assert!(
-            from_codex_session(&full, NOW).unwrap().limited,
+            from_codex_session(&full).unwrap().limited,
             "100% is limited"
         );
-        assert_eq!(from_codex_session("{}\nnot json", NOW), None);
+        assert_eq!(from_codex_session("{}\nnot json"), None);
+    }
+
+    #[test]
+    fn recorded_cli_output() {
+        // Real lines, sanitized (CLAUDE.md): claude 2.1.332 stream, codex 0.172.0 session.
+        let claude: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/claude-2.1.332-rate-limit.jsonl"
+        ))
+        .unwrap();
+        let l = from_claude(&claude, NOW).unwrap();
+        assert!((l.five_hour.unwrap().used_percent - 33.0).abs() < 1e-9);
+        assert_eq!(l.weekly.unwrap().resets_at, 1_796_137_200);
+        assert!(!l.limited);
+        let l = from_codex_session(include_str!(
+            "../tests/fixtures/codex-0.172.0-session-tail.jsonl"
+        ))
+        .unwrap();
+        assert_eq!(
+            (
+                l.five_hour.unwrap().used_percent,
+                l.weekly.unwrap().used_percent
+            ),
+            (15.0, 70.0)
+        );
+        assert_eq!(l.seen_at, iso_ms("2026-11-25T15:44:10.509Z").unwrap());
+    }
+
+    #[test]
+    fn codex_timestamps() {
+        assert_eq!(iso_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(iso_ms("2026-11-25T20:45:00.000Z"), Some(NOW));
+        assert_eq!(iso_ms("2026-11-25T20:45:00.5Z"), Some(NOW + 500));
+        assert_eq!(iso_ms("2024-02-29T00:00:00Z"), Some(1_709_164_800_000));
+        assert_eq!(iso_ms("2026-11-25 20:45:00"), None);
+        assert_eq!(iso_ms("garbage-but-long-enough-Z"), None);
+    }
+
+    #[test]
+    fn blocked_only_until_the_full_window_resets() {
+        let full = |resets_at| Limits {
+            five_hour: Some(Window {
+                used_percent: 100.0,
+                resets_at,
+            }),
+            weekly: None,
+            limited: true,
+            seen_at: 0,
+            identity: None,
+        };
+        assert_eq!(
+            blocked_until(&full(1_795_641_000), NOW),
+            Some(1_795_641_000)
+        );
+        assert_eq!(blocked_until(&full(1_795_630_000), NOW), None);
     }
 
     #[test]
@@ -299,6 +414,7 @@ mod tests {
                 }),
                 limited: false,
                 seen_at: NOW - 60_000,
+                identity: None,
             },
         );
         limits.insert(
@@ -311,6 +427,7 @@ mod tests {
                 weekly: None,
                 limited: true,
                 seen_at: NOW - 3_600_000,
+                identity: None,
             },
         );
         insta::assert_snapshot!(report(&["claude", "codex", "llama"], &limits, NOW, 0), @r"

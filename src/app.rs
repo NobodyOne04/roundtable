@@ -20,7 +20,8 @@ pub enum Event {
     /// Text pasted into the terminal (bracketed paste): goes into the input as is, line
     /// breaks included, and is never sent by itself.
     Paste(String),
-    Resize,
+    /// The terminal's new width: below `WIDE` the side panes are hidden.
+    Resize(u16),
     /// Redraw throttle: at most one draw per tick.
     Tick,
     /// The terminal input stream ended or failed; nothing more can be typed.
@@ -248,6 +249,9 @@ impl ChatLine {
     }
 }
 
+/// Below this many columns the side panes hide (ADR 0009).
+pub const WIDE: u16 = 100;
+
 /// Which part of the screen keys go to (`Tab` cycles, ADR 0009).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -350,8 +354,12 @@ pub struct App {
     /// A resumed thread from another checkout: nothing may be sent into it (ADR 0010).
     read_only: Option<std::path::PathBuf>,
     pub focus: Focus,
-    /// The tool/handoff line picked in the chat (an index into `lines`).
+    /// The terminal width, from `Event::Resize`: the side panes show only from `WIDE` up.
+    pub width: u16,
+    /// The line picked in the chat (an index into `lines`).
     pub selected_line: Option<usize>,
+    /// The view keeps `selected_line` in sight; paging keys turn this off so they page.
+    pub follow_selection: bool,
     /// The threads pane: past threads, newest first, and the picked one.
     pub threads: Vec<ThreadRow>,
     pub thread_pick: usize,
@@ -372,6 +380,8 @@ pub struct App {
     quit_armed: bool,
     /// Each CLI agent's plan limits as last reported (ADR 0014), by participant id.
     pub limits: BTreeMap<String, crate::limits::Limits>,
+    /// A message draft put aside by `/` or `:` in Normal mode, back after the command.
+    stashed_draft: Option<String>,
     /// Normal mode saw `g`: a second one goes to the top (`gg`, ADR 0015).
     pending_g: bool,
 }
@@ -404,6 +414,8 @@ impl App {
             read_only: None,
             focus: Focus::Input,
             selected_line: None,
+            width: WIDE,
+            follow_selection: true,
             threads: vec![],
             thread_pick: 0,
             show_threads: true,
@@ -415,6 +427,7 @@ impl App {
             last_origin: 0,
             quit_armed: false,
             pending_g: false,
+            stashed_draft: None,
             limits: BTreeMap::new(),
         };
         app.apply_registry(registry, checks, false);
@@ -480,6 +493,10 @@ impl App {
         self.dirty = true;
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.key(key),
+            Event::Resize(width) => {
+                self.width = width;
+                vec![]
+            }
             Event::Paste(text) => {
                 self.focus = Focus::Input;
                 self.input
@@ -487,7 +504,6 @@ impl App {
                 vec![]
             }
             Event::Key(_)
-            | Event::Resize
             | Event::Tick
             | Event::RegistryFileChanged
             | Event::EditorClosed(_)
@@ -577,11 +593,11 @@ impl App {
                 return vec![];
             }
             KeyCode::PageUp => {
-                self.scroll = self.scroll.saturating_add(10);
+                self.page(10);
                 return vec![];
             }
             KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_sub(10);
+                self.page(-10);
                 return vec![];
             }
             // Normal mode (ADR 0015): the panes have the keys, nothing is typed.
@@ -642,7 +658,7 @@ impl App {
     fn cycle_focus(&mut self) {
         self.focus = match self.focus {
             Focus::Input => Focus::Chat,
-            Focus::Chat if self.show_threads && !self.threads.is_empty() => Focus::Threads,
+            Focus::Chat if self.threads_visible() => Focus::Threads,
             _ => Focus::Input,
         };
         if self.focus == Focus::Chat && self.selected_line.is_none() {
@@ -650,8 +666,20 @@ impl App {
         }
     }
 
+    /// The threads pane is on screen: switched on, wide enough, with something in it.
+    fn threads_visible(&self) -> bool {
+        self.show_threads && self.width >= WIDE && !self.threads.is_empty()
+    }
+
     fn select_last(&mut self) {
         self.selected_line = self.lines.len().checked_sub(1);
+        self.follow_selection = true;
+    }
+
+    /// Scrolls `lines` up (positive) or down; the view stops following the selection.
+    fn page(&mut self, lines: i32) {
+        self.scroll = self.scroll.saturating_add_signed(lines as i16);
+        self.follow_selection = false;
     }
 
     /// Normal mode (ADR 0015): vim keys over the chat and threads panes.
@@ -662,6 +690,15 @@ impl App {
             (_, KeyCode::Char('i' | 'a')) => self.focus = Focus::Input,
             (_, KeyCode::Char('/' | ':')) => {
                 self.focus = Focus::Input;
+                // A half-typed message is put aside, so the command runs as a command.
+                if !self.input.is_empty() && !self.input.starts_with('/') {
+                    self.stashed_draft = Some(std::mem::take(&mut self.input));
+                    self.push(
+                        "roundtable",
+                        "draft put aside: it comes back after the command".into(),
+                        LineKind::Info,
+                    );
+                }
                 if self.input.is_empty() {
                     self.input.push('/');
                 }
@@ -678,7 +715,7 @@ impl App {
                 self.quit_armed = true;
                 self.push("roundtable", "q again to quit".into(), LineKind::Info);
             }
-            (_, KeyCode::Char('h')) if self.show_threads && !self.threads.is_empty() => {
+            (_, KeyCode::Char('h')) if self.threads_visible() => {
                 self.focus = Focus::Threads;
             }
             (_, KeyCode::Char('l')) => {
@@ -689,8 +726,8 @@ impl App {
             }
             // shortcut: 10 lines like PgUp/PgDn, not a measured half page; App doesn't know
             // the pane's height. Pass it in if the jump feels wrong.
-            (_, KeyCode::Char('d')) if ctrl => self.scroll = self.scroll.saturating_sub(10),
-            (_, KeyCode::Char('u')) if ctrl => self.scroll = self.scroll.saturating_add(10),
+            (_, KeyCode::Char('d')) if ctrl => self.page(-10),
+            (_, KeyCode::Char('u')) if ctrl => self.page(10),
             (Focus::Chat, KeyCode::Char('G')) => {
                 self.scroll = 0;
                 self.select_last();
@@ -698,6 +735,7 @@ impl App {
             (Focus::Chat, KeyCode::Char('g')) if pending_g => {
                 self.scroll = u16::MAX;
                 self.selected_line = (!self.lines.is_empty()).then_some(0);
+                self.follow_selection = true;
             }
             (Focus::Threads, KeyCode::Char('G')) => {
                 self.thread_pick = self.threads.len().saturating_sub(1);
@@ -728,6 +766,7 @@ impl App {
                     (KeyCode::Up, Some(i)) => Some(i.saturating_sub(1)),
                     (_, Some(i)) => last.map(|l| (i + 1).min(l)),
                 };
+                self.follow_selection = true;
                 vec![]
             }
             (Focus::Chat, _) => {
@@ -804,6 +843,21 @@ impl App {
             .collect()
     }
 
+    /// The readings that still describe an enabled CLI agent's current destination: a
+    /// repointed, disabled or removed id shows nothing (ADR 0014).
+    pub fn shown_limits(&self) -> BTreeMap<String, crate::limits::Limits> {
+        self.registry
+            .participants
+            .iter()
+            .filter(|p| p.enabled && matches!(p.adapter, crate::registry::Adapter::Cli(_)))
+            .filter_map(|p| {
+                let l = self.limits.get(&p.id)?;
+                (l.identity.as_deref() == Some(p.identity.as_str()))
+                    .then(|| (p.id.clone(), l.clone()))
+            })
+            .collect()
+    }
+
     /// Enabled CLI agents, whose plan limits `/usage` shows (ADR 0014).
     pub fn cli_agents(&self) -> Vec<String> {
         self.registry
@@ -857,7 +911,14 @@ impl App {
         let mut input = std::mem::take(&mut self.input);
         self.scroll = 0;
         if input.trim_start().starts_with('/') {
-            return self.command(input.trim());
+            let effects = self.command(input.trim());
+            // A draft put aside by `/` or `:` in Normal mode comes back (ADR 0015).
+            if self.input.is_empty()
+                && let Some(draft) = self.stashed_draft.take()
+            {
+                self.input = draft;
+            }
+            return effects;
         }
         if let Some(checkout) = &self.read_only {
             let why = format!(
@@ -1544,6 +1605,10 @@ impl App {
                 None => return Err("no default model: start with @<id> (see /models)".into()),
             }
         }
+        // `@all` or `default = "all"` with nobody able to answer: say so, keep the prompt.
+        if targets.is_empty() {
+            return Err("nobody at the table can answer now (see /status)".into());
+        }
         let mut seen = vec![];
         targets.retain(|id| {
             let new = !seen.contains(id);
@@ -1797,7 +1862,15 @@ impl App {
                 seat.usage = Some((input, output, cost_usd, estimated));
                 vec![]
             }
-            PEvent::Limits(limits) => {
+            PEvent::Limits(mut limits) => {
+                limits.identity = seat.turn_identity.clone();
+                // Never replace a newer reading of the same destination with an older one.
+                let older = self.limits.get(id).is_some_and(|known| {
+                    known.identity == limits.identity && known.seen_at > limits.seen_at
+                });
+                if older {
+                    return vec![];
+                }
                 self.limits.insert(id.to_string(), limits);
                 vec![Effect::SaveLimits(self.limits.clone())]
             }
@@ -2282,8 +2355,8 @@ mod tests {
             "first tick draws"
         );
         assert!(app.update(Event::Tick).is_empty(), "nothing changed");
-        app.update(Event::Resize);
-        app.update(Event::Resize);
+        app.update(Event::Resize(120));
+        app.update(Event::Resize(120));
         assert_eq!(
             app.update(Event::Tick),
             [Effect::Redraw],
@@ -3524,19 +3597,49 @@ mod tests {
     #[test]
     fn reported_limits_are_kept_and_saved() {
         let mut app = App::default();
-        let limits = crate::limits::Limits {
+        let reading = |seen_at| crate::limits::Limits {
             five_hour: None,
             weekly: Some(crate::limits::Window {
                 used_percent: 66.0,
                 resets_at: 1,
             }),
             limited: false,
-            seen_at: 5,
+            seen_at,
+            identity: None,
         };
-        let effects = app.update(agent("codex", PEvent::Limits(limits)));
-        assert_eq!(app.limits["codex"], limits);
+        type_line(&mut app, "@codex go");
+        let effects = app.update(agent("codex", PEvent::Limits(reading(5))));
         assert_eq!(effects, [Effect::SaveLimits(app.limits.clone())]);
-        assert_eq!(app.cli_agents(), ["claude", "codex"]);
+        let codex = app.registry.get("codex").unwrap().identity.clone();
+        assert_eq!(
+            app.limits["codex"].identity.as_deref(),
+            Some(codex.as_str())
+        );
+        assert_eq!(app.shown_limits().keys().collect::<Vec<_>>(), ["codex"]);
+        // An older sample of the same destination never replaces a newer one.
+        assert!(
+            app.update(agent("codex", PEvent::Limits(reading(4))))
+                .is_empty()
+        );
+        assert_eq!(app.limits["codex"].seen_at, 5);
+        // Repointed: the old reading is not shown as the new destination's.
+        reload(
+            &mut app,
+            &DEFAULT_FILE.replace("role = \"reviewer\"", "role = \"reviewer\"\nmodel = \"o3\""),
+        );
+        assert!(app.shown_limits().is_empty());
+        // Disabled: nothing shown either.
+        reload(&mut app, DEFAULT_FILE);
+        assert_eq!(app.shown_limits().len(), 1);
+        reload(
+            &mut app,
+            &DEFAULT_FILE.replace(
+                "role = \"reviewer\"\nenabled = true",
+                "role = \"reviewer\"\nenabled = false",
+            ),
+        );
+        assert!(app.shown_limits().is_empty());
+        assert_eq!(app.cli_agents(), ["claude"]);
     }
 
     #[test]
@@ -3600,6 +3703,68 @@ mod tests {
         );
         app.update(key(KeyCode::PageUp, KeyModifiers::NONE));
         assert_eq!(app.scroll, 10, "PgUp works in Insert too");
+    }
+
+    #[test]
+    fn a_broadcast_to_nobody_keeps_the_prompt() {
+        let mut app = App::default();
+        type_line(&mut app, "/model use all");
+        for id in ["claude", "codex"] {
+            app.checks.insert(id.into(), Err("not installed".into()));
+        }
+        for c in "hello".chars() {
+            app.update(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let effects = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Record { .. })),
+            "nothing recorded: {effects:?}"
+        );
+        assert_eq!(app.input, "hello");
+        assert!(last_text(&app).contains("nobody at the table"));
+    }
+
+    #[test]
+    fn h_and_tab_skip_a_threads_pane_that_is_not_on_screen() {
+        let mut app = App::default();
+        app.update(Event::Threads(vec![ThreadRow {
+            id: "01A".into(),
+            title: "t".into(),
+            day: "2026-11-25".into(),
+            elsewhere: false,
+        }]));
+        app.update(Event::Resize(80));
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        app.update(key(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Chat, "narrow: the pane is hidden");
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Input, "Tab skips it too");
+        app.update(Event::Resize(120));
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        app.update(key(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Threads);
+    }
+
+    #[test]
+    fn a_command_from_normal_mode_does_not_eat_the_draft() {
+        let mut app = App::default();
+        for c in "half a thought".chars() {
+            app.update(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        app.update(key(KeyCode::Char(':'), KeyModifiers::NONE));
+        assert_eq!(app.input, "/", "a clean command line");
+        for c in "help".chars() {
+            app.update(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let effects = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::StartTurn { .. })),
+            "ran /help, sent nothing"
+        );
+        assert_eq!(app.input, "half a thought", "the draft is back");
     }
 
     #[test]

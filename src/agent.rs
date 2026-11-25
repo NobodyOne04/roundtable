@@ -344,12 +344,39 @@ fn codex_limits(thread_id: &str) -> Option<crate::limits::Limits> {
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?;
     let file = crate::limits::codex_session_file(&home, thread_id)?;
-    let text = std::fs::read_to_string(&file).ok()?;
-    let limits = crate::limits::from_codex_session(&text, now_ms());
+    let limits = read_tail(&file, crate::limits::from_codex_session);
     if limits.is_none() {
         tracing::debug!(file = %file.display(), "no Codex limits in the session file");
     }
     limits
+}
+
+/// Runs `find` over the end of `file`, 64 KiB, then 1 MiB, then 16 MiB, stopping at the
+/// first hit: a long session is never read whole for one recent line. The first, likely
+/// partial, line of a tail is dropped.
+fn read_tail<T>(file: &std::path::Path, find: impl Fn(&str) -> Option<T>) -> Option<T> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(file).ok()?;
+    let len = f.metadata().ok()?.len();
+    for size in [64 << 10, 1 << 20, 16 << 20] {
+        let start = len.saturating_sub(size);
+        f.seek(SeekFrom::Start(start)).ok()?;
+        let mut bytes = Vec::new();
+        f.by_ref().take(size).read_to_end(&mut bytes).ok()?;
+        let text = String::from_utf8_lossy(&bytes);
+        let text = if start > 0 {
+            text.split_once('\n').map_or("", |(_, rest)| rest)
+        } else {
+            &text
+        };
+        if let Some(found) = find(text) {
+            return Some(found);
+        }
+        if start == 0 {
+            return None;
+        }
+    }
+    None
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -660,6 +687,23 @@ mod tests {
         assert_eq!(l.five_hour.unwrap().resets_at, 1795620000);
         // The recorded fixtures carry the event without data: nothing comes of it.
         assert!(parse(Kind::Claude, r#"{"type":"rate_limit_event"}"#).is_empty());
+    }
+
+    #[test]
+    fn the_tail_is_read_in_growing_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("s.jsonl");
+        let filler = "x".repeat(100) + "\n";
+        std::fs::write(&file, format!("needle\n{}", filler.repeat(2_000))).unwrap();
+        let seen = std::cell::RefCell::new(vec![]);
+        let found = read_tail(&file, |text| {
+            seen.borrow_mut().push(text.len());
+            text.lines().any(|l| l == "needle").then_some(())
+        });
+        assert_eq!(found, Some(()));
+        let seen = seen.into_inner();
+        assert!(seen[0] < 70_000 && seen.len() == 2, "{seen:?}");
+        assert_eq!(read_tail(&file, |_| None::<()>), None);
     }
 
     #[test]
