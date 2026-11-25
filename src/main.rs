@@ -12,7 +12,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{Event as TermEvent, EventStream};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, EventStream,
+};
 use futures_util::StreamExt;
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
@@ -141,7 +143,15 @@ async fn start() -> Result<()> {
     // Enters raw mode and the alternate screen, and installs a panic hook that restores the
     // terminal first, so a crash never leaves the user's shell broken.
     let terminal = ratatui::init();
+    // Bracketed paste: a pasted block arrives whole, so its line breaks don't send it.
+    let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
+    let restore_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
+        restore_hook(info);
+    }));
     let result = run(terminal, app, runtime).await;
+    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -1004,6 +1014,7 @@ async fn read_terminal(tx: mpsc::Sender<Event>) {
     let reason = loop {
         let event = match input.next().await {
             Some(Ok(TermEvent::Key(key))) => Event::Key(key),
+            Some(Ok(TermEvent::Paste(text))) => Event::Paste(text),
             Some(Ok(TermEvent::Resize(..))) => Event::Resize,
             Some(Ok(_)) => continue,
             Some(Err(err)) => break err.to_string(),
@@ -1244,5 +1255,50 @@ mod tests {
             PEvent::TextDelta("Two notes:\n1. a".into()),
         ));
         insta::assert_snapshot!(render(&app, 60, 10));
+    }
+
+    /// The screen and where the cursor ended up.
+    fn render_with_cursor(app: &App, width: u16, height: u16) -> (TestBackend, (u16, u16)) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        (terminal.backend().clone(), (cursor.x, cursor.y))
+    }
+
+    #[test]
+    fn a_long_prompt_wraps_and_keeps_the_cursor_in_view() {
+        let mut app = App::default();
+        let prompt = "please review the writer lock and tell me whether a crash mid-turn leaves the marker behind";
+        for c in prompt.chars() {
+            app.update(Event::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )));
+        }
+        let (screen, cursor) = render_with_cursor(&app, 60, 12);
+        insta::assert_snapshot!("long_input", screen);
+        // "> " + 91 characters in 58 columns: 58 on the first row, 35 on the second.
+        assert_eq!(cursor, (36, 9));
+    }
+
+    #[test]
+    fn a_tall_prompt_shows_its_last_rows() {
+        let mut app = App::default();
+        let text = (1..=12)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.update(Event::Paste(text));
+        let (screen, cursor) = render_with_cursor(&app, 60, 16);
+        insta::assert_snapshot!("tall_input", screen);
+        assert_eq!(cursor, (8, 13));
+    }
+
+    #[test]
+    fn a_paste_goes_into_the_input_and_is_not_sent() {
+        let mut app = App::default();
+        let effects = app.update(Event::Paste("first\r\nsecond\rthird".into()));
+        assert!(effects.is_empty());
+        assert_eq!(app.input, "first\nsecond\nthird");
     }
 }

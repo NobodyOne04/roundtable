@@ -17,6 +17,9 @@ pub type Checks = BTreeMap<String, Result<String, String>>;
 #[derive(Debug)]
 pub enum Event {
     Key(KeyEvent),
+    /// Text pasted into the terminal (bracketed paste): goes into the input as is, line
+    /// breaks included, and is never sent by itself.
+    Paste(String),
     Resize,
     /// Redraw throttle: at most one draw per tick.
     Tick,
@@ -438,6 +441,12 @@ impl App {
         self.dirty = true;
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.key(key),
+            Event::Paste(text) => {
+                self.focus = Focus::Input;
+                self.input
+                    .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                vec![]
+            }
             Event::Key(_)
             | Event::Resize
             | Event::Tick
@@ -686,6 +695,11 @@ impl App {
                 })
             })
             .collect()
+    }
+
+    /// Whether a message without an @mention goes to everyone (`default = "all"`).
+    pub fn default_is_everyone(&self) -> bool {
+        self.registry.default() == Some("all")
     }
 
     /// The status line: the talk switch and the latest message's model-to-model use
@@ -1242,7 +1256,7 @@ impl App {
     }
 
     fn use_default(&mut self, id: &str) -> Vec<Effect> {
-        if !self.registry.get(id).is_some_and(|p| p.enabled) {
+        if id != "all" && !self.registry.get(id).is_some_and(|p| p.enabled) {
             self.push(
                 "roundtable",
                 format!("`{id}` is not an enabled model"),
@@ -1378,13 +1392,7 @@ impl App {
             let name = &mention[..end];
             mentions += if name == "all" { 2 } else { 1 };
             if name == "all" {
-                targets.extend(
-                    self.registry
-                        .participants
-                        .iter()
-                        .filter(|p| p.enabled && self.availability(p).is_ok())
-                        .map(|p| p.id.clone()),
-                );
+                targets.extend(self.everyone());
             } else if self.registry.get(name).is_some() {
                 targets.push(name.into());
             } else {
@@ -1398,6 +1406,11 @@ impl App {
         }
         if targets.is_empty() {
             match self.registry.default() {
+                // Everyone by default: the same broadcast as `@all`, read-only for all.
+                Some("all") => {
+                    targets.extend(self.everyone());
+                    mentions = 2;
+                }
                 Some(id) => targets.push(id.into()),
                 None => return Err("no default model: start with @<id> (see /models)".into()),
             }
@@ -1409,6 +1422,16 @@ impl App {
             new
         });
         Ok((targets, prompt.into(), mentions > 1))
+    }
+
+    /// Every enabled participant that can take a turn now: who `@all` reaches.
+    fn everyone(&self) -> Vec<String> {
+        self.registry
+            .participants
+            .iter()
+            .filter(|p| p.enabled && self.availability(p).is_ok())
+            .map(|p| p.id.clone())
+            .collect()
     }
 
     fn deliver(&mut self, id: &str, prompt: String, writable: bool, origin: u64) -> Vec<Effect> {
@@ -2243,6 +2266,31 @@ mod tests {
 
         type_line(&mut app, "/model enable codex");
         assert_eq!(started(&type_line(&mut app, "@codex back")), ["codex"]);
+    }
+
+    #[test]
+    fn everyone_is_the_default_after_model_use_all() {
+        let mut app = App::default();
+        let effects = type_line(&mut app, "/model use all");
+        assert!(effects.contains(&Effect::EditRegistry(FileEdit::Default("all".into()))));
+        let effects = type_line(&mut app, "hi");
+        assert_eq!(started(&effects), ["claude", "codex"]);
+        assert!(
+            effects
+                .iter()
+                .all(|e| !matches!(e, Effect::StartTurn { writable: true, .. })),
+            "a default broadcast never writes: {effects:?}"
+        );
+        // Naming the writer alone still lets it edit (a fresh table: claude is busy above).
+        let mut app = App::default();
+        type_line(&mut app, "/model use all");
+        let effects = type_line(&mut app, "@claude fix it");
+        assert!(
+            effects.iter().any(
+                |e| matches!(e, Effect::StartTurn { id, writable: true, .. } if id == "claude")
+            ),
+            "{effects:?}"
+        );
     }
 
     #[test]

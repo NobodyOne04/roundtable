@@ -31,6 +31,9 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
 - Review the ADR 0005 PR (`feature/adr-0005-free-models`): its last commits (loop-wide key
   redaction in `Runtime::redact_output`, `StreamRedactor`, SSE event assembly, unknown
   usage) landed after your two reviews; the third was skipped (usage limit).
+- Review the input/default PR (`minor/input-wrap-default-all`), skipped (owner asked to go on
+  without Codex): input wrapping and bracketed paste in `src/ui.rs`/`src/main.rs`, and
+  `default = "all"` routing in `src/app.rs`/`src/registry.rs` (must stay read-only).
 - Record a real two-turn Codex fixture (first turn plus `exec resume`):
   `tests/fixtures/codex-0.171.0-turn1.jsonl` was cut from one turn, and resume was never
   recorded. Sanitize as CLAUDE.md says, and hand it to Claude to commit.

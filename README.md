@@ -37,7 +37,8 @@ the reply, and the tokens it cost.
 ## Planned features
 
 - `@claude`, `@codex`, `@all` to address participants; no mention goes to the default.
-  With `@all`, every enabled participant answers you independently.
+  With `@all`, every enabled participant answers you independently. `default = "all"`
+  (or `/model use all`) makes every message without a mention an `@all`, read-only.
 - Slash commands like Claude Code (`/help` lists them, `Tab` completes them and `@` ids):
   `/status`, `/usage [thread|today|all]`, `/context [id]`, `/models`,
   `/model enable|disable|use|test <id>`, `/talk on|off|show|allow a->b|deny a->b`,

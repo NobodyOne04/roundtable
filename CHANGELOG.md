@@ -20,11 +20,14 @@
 - Proposed ADR 0010 (JSONL files as the transcript) and 0011 (hot in-memory model registry)
 
 ### Fixed
+- Long prompts wrap in the input box (up to 8 rows, then the last ones) and the cursor stays in view; a pasted multi-line block goes into the input whole instead of sending at its first line break
 - The `ask` socket falls back to a short owner-only temp folder when the data folder path is too long for a Unix socket (startup failed)
 - Writer safety after Codex review: broadcasts never write, explicit safe default modes, waiting writers keep order, the crash lock covers the whole git checkout and fails closed on unreadable history or git errors, `/quiet` unlocks only after the settle is on disk
 - Transcript, sessions and logs are readable by the owner only (data folder 0700, files 0600)
 
 ### Changed
+- `default = "all"` (or `/model use all`): a message without an @mention goes to everyone, read-only like `@all`; `@<id>` still picks one, and only the writer named alone may edit
+- Speaker colours: you are cyan, Codex (the reviewer) is green
 - README matches the ADRs: roadmap in build order with progress, worktree decision, hot-registry and disable behaviour, chat-only models, requirements
 - ADRs 0010 and 0011 accepted
 - ADRs 0001, 0002, 0004, 0005, 0007, 0008, 0009 accepted; 0003 (SQLite) and 0006 (registry) rejected

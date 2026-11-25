@@ -9,6 +9,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use roundtable::agent::Outcome;
 use roundtable::app::{App, ChatLine, Focus, LineKind};
 
@@ -16,10 +18,14 @@ use roundtable::app::{App, ChatLine, Focus, LineKind};
 const WIDE: u16 = 100;
 const THREADS_WIDTH: u16 = 26;
 const CONTEXT_WIDTH: u16 = 30;
+/// The input box's most rows of text; a longer input shows its last rows.
+const INPUT_MAX_ROWS: usize = 8;
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    // The input grows with its lines (Alt-Enter), up to a few.
-    let input_rows = app.input.split('\n').count().clamp(1, 6) as u16;
+    // The input wraps to the box and grows with its rows, up to a few; past that it shows
+    // the last ones, where the cursor is. The box spans the whole width, inside its border.
+    let input_lines = input_lines(&app.input, frame.area().width.saturating_sub(2) as usize);
+    let input_rows = input_lines.len().clamp(1, INPUT_MAX_ROWS) as u16;
     let completions = app.completions();
     let popup_rows = completions.len().min(6) as u16;
     let [main, popup_area, input_area, status_area] = Layout::vertical([
@@ -73,7 +79,17 @@ pub fn draw(frame: &mut Frame, app: &App) {
         frame.render_widget(popup, popup_area);
     }
 
-    let input = Paragraph::new(format!("> {}", app.input)).block(focused(
+    let visible = input_lines
+        .len()
+        .min(input_area.height.saturating_sub(2) as usize);
+    let shown = &input_lines[input_lines.len() - visible..];
+    let input = Paragraph::new(
+        shown
+            .iter()
+            .map(|l| Line::raw(l.clone()))
+            .collect::<Vec<_>>(),
+    )
+    .block(focused(
         Block::bordered()
             .title_bottom(" Enter send · Alt-Enter new line · Tab panes · /help · Esc cancel "),
         app.focus == Focus::Input,
@@ -85,14 +101,40 @@ pub fn draw(frame: &mut Frame, app: &App) {
     ));
     frame.render_widget(status, status_area);
     if app.focus == Focus::Input {
-        let last = app.input.rsplit('\n').next().unwrap_or("");
-        let row = (input_rows - 1).min(input_area.height.saturating_sub(3));
-        let col = if input_rows > 1 { 1 } else { 3 } + last.chars().count() as u16;
+        // The cursor is always at the end of the input: after the last row.
+        let last = shown.last().map_or(0, |l| l.width()) as u16;
+        let row = visible.saturating_sub(1) as u16;
         frame.set_cursor_position(Position::new(
-            (input_area.x + col).min(input_area.right().saturating_sub(2)),
+            (input_area.x + 1 + last).min(input_area.right().saturating_sub(2)),
             input_area.y + 1 + row,
         ));
     }
+}
+
+/// `"> " + input`, hard-wrapped to `width` columns by display width, so the cursor lands
+/// exactly after the last row. A row that fills the width is followed by an empty one: the
+/// cursor needs a cell after the text.
+fn input_lines(input: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = vec![];
+    for line in format!("> {input}").split('\n') {
+        let mut row = String::new();
+        let mut used = 0;
+        for c in line.chars() {
+            let w = c.width().unwrap_or(0);
+            if used + w > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            row.push(c);
+            used += w;
+        }
+        rows.push(row);
+    }
+    if rows.last().is_some_and(|r| r.width() >= width) {
+        rows.push(String::new());
+    }
+    rows
 }
 
 /// The focused pane's border is bold.
@@ -106,10 +148,12 @@ fn focused(block: Block<'static>, focus: bool) -> Block<'static> {
 
 fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
     let text = if app.lines.is_empty() {
-        Text::styled(
-            "Nothing at the table yet. Type to Claude, start with @codex or @all, or /help.",
-            Style::new().add_modifier(Modifier::DIM),
-        )
+        let hint = if app.default_is_everyone() {
+            "Nothing at the table yet. Type to everyone, start with @<id> for one, or /help."
+        } else {
+            "Nothing at the table yet. Type to Claude, start with @codex or @all, or /help."
+        };
+        Text::styled(hint, Style::new().add_modifier(Modifier::DIM))
     } else {
         let selected = (app.focus == Focus::Chat)
             .then_some(app.selected_line)
@@ -233,9 +277,9 @@ fn clip(text: &str, width: usize) -> String {
 fn colour(who: &str) -> Color {
     match who.split(' ').next() {
         Some("claude") => Color::Yellow,
-        Some("codex") => Color::Cyan,
+        Some("codex") => Color::Green,
         Some("roundtable") => Color::DarkGray,
-        Some("you") => Color::Reset,
+        Some("you") => Color::Cyan,
         Some(_) => Color::Magenta,
         None => Color::Reset,
     }
@@ -397,6 +441,21 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn input_wraps_by_display_width() {
+        assert_eq!(input_lines("", 10), ["> "]);
+        assert_eq!(input_lines("hi", 10), ["> hi"]);
+        // Exactly full: the cursor goes on a fresh row.
+        assert_eq!(input_lines("12345678", 10), ["> 12345678", ""]);
+        assert_eq!(input_lines("123456789", 10), ["> 12345678", "9"]);
+        assert_eq!(input_lines("ab\ncd", 10), ["> ab", "cd"]);
+        assert_eq!(input_lines("ab\n", 10), ["> ab", ""]);
+        // Wide characters take two columns and never split across rows.
+        assert_eq!(input_lines("日本語です", 7), ["> 日本", "語です"]);
+        // A width of zero still makes progress.
+        assert_eq!(input_lines("ab", 0).len(), 5);
     }
 
     #[test]
