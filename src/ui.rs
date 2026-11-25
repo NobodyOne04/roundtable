@@ -192,7 +192,10 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) -> usize {
     let mut entry_start = Vec::with_capacity(app.lines.len() + 1);
     for (i, line) in app.lines.iter().enumerate() {
         entry_start.push(lines.len());
-        for l in chat_lines(line, selected == Some(i)) {
+        for l in chat_lines(line, selected == Some(i))
+            .into_iter()
+            .flat_map(|l| split_tall(l, width))
+        {
             let rows = Paragraph::new(l.clone())
                 .wrap(Wrap { trim: false })
                 .line_count(width);
@@ -261,6 +264,31 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) -> usize {
     scrolled
 }
 
+/// A line that would wrap to more than `TALL` rows, cut into lines of at most `TALL` rows'
+/// worth of text, so the widget's `u16` offset never has to reach into one line further
+/// than that. Wrapping at the cuts may differ slightly from the uncut line, and the pieces
+/// keep the line's style, not each span's: only for text this long.
+fn split_tall(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    const TALL: usize = 1024;
+    let per_piece = (width.max(1) as usize) * TALL;
+    if line.width() <= per_piece {
+        return vec![line];
+    }
+    let (style, text) = (line.style, line.to_string());
+    let mut pieces = vec![];
+    let (mut piece, mut used) = (String::new(), 0);
+    for g in text.graphemes(true) {
+        if used + g.width() > per_piece {
+            pieces.push(Line::styled(std::mem::take(&mut piece), style));
+            used = 0;
+        }
+        piece.push_str(g);
+        used += g.width();
+    }
+    pieces.push(Line::styled(piece, style));
+    pieces
+}
+
 fn draw_threads(frame: &mut Frame, app: &App, area: Rect) {
     let focus = app.focus == Focus::Threads;
     let width = area.width.saturating_sub(4) as usize;
@@ -285,11 +313,13 @@ fn draw_threads(frame: &mut Frame, app: &App, area: Rect) {
             })
             .collect()
     };
-    // The picked thread stays in view (`G` in a long list).
+    // The picked thread stays in view (`G` in a long list): rows before it are skipped as
+    // `usize`, never squeezed into the widget's `u16` offset.
     let inner = area.height.saturating_sub(2) as usize;
-    let top = (app.thread_pick + 1).saturating_sub(inner) as u16;
+    let top = (app.thread_pick + 1).saturating_sub(inner);
+    let rows: Vec<Line> = rows.into_iter().skip(top).collect();
     let block = focused(Block::bordered().title(" threads "), focus);
-    frame.render_widget(Paragraph::new(rows).scroll((top, 0)).block(block), area);
+    frame.render_widget(Paragraph::new(rows).block(block), area);
 }
 
 fn draw_context(frame: &mut Frame, app: &App, area: Rect) {
@@ -311,7 +341,7 @@ fn draw_context(frame: &mut Frame, app: &App, area: Rect) {
             .get(&r.id)
             .and_then(|l| roundtable::limits::blocked_until(l, now))
             .map(|until| {
-                let local = |s: i64| (s + crate::utc_offset_at(s)).max(0) as u64 * 1000;
+                let local = |s: i64| roundtable::limits::local_ms(s, crate::utc_offset_at);
                 // Its own row: the pane is 28 columns inside, too narrow beside the state.
                 format!(
                     "  limited until {}",

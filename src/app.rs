@@ -761,6 +761,9 @@ impl App {
             (Focus::Chat, KeyCode::Char('G')) => {
                 self.scroll = 0;
                 self.select_last();
+                // The bottom of the thread, even when the last reply is taller than the pane:
+                // not "show the selected reply's start".
+                self.follow_selection = false;
             }
             (Focus::Chat, KeyCode::Char('g')) if pending_g => {
                 self.scroll = usize::MAX;

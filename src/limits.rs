@@ -175,6 +175,9 @@ fn iso_ms(text: &str) -> Option<u64> {
         Some("") => 0,
         Some(frac) => {
             let digits = frac.strip_prefix('.')?;
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
             format!("{digits:0<3}").get(..3)?.parse::<i64>().ok()?
         }
         None => return None,
@@ -239,10 +242,7 @@ pub fn report(
     now_ms: u64,
     offset_at: impl Fn(i64) -> i64,
 ) -> String {
-    let local = |s: i64| {
-        let s = s.clamp(0, LAST_SECOND);
-        (s + offset_at(s)).max(0) as u64 * 1000
-    };
+    let local = |s: i64| local_ms(s, &offset_at);
     let width = ids.iter().map(|id| id.len()).max().unwrap_or(0);
     let mut rows = vec!["limits:".to_string()];
     for id in ids {
@@ -309,6 +309,13 @@ pub fn warnings(limits: &BTreeMap<String, Limits>, now_ms: u64) -> Vec<String> {
 }
 
 /// `HH:MM` today, else `Mon HH:MM` within a week, else the date; both in local milliseconds.
+/// Local Unix milliseconds of Unix second `s`, clamped to years 1970-9999 so a damaged
+/// reading (e.g. from `limits.json`) can't overflow.
+pub fn local_ms(s: i64, offset_at: impl Fn(i64) -> i64) -> u64 {
+    let s = s.clamp(0, LAST_SECOND);
+    (s + offset_at(s)).max(0) as u64 * 1000
+}
+
 pub fn when(at_ms: u64, now_ms: u64) -> String {
     let minutes = at_ms / 60_000;
     let clock = format!("{:02}:{:02}", minutes / 60 % 24, minutes % 60);
@@ -491,6 +498,9 @@ mod tests {
         assert_eq!(iso_ms("2026-99-25T15:42:05Z"), None, "no month 99");
         assert_eq!(iso_ms("2026-02-30T00:00:00Z"), None, "no 30 February");
         assert_eq!(iso_ms("2026-11-25T24:00:00Z"), None);
+        assert_eq!(iso_ms("2026-11-25T20:45:00.Z"), None, "an empty fraction");
+        assert_eq!(iso_ms("2026-11-25T20:45:00.123garbageZ"), None);
+        assert_eq!(iso_ms("2026-11-25T20:45:00.123456Z"), Some(NOW + 123));
     }
 
     #[test]

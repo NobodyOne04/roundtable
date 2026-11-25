@@ -1552,6 +1552,54 @@ mod tests {
     }
 
     #[test]
+    fn g_shows_the_end_of_a_last_reply_taller_than_the_pane() {
+        let mut app = App::default();
+        app.note("first".into(), false);
+        let tall: Vec<String> = (0..50).map(|n| format!("row {n}")).collect();
+        app.note(tall.join("\n"), false);
+        let key = |c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        app.update(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        app.update(key('k'));
+        app.update(key('G'));
+        let screen = render(&app, 60, 12);
+        let text: String = screen.buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("row 49"), "the reply's end, not its start");
+        assert!(!text.contains("scrolled up"));
+    }
+
+    #[test]
+    fn one_unbroken_line_past_u16_rows_shows_its_end() {
+        let mut app = App::default();
+        app.note(format!("{}END", "a".repeat(58 * 70_000)), false);
+        let screen = render(&app, 60, 12);
+        let text: String = screen.buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("END"));
+    }
+
+    #[test]
+    fn g_in_a_huge_thread_list_shows_the_picked_thread() {
+        let mut app = App::default();
+        app.update(Event::Threads(
+            (0..70_000)
+                .map(|n| roundtable::app::ThreadRow {
+                    id: format!("{n}"),
+                    title: format!("thread {n}"),
+                    day: "2026-11-25".into(),
+                    elsewhere: false,
+                })
+                .collect(),
+        ));
+        app.update(Event::Resize(130));
+        let key = |c| Event::Key(KeyEvent::new(c, KeyModifiers::NONE));
+        app.update(key(KeyCode::Esc));
+        app.update(key(KeyCode::Char('h')));
+        app.update(key(KeyCode::Char('G')));
+        let screen = render(&app, 130, 14);
+        let text: String = screen.buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("thread 69999"));
+    }
+
+    #[test]
     fn an_interrupt_meant_for_the_editor_does_not_kill_roundtable() {
         let file = Path::new("/dev/null");
         let sh = |script: &str| vec!["sh".to_string(), "-c".into(), script.into()];
