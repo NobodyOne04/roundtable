@@ -20,6 +20,7 @@
 - Proposed ADR 0010 (JSONL files as the transcript) and 0011 (hot in-memory model registry)
 
 ### Fixed
+- Transcript events carry `turn` (the user message they descend from) and `parent` (the event that caused them), as ADR 0010 says; they were always empty
 - Long prompts wrap in the input box (up to 8 rows, then the last ones) and the cursor stays in view; a pasted multi-line block goes into the input whole instead of sending at its first line break
 - The `ask` socket falls back to a short owner-only temp folder when the data folder path is too long for a Unix socket (startup failed)
 - Writer safety after Codex review: broadcasts never write, explicit safe default modes, waiting writers keep order, the crash lock covers the whole git checkout and fails closed on unreadable history or git errors, `/quiet` unlocks only after the settle is on disk

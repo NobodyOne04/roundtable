@@ -177,6 +177,7 @@ pub enum Effect {
     Record {
         event: NewEvent,
         durable: bool,
+        link: Link,
     },
     /// Persist a native session id, bound to the participant's identity (ADR 0010).
     SaveSession {
@@ -267,6 +268,19 @@ pub struct ContextRow {
     pub tokens: (u64, u64),
 }
 
+/// How a recorded event hangs together (ADR 0010 `turn`/`parent`), in `App`'s own keys: the
+/// loop assigns `seq`, so it maps each `key` to the `seq` it wrote and fills `turn` and
+/// `parent` from that. 0 means none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Link {
+    /// This event's key, for later events to point at.
+    pub key: u64,
+    /// The user message it descends from.
+    pub turn: u64,
+    /// The event that caused it.
+    pub parent: u64,
+}
+
 /// Runtime state of one participant; survives registry reloads for as long as it runs.
 #[derive(Debug)]
 struct Seat {
@@ -278,6 +292,8 @@ struct Seat {
     queue: VecDeque<(String, bool, u64)>,
     /// The user message the running turn descends from: limits count per origin.
     origin: u64,
+    /// The key of the running turn's delivery: the `parent` of what the turn records.
+    delivery_key: u64,
     /// The `ask` this turn answers, and who asked.
     answering: Option<u64>,
     asked_by: Option<String>,
@@ -335,7 +351,11 @@ pub struct App {
     talk_on: bool,
     /// Per user message: model-to-model turns started and tokens they used (ADR 0007).
     origins: BTreeMap<u64, (u32, u64)>,
+    /// Origins and transcript keys (`Link`) share this counter, so an origin is also the
+    /// key of its user message.
     next_origin: u64,
+    /// The latest user message's origin: the status line shows its limits.
+    last_origin: u64,
     /// First Ctrl-C arms, the second quits.
     quit_armed: bool,
 }
@@ -376,6 +396,7 @@ impl App {
             talk_on: true,
             origins: BTreeMap::new(),
             next_origin: 1,
+            last_origin: 0,
             quit_armed: false,
         };
         app.apply_registry(registry, checks, false);
@@ -708,7 +729,7 @@ impl App {
         let talk = &self.registry.talk;
         let (turns, tokens) = self
             .origins
-            .get(&(self.next_origin - 1))
+            .get(&self.last_origin)
             .copied()
             .unwrap_or_default();
         let edits = if self.locked() {
@@ -782,14 +803,14 @@ impl App {
             );
         }
         let to = targets.iter().map(|id| self.party(id)).collect();
-        let mut effects = vec![record(
-            user(),
-            to,
-            transcript::Kind::Msg,
-            json!({ "text": prompt }),
-        )];
-        let origin = self.next_origin;
-        self.next_origin += 1;
+        let origin = self.next_key();
+        self.last_origin = origin;
+        let mut effects = vec![
+            record(user(), to, transcript::Kind::Msg, json!({ "text": prompt })).linked(Link {
+                key: origin,
+                ..Link::default()
+            }),
+        ];
         for id in targets {
             effects.extend(self.deliver(&id, prompt.clone(), writable, origin));
         }
@@ -1324,6 +1345,7 @@ impl App {
                     session: None,
                     queue: VecDeque::new(),
                     origin: 0,
+                    delivery_key: 0,
                     answering: None,
                     asked_by: None,
                     writable: false,
@@ -1501,6 +1523,8 @@ impl App {
         seat.prompt = Some(prompt.clone());
         let session = seat.session.clone();
         let history = seat.history.clone();
+        let key = self.next_key();
+        self.seat_mut(&p.id).expect("seat").delivery_key = key;
         let delivery = record(
             router(),
             vec![self.party(&p.id)],
@@ -1508,7 +1532,12 @@ impl App {
             // A writable delivery is the writer marker: synced before the CLI starts.
             json!({ "status": "sent", "text": prompt, "writable": writable }),
         )
-        .durable();
+        .durable()
+        .linked(Link {
+            key,
+            turn: origin,
+            parent: origin,
+        });
         let Adapter::Cli(kind) = p.adapter else {
             let role = p
                 .role
@@ -1581,6 +1610,11 @@ impl App {
             return vec![];
         };
         let reply = seat.reply;
+        let link = Link {
+            key: 0,
+            turn: seat.origin,
+            parent: seat.delivery_key,
+        };
         match event {
             PEvent::Session(session) => {
                 // Saved under the identity the turn went to; it becomes the seat's session
@@ -1637,12 +1671,15 @@ impl App {
                     }
                     None => self.lines.push(line),
                 }
-                vec![record(
-                    party,
-                    vec![],
-                    transcript::Kind::ToolCall,
-                    json!({ "summary": summary }),
-                )]
+                vec![
+                    record(
+                        party,
+                        vec![],
+                        transcript::Kind::ToolCall,
+                        json!({ "summary": summary }),
+                    )
+                    .linked(link),
+                ]
             }
             PEvent::Usage {
                 input,
@@ -1656,12 +1693,15 @@ impl App {
             PEvent::Error(text) => {
                 self.push(id, text.clone(), LineKind::Error);
                 // Kept in the transcript too: a failed reply should say why.
-                vec![record(
-                    party,
-                    vec![],
-                    transcript::Kind::Error,
-                    json!({ "text": text }),
-                )]
+                vec![
+                    record(
+                        party,
+                        vec![],
+                        transcript::Kind::Error,
+                        json!({ "text": text }),
+                    )
+                    .linked(link),
+                ]
             }
             PEvent::Done(outcome) => self.finish(id, outcome),
         }
@@ -1677,6 +1717,11 @@ impl App {
             seat.thread_tokens.1 += tokens_out;
         }
         let writable = std::mem::take(&mut seat.writable);
+        let link = Link {
+            key: 0,
+            turn: seat.origin,
+            parent: seat.delivery_key,
+        };
         let prompt = seat.prompt.take();
         let text = match seat.reply.take() {
             Some(i) => {
@@ -1722,7 +1767,8 @@ impl App {
                 "writable": writable,
             }),
         )
-        .durable();
+        .durable()
+        .linked(link);
         if let (Effect::Record { event, .. }, Some((tokens_in, tokens_out, ..))) =
             (&mut reply, usage)
         {
@@ -1834,6 +1880,11 @@ impl App {
             }
         };
         let (from_party, to_party) = (self.party(&caller), self.party(&to));
+        let handoff_link = Link {
+            key: self.next_key(),
+            turn: origin.unwrap_or(0),
+            parent: self.seat_mut(&caller).map_or(0, |s| s.delivery_key),
+        };
         let handoff = |status: &str, reason: Option<&str>| {
             record(
                 from_party.clone(),
@@ -1842,6 +1893,7 @@ impl App {
                 json!({ "ask": ask, "prompt": prompt, "status": status, "reason": reason, "origin": origin }),
             )
             .durable()
+            .linked(handoff_link)
         };
         if let Some(why) = refusal {
             let effects = vec![
@@ -1868,8 +1920,27 @@ impl App {
             LineKind::Handoff,
         );
         let target = target.expect("checked above");
-        // An asked turn never writes, whoever it is (ADR 0004).
-        effects.extend(self.start(&target, prompt, false, origin));
+        // An asked turn never writes, whoever it is (ADR 0004). Its delivery was caused by
+        // the handoff, not by the user message.
+        effects.extend(
+            self.start(&target, prompt, false, origin)
+                .into_iter()
+                .map(|e| match e {
+                    Effect::Record {
+                        event,
+                        durable,
+                        link,
+                    } if event.kind == transcript::Kind::Delivery => Effect::Record {
+                        event,
+                        durable,
+                        link: Link {
+                            parent: handoff_link.key,
+                            ..link
+                        },
+                    },
+                    other => other,
+                }),
+        );
         if let Some(seat) = self.seat_mut(&to) {
             seat.answering = Some(ask);
             seat.asked_by = Some(caller.clone());
@@ -1911,6 +1982,12 @@ impl App {
             }
         }
         effects
+    }
+
+    /// A fresh key for an origin or a `Link`.
+    fn next_key(&mut self) -> u64 {
+        self.next_origin += 1;
+        self.next_origin - 1
     }
 
     fn seat_mut(&mut self, id: &str) -> Option<&mut Seat> {
@@ -1980,6 +2057,7 @@ fn record(
             tokens_out: None,
         },
         durable: false,
+        link: Link::default(),
     }
 }
 
@@ -1996,9 +2074,21 @@ fn status(text: String) -> Effect {
 impl Effect {
     fn durable(self) -> Self {
         match self {
-            Effect::Record { event, .. } => Effect::Record {
+            Effect::Record { event, link, .. } => Effect::Record {
                 event,
                 durable: true,
+                link,
+            },
+            other => other,
+        }
+    }
+
+    fn linked(self, link: Link) -> Self {
+        match self {
+            Effect::Record { event, durable, .. } => Effect::Record {
+                event,
+                durable,
+                link,
             },
             other => other,
         }
@@ -2184,6 +2274,7 @@ mod tests {
                 Effect::Record {
                     event,
                     durable: true,
+                    ..
                 },
             ] => {
                 assert_eq!(event.payload["text"], "pong");
@@ -2765,6 +2856,77 @@ mod tests {
             panic!()
         };
         assert_eq!(event.payload["usage_estimated"], true);
+    }
+
+    /// The `Link`s of every `Record` among `effects`, by kind.
+    fn links(effects: &[Effect]) -> Vec<(transcript::Kind, Link)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Record { event, link, .. } => Some((event.kind, *link)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn records_link_to_their_user_message_and_cause() {
+        use transcript::Kind;
+        let mut app = App::default();
+        let sent = links(&type_line(&mut app, "hi"));
+        let [(Kind::Msg, msg), (Kind::Delivery, delivery)] = sent[..] else {
+            panic!("{sent:?}")
+        };
+        assert_ne!(msg.key, 0);
+        assert_eq!((msg.turn, msg.parent), (0, 0));
+        assert_ne!(delivery.key, 0);
+        assert_eq!((delivery.turn, delivery.parent), (msg.key, msg.key));
+
+        let tool = links(&app.update(agent("claude", PEvent::Tool("Read src/app.rs".into()))));
+        assert_eq!(
+            tool,
+            [(
+                Kind::ToolCall,
+                Link {
+                    key: 0,
+                    turn: msg.key,
+                    parent: delivery.key
+                }
+            )]
+        );
+
+        // Claude asks Codex: the handoff hangs off Claude's delivery, Codex's delivery off
+        // the handoff, and both still descend from the user message.
+        let asked = links(&ask(&mut app, 1, "claude", "codex"));
+        let [(Kind::Handoff, handoff), (Kind::Delivery, codex)] = asked[..] else {
+            panic!("{asked:?}")
+        };
+        assert_eq!((handoff.turn, handoff.parent), (msg.key, delivery.key));
+        assert_eq!((codex.turn, codex.parent), (msg.key, handoff.key));
+        let reply = links(&app.update(agent("codex", PEvent::Done(Outcome::Complete))));
+        assert!(
+            reply.contains(&(
+                Kind::Msg,
+                Link {
+                    key: 0,
+                    turn: msg.key,
+                    parent: codex.key
+                }
+            )),
+            "{reply:?}"
+        );
+        let reply = links(&app.update(agent("claude", PEvent::Done(Outcome::Complete))));
+        assert!(
+            reply.contains(&(
+                Kind::Msg,
+                Link {
+                    key: 0,
+                    turn: msg.key,
+                    parent: delivery.key
+                }
+            )),
+            "{reply:?}"
+        );
     }
 
     fn ask(app: &mut App, ask: u64, caller: &str, to: &str) -> Vec<Effect> {

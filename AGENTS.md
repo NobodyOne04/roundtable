@@ -34,6 +34,8 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
 - Review the input/default PR (`minor/input-wrap-default-all`), skipped (owner asked to go on
   without Codex): input wrapping and bracketed paste in `src/ui.rs`/`src/main.rs`, and
   `default = "all"` routing in `src/app.rs`/`src/registry.rs` (must stay read-only).
+- Review the `turn`/`parent` fix (`bug/event-turn-parent`, your deferred finding), skipped
+  (Codex paused by the owner): `Link` keys in `App`, resolved to `seq` in `Runtime::record`.
 - Record a real two-turn Codex fixture (first turn plus `exec resume`):
   `tests/fixtures/codex-0.171.0-turn1.jsonl` was cut from one turn, and resume was never
   recorded. Sanitize as CLAUDE.md says, and hand it to Claude to commit.
