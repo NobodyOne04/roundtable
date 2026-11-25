@@ -165,7 +165,7 @@ is read-only: plan mode for Claude, the read-only sandbox for Codex, both withou
 MCP servers, hooks and plugins, and each in its own mirror of the checkout
 (`<data>/worktrees/`): synced before each of its turns (HEAD, uncommitted changes and
 untracked files; ignored files like `target/` are not copied, so it builds there itself),
-never copied back. `/worktrees` lists the mirrors with their sizes, `/worktrees clean [id]`
+never copied back (needs git 2.35 or later). `/worktrees` lists the mirrors with their sizes, `/worktrees clean [id]`
 removes them. Not mirrored yet: a checkout with no commit, a populated submodule, an
 untracked nested repository; those turns fail and say why rather than review a partial copy.
 
