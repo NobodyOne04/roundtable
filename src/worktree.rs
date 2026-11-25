@@ -240,6 +240,8 @@ pub fn sync(
     let index = git(&["rev-parse", "--git-path", "index"], None)?;
     let index = checkout.join(String::from_utf8_lossy(&index).trim());
     let snapshot = dir.join(format!("{id}.index"));
+    // A lock a hard-stopped sync left on the snapshot would fail every `update-index`.
+    let _ = fs::remove_file(dir.join(format!("{id}.index.lock")));
     fs::copy(&index, &snapshot).map_err(|e| format!("{}: {e}", index.display()))?;
     let src_in = |args: &[&str], input: Option<&[u8]>| {
         let env = [("GIT_INDEX_FILE", snapshot.as_os_str())];
@@ -329,7 +331,7 @@ pub fn sync(
     let stray: Vec<&[u8]> = stray.split(|b| *b == 0).filter(|n| !n.is_empty()).collect();
     // Inside a folder the writer ignores (`node_modules/`) they belong to the agent's own
     // tree, which `clean` spares anyway: left alone.
-    let spared = ignored_by(checkout, &stray)?;
+    let spared = ignored_by(checkout, &stray, cancel)?;
     for name in stray.into_iter().filter(|n| !spared.contains(*n)) {
         let name = Path::new(OsStr::from_bytes(name));
         let parent = name.parent().unwrap_or(Path::new(""));
@@ -666,43 +668,29 @@ fn open_beneath(root: &Path, rel: &Path) -> std::io::Result<fs::File> {
 
 /// Which of `names` the checkout's ignore rules (the writer's) exclude, a folder rule
 /// covering the files in it.
-fn ignored_by(checkout: &Path, names: &[&[u8]]) -> Result<HashSet<Vec<u8>>, String> {
+fn ignored_by(
+    checkout: &Path,
+    names: &[&[u8]],
+    cancel: &AtomicBool,
+) -> Result<HashSet<Vec<u8>>, String> {
     if names.is_empty() {
         return Ok(HashSet::new());
     }
-    let mut command = Command::new("git");
-    command
-        .args(["-c", "core.fsmonitor=false", "-C"])
-        .arg(checkout)
-        .args(["check-ignore", "-z", "--stdin", "--no-index"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for var in REPO_ENV {
-        command.env_remove(var);
-    }
-    let mut child = command.spawn().map_err(|e| format!("git: {e}"))?;
     let input: Vec<u8> = names
         .iter()
         .flat_map(|n| n.iter().chain(&[0]))
         .copied()
         .collect();
-    let stdin = child.stdin.take();
-    std::thread::spawn(move || {
-        if let Some(mut stdin) = stdin {
-            let _ = stdin.write_all(&input);
-        }
-    });
-    let out = child.wait_with_output().map_err(|e| format!("git: {e}"))?;
-    // 1 is "none ignored", not a failure.
-    if !matches!(out.status.code(), Some(0 | 1)) {
-        return Err(format!(
-            "git check-ignore: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
+    // Exit 1 is "none ignored", not a failure.
+    let out = run_git_with(
+        &[OsStr::new("-C"), checkout.as_os_str()],
+        &["check-ignore", "-z", "--stdin", "--no-index"],
+        Some(&input),
+        &[],
+        cancel,
+        &[0, 1],
+    )?;
     Ok(out
-        .stdout
         .split(|b| *b == 0)
         .filter(|n| !n.is_empty())
         .map(<[u8]>::to_vec)
@@ -733,6 +721,18 @@ fn run_git(
     input: Option<&[u8]>,
     env: &[(&str, &OsStr)],
     cancel: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    run_git_with(base, args, input, env, cancel, &[0])
+}
+
+/// `run_git`, taking the exit codes in `ok` as success.
+fn run_git_with(
+    base: &[&OsStr],
+    args: &[&str],
+    input: Option<&[u8]>,
+    env: &[(&str, &OsStr)],
+    cancel: &AtomicBool,
+    ok: &[i32],
 ) -> Result<Vec<u8>, String> {
     let mut command = Command::new("git");
     // Its own process group, so a cancel stops git's helpers (checkout workers) too.
@@ -807,7 +807,7 @@ fn run_git(
     };
     let stdout = stdout.join().unwrap_or_default();
     let stderr = stderr.join().unwrap_or_default();
-    if status.success() {
+    if status.code().is_some_and(|code| ok.contains(&code)) {
         Ok(stdout)
     } else {
         Err(format!(
@@ -845,7 +845,8 @@ pub fn list(data_root: &Path, checkout: &Path) -> Vec<(String, Record)> {
 
 /// Removes one mirror `list` returned, and its record. A mirror git never registered (a
 /// crash during creation) is just deleted.
-pub fn remove(id: &str, record: &Record) -> Result<(), String> {
+pub fn remove(id: &str, record: &Record) -> Result<String, String> {
+    let mut note = String::from("removed");
     let never = AtomicBool::new(false);
     if fs::symlink_metadata(&record.mirror).is_ok_and(|m| m.file_type().is_symlink()) {
         // Not ours: a link to who knows which worktree. Only the link goes; its
@@ -883,6 +884,13 @@ pub fn remove(id: &str, record: &Record) -> Result<(), String> {
         // The checkout is gone (moved or deleted) and with it git's registration: the
         // folder's identity is the proof it is the one we made.
         fs::remove_dir_all(&record.mirror).map_err(|e| e.to_string())?;
+        // A checkout that was moved took its registration along, where we can't find it.
+        note = format!(
+            "removed; if {} was moved, not deleted, its git still lists this mirror (locked): \
+             `git worktree remove -f -f {}` there",
+            record.source.display(),
+            record.mirror.display()
+        );
     }
     if fs::symlink_metadata(&record.mirror).is_ok() {
         // Nothing vouches for it (a crash before git made it, or someone reused the path):
@@ -896,7 +904,9 @@ pub fn remove(id: &str, record: &Record) -> Result<(), String> {
     let dir = record.mirror.parent().unwrap_or(Path::new(""));
     let _ = fs::remove_file(dir.join(format!("{id}.copied")));
     let _ = fs::remove_file(dir.join(format!("{id}.index")));
-    fs::remove_file(dir.join(format!("{id}.json"))).map_err(|e| e.to_string())
+    let _ = fs::remove_file(dir.join(format!("{id}.index.lock")));
+    fs::remove_file(dir.join(format!("{id}.json"))).map_err(|e| e.to_string())?;
+    Ok(note)
 }
 
 /// Bytes under `path`, symlinks not followed.

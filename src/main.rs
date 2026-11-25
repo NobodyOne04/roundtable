@@ -1219,7 +1219,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                                     .push(format!("{who}: kept, its turn or a removal is running"));
                             } else if clean {
                                 lines.push(match worktree::remove(who, record) {
-                                    Ok(()) => format!("{who}: removed"),
+                                    Ok(note) => format!("{who}: {note}"),
                                     Err(err) => format!("{who}: {err}"),
                                 });
                             } else {
