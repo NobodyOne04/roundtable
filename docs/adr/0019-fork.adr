@@ -1,6 +1,6 @@
 # 0019. `/fork`: branch the current thread
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-25; revised after Codex's critique the same day)
 - Date: 2026-11-25
 
 [0008](0008-slash-commands-and-mentions.adr) lists `/fork` ("branch the current thread
@@ -10,10 +10,10 @@ here") as later; [0010](0010-filesystem-event-log.adr) already reserves `parent_
 ## Technical details
 - **`/fork [title]`**: a new thread that starts with everything the current one has, and
   goes its own way from here. The old thread stays as it was and can be resumed.
-- **Branch point: the end of the thread only** (v1). Both CLIs fork a session as a whole
-  (Claude `--resume <id> --fork-session`, Codex `codex exec fork <id>` /
-  `codex fork`); neither can branch at an earlier message, and the 0003 rule still holds:
-  ship only what both adapters can do natively. Forking from a selected earlier line is
+- **Branch point: the end of the thread only** (v1). This is roundtable's limit across
+  adapters, not Claude's: Claude can resume at an earlier message (`--resume-session-at`),
+  Codex forks a session only as a whole (`codex exec fork <id>`), and the 0003 rule still
+  holds: ship only what both adapters can do natively. Forking from a selected earlier line is
   a later extension (it would need a summary seeded into fresh sessions, see
   [0020](0020-handoff.adr)).
 - **Refused while busy**: a fork with a reply running or queued says "wait for replies to
@@ -22,17 +22,38 @@ here") as later; [0010](0010-filesystem-event-log.adr) already reserves `parent_
   - new `threads/<ulid>/meta.json`: `parent_id` = old thread id, `fork_event` = the old
     thread's last `seq`, `title` = given or `<old title> (fork)`, same `checkout`;
   - `events.jsonl` starts with one `status` line `forked from <id>@<seq>`; parent events
-    are not copied. Opening a fork reads the parent's events up to `fork_event` first,
-    then its own (recursively for forks of forks), using the `turn`/`parent` fields so
-    ids stay distinct per thread;
-  - `sessions.json`: each CLI session forked natively on the fork's first turn per agent
-    (lazy: no CLI call at `/fork` time). Until then the parent's session id is kept with
-    a `fork_pending` flag, so the first turn runs `--resume <id> --fork-session` (Claude)
-    or `exec fork` (Codex) instead of a plain resume. Parent and child never share a
-    native session.
-  - free models: their history is rebuilt from the events, so nothing extra.
+    are not copied.
+  - **One ancestry reader** serves `/resume`, `/log`, history builders and `/context`: it
+    reads the parent's events up to `fork_event`, then the child's own (recursively for
+    forks of forks). Every event read this way is addressed as `(thread_id, seq)`, and
+    its `turn`/`parent` resolve within its own thread, so equal `seq` numbers in parent
+    and child never collide. A missing parent, a `fork_event` past the parent's end, or
+    a cycle in `parent_id` fails visibly ("cannot open fork: …"), never a partial thread.
+  - **The reader returns everything up to the fork point; each consumer filters**:
+    deliveries, settles and `/compact` checkpoints ([0021](0021-compact.adr)) are needed to
+    rebuild a model's history exactly as the parent had it (0010: history uses only `sent`
+    deliveries), so they are inherited. What a consumer takes from inherited events is its
+    own rule: the chat and `/log` show the conversation; `/usage thread` on a fork counts
+    only the fork's own events, and `/usage today|all` count every event once, in the
+    thread that recorded it; approval grants ([0018](0018-approvals-in-the-chat.adr)) are never restored
+    from inherited events, so a fork starts with none.
+  - **Native sessions are pinned at the fork point**, because the parent's session keeps
+    moving if the parent is resumed and used before the child's first turn:
+    - Claude: `/fork` stores the parent session id and the id of its last message; the
+      child's first turn runs `--resume <parent> --resume-session-at <message id>
+      --fork-session` (the flag works in 2.1.332 but is missing from `--help`).
+    - Codex: `/fork` runs `codex exec fork <thread id>` at once, without a prompt, and
+      stores the new thread id; the child resumes that.
+    - Both boundaries are verified by a recorded fixture where the parent advances after
+      `/fork` and before the child's first turn; an adapter whose boundary cannot be
+      pinned refuses `/fork` for its sessions with that reason.
+    - Exception, ACP agents ([0023](0023-acp-adapter.adr)): no native fork; in a fork they
+      start a new session, seeded only with what that agent itself was sent before, under
+      its current identity.
+    Parent and child never share a native session.
+  - free models: their history is rebuilt from the inherited events, so nothing extra.
 - **Usage**: tokens of the shared part stay counted in the parent; the fork's
-  `usage.json` starts empty.
+  `usage.json` starts empty and `/usage thread` on a fork counts only its own.
 - **Threads pane**: a fork shows under its parent, indented (`↳ title`).
 - **Writer lock**: unchanged; forks share the checkout, so one writer at a time across
   both ([0012](0012-checkout-writer-lock.adr)).
@@ -41,7 +62,7 @@ here") as later; [0010](0010-filesystem-event-log.adr) already reserves `parent_
   follow `parent_id`.
 
 ## Technologies and alternatives
-- Involved: claude `--fork-session`, codex `exec fork` (0.172.0)
+- Involved: claude `--fork-session` and `--resume-session-at` (2.1.332), codex `exec fork` (0.172.0)
 - Alternatives:
   - Copying the parent's events into the fork: self-contained folders, but doubles storage
     and breaks "append-only, one place" for usage.

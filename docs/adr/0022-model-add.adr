@@ -1,6 +1,6 @@
 # 0022. `/model add`: add a free model from the chat
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-25; revised after Codex's critique the same day)
 - Date: 2026-11-25
 
 Adding an OpenAI-compatible model ([0005](0005-openai-compatible-models.adr)) means
@@ -10,28 +10,39 @@ guided `/model add` as later. This ADR decides its steps and where the key goes.
 ## Technical details
 - **Scope**: `kind = "openai"` models only. CLI agents are fixed to `claude` and `codex`
   ([0011](0011-hot-model-registry.adr)); adding another CLI needs code.
-- **Flow**, one question per step in the input box, `Esc` aborts with nothing written:
+- **Flow**, one question per step in the input box; `Esc` at any step aborts with nothing
+  written, and a discovery answer that arrives after `Esc` or after the provider changed
+  is dropped:
   1. Provider: a short preset list plus `other`:
      `ollama` (`http://localhost:11434/v1`, no key), `lmstudio`
      (`http://localhost:1234/v1`, no key), `openrouter`
-     (`https://openrouter.ai/api/v1`, key), `other` (asks for the base URL).
-  2. Key, when the provider needs one: `env:VAR` or `keyring:<name>`. The key itself is
-     never typed into roundtable: for `keyring:` the chat prints the command to store it
+     (`https://openrouter.ai/api/v1`, key), `other` (asks for the base URL, then whether
+     it needs a key).
+  2. **The URL is checked before any key is touched**: parsed, `http` or `https` only, no
+     user info (`user:pass@`) in it, and `http` with a key only for a loopback host
+     (`localhost`, `127.0.0.1`, `::1`); otherwise `https` is required. The registry's own
+     URL checks are the same code.
+  3. Key, when needed: `env:VAR` or `keyring:<name>`. The key itself is never typed into
+     roundtable: for `keyring:` the chat prints the command to store it
      (`security add-generic-password -s roundtable -a <name> -w` on macOS,
-     `secret-tool store …` on Linux). Same rule as 0005 and 0011: config holds references
-     only.
-  3. Model: roundtable calls `GET <base_url>/models` with the key and shows the list to
-     pick from (completion as in 0008); if the endpoint fails, the name is typed.
-  4. Id: suggested from the model name (`llama3-8b`), editable; must be unique.
-  5. `context_window`: taken from the `/models` answer when the provider gives it,
-     otherwise asked with 8192 suggested.
-- **Then**: the entry is appended to `models.toml` with `toml_edit`, keeping comments
-  (as `/model enable|disable|use` do), enabled; the hot registry picks it up, and
-  `/model test <id>` runs once automatically.
-- **Refused**: an id that exists, a base URL that is not `http(s)`, a non-local `http`
-  URL with a key (the key would travel in clear; `https` required).
-- Consequences: a free model takes a minute to add, without the README open. Costs: a
-  small wizard state machine in `App` and provider presets to keep current.
+     `secret-tool store …` on Linux). Config holds references only (0005, 0011).
+  4. Model: roundtable resolves the key and calls `GET <base_url>/models` with the same
+     HTTP client as chat turns (no redirects followed, [0005](0005-openai-compatible-models.adr)),
+     and shows the list to pick from; if the endpoint fails, the name is typed.
+  5. Id: suggested from the model name (`llama3-8b`), editable; must be unique.
+  6. `context_window`: from the `/models` answer when the provider gives it, otherwise
+     asked with 8192 suggested.
+- **Then, through the live registry, not the file watcher** (roundtable skips watcher
+  events for its own writes, 0011): the candidate entry is added to the registry parsed
+  from the current `models.toml`, the whole candidate is validated as any reload is, and
+  only if it is valid is it applied in memory and written back with `toml_edit` (comments
+  kept, as `/model enable|disable|use` do). Then `/model test <id>` runs on the resulting
+  identity. A write failure and a failed test are reported separately: a model that is
+  saved but unreachable stays, enabled, with the test's error shown.
+- **Refused**: an id that exists, any URL failing step 2.
+- Consequences: a free model takes a minute to add, without the README open, and no key
+  ever goes to an unchecked URL. Costs: a small wizard state machine in `App` and
+  provider presets to keep current.
 
 ## Technologies and alternatives
 - Involved: `toml_edit` (already used), the OpenAI-compatible `/models` endpoint

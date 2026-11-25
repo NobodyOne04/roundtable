@@ -1,6 +1,6 @@
 # 0020. `/handoff`: pass the thread to another model
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-25; revised after Codex's critique the same day)
 - Date: 2026-11-25
 
 [0008](0008-slash-commands-and-mentions.adr) lists `/handoff <id>`: "send a summary of the
@@ -9,30 +9,48 @@ thread to `<id>` and make it default". Useful when one model hits its limit
 decides who writes the summary, what it contains and what changes after.
 
 ## Technical details
-- **`/handoff <id> [note]`**:
-  1. The current default model (or, with `default = "all"`, the writer; if neither, the
-     command asks for `/handoff <id> from <id>`) gets a read-only turn with a fixed
-     prompt: summarize this thread for a colleague who takes over: goal, decisions,
-     current state of the work, open questions, files touched, next step. Plus `note` if
-     given.
-  2. That summary goes to `<id>` as a message: `handoff from claude: <summary>`, with the
-     owner's `note`, in the same thread. `<id>` replies with what it understood and its
-     first step.
-  3. `default` becomes `<id>` (written to `models.toml`, [0011](0011-hot-model-registry.adr)).
-     It does **not** change `writer`: who edits stays an explicit config choice. The chat
-     says so if `<id>` is not the writer: `codex is now the default; it is read-only
-     (writer: claude)`.
-- **Transcript**: one `handoff` event (kind already in [0010](0010-filesystem-event-log.adr))
-  with `from`, `to`, the summary and the note; `turn`/`parent` link it to the summary turn.
-  In the chat it shows as one collapsed line, `Enter` expands it (0008's key note).
-- **The summary turn is read-only** (as any non-writer turn) and counts toward the
-  summarizer's usage; with the summarizer out of quota, `/handoff <id> raw` sends the last
-  `n` messages verbatim instead (`n` fitting `<id>`'s window, default 20).
-- **Free models** as targets get the summary as their first user message in a fresh
-  history: they have no earlier context to keep.
+- **`/handoff <id> [note]`**, three steps, all read-only even when either side is the
+  `writer`:
+  1. **Summary.** The summarizer is the current default (with `default = "all"`, the
+     writer; otherwise `/handoff <id> from <summarizer>`). A model can only summarize what
+     it saw, so its prompt carries the thread itself: the `/log` rendering
+     ([0024](0024-log-command.adr)) of this thread, oldest messages dropped to fit the
+     summarizer's window, with the instruction: summarize for a colleague who takes over
+     (goal, decisions, state of the work, open questions, files touched, next step), plus
+     `note`. The summarizer may never have received parts of that log (other models'
+     exchanges, their tool lines, errors), so before anything is sent the chat names both
+     sides and what is new to the summarizer, and asks: `claude summarizes for codex;
+     claude has not seen 12 entries (llama, codex) — send them to claude? y/n`. "Unseen" is
+     checked against the exact rendered text being sent, entry by entry (message, tool
+     line, error): any entry that did not come from or go to the summarizer counts. No
+     unseen entry: no question.
+  2. **Dispatch.** The summary goes to `<id>` as `handoff from <summarizer>: <summary>`
+     plus the note; `<id>` replies with what it understood and its first step. Only the
+     summary crosses to `<id>`'s provider, never other participants' raw replies.
+  3. **Default.** Only after `<id>`'s reply completes does `default` become `<id>`, the same
+     way `/model use <id>` does it ([0011](0011-hot-model-registry.adr)): the live registry
+     changes at once, then `models.toml` is written; if that write fails the chat says so
+     and the new default stays active for this session only. `writer` never changes: the chat says
+     `codex is now the default; it is read-only (writer: claude)` when that applies.
+- **Durable and unambiguous** ([0010](0010-filesystem-event-log.adr)): a `handoff` intent
+  event, synced before step 1, pins both participants' identities. Before step 2 the
+  target is rechecked: disabled or repointed since (identity differs) settles the handoff
+  `blocked` with that reason. Every handoff ends in one `settle`: `complete`, `failed`
+  (either turn failed), `interrupted` (`Esc`, as 0010 names it), or `blocked`;
+  `cancelled` stays a delivery status. Only `complete` changes the
+  default. `turn`/`parent` link the summary turn, the dispatch and the reply to the intent.
+  In the chat it is one collapsed line that `Enter` expands (0008).
+- **`raw` instead of a summary**: `/handoff <id> raw [n]` sends the last `n` messages
+  (default 20, fewer if they don't fit `<id>`'s window) verbatim, other participants'
+  replies included, so they reach `<id>`'s provider. It asks first: `send 20 messages
+  (claude, codex) to llama at http://… ? y/n`. For when the summarizer is out of quota.
+- **Free-model targets**: the handoff message is appended to `<id>`'s identity-bound
+  history ([0005](0005-openai-compatible-models.adr)) like any delivered message; nothing is
+  reset, and `/resume` rebuilds it the same way.
 - Consequences: switching who leads takes one command and keeps the reasoning, not just
-  the last message. Costs: a summary turn (tokens, time), and summaries lose detail; the
-  full thread stays readable with `/log` ([0024](0024-log-command.adr)).
+  the last message; nothing silently changes the default or leaks raw replies. Costs: a
+  summary turn (tokens, time), summaries lose detail (the full thread stays in `/log`),
+  and the summarizer's prompt carries the thread, so a long thread costs a full window.
 
 ## Technologies and alternatives
 - Alternatives:
