@@ -796,6 +796,8 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
     listen_for_asks(&rt.ask_socket, tx.clone())?;
 
     let mut quit_by: Option<tokio::time::Instant> = None;
+    // The last tick's time: a plan window resetting since then needs a redraw (ADR 0014).
+    let mut last_tick = now_ms();
     loop {
         let deadline = quit_by.unwrap_or_else(tokio::time::Instant::now);
         let event = if let Some(event) = local.pop_front() {
@@ -812,6 +814,14 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             }
             }
         };
+        if let Event::Tick = event {
+            let now = now_ms();
+            // Through the local queue, as every event the loop raises; drawn next tick.
+            if roundtable::limits::resets_between(&app.shown_limits(), last_tick, now) {
+                local.push_back(Event::Clock);
+            }
+            last_tick = now;
+        }
         let event = match event {
             Event::EditorClosed(failure) => {
                 let guard = editing.take().map(|(path, guard)| {
@@ -822,10 +832,11 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                 terminal.clear()?;
                 drop(guard);
                 input = tokio::spawn(read_terminal(tx.clone()));
-                match failure {
-                    Some(why) => Event::Notice(why),
-                    None => Event::Resize(crossterm::terminal::size().map_or(WIDE, |s| s.0)),
+                // The terminal may have been resized meanwhile: refresh the width either way.
+                if let Some(why) = failure {
+                    local.push_back(Event::Notice(why));
                 }
+                Event::Resize(terminal.size().map_or(WIDE, |s| s.width))
             }
             Event::RegistryFileChanged => match rt.reload_registry() {
                 Some(result) => Event::Registry(result),
@@ -1486,8 +1497,29 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         let a = Path::new(std::ffi::OsStr::from_bytes(b"/data/\xff"));
         let b = Path::new(std::ffi::OsStr::from_bytes(b"/data/\xfe"));
-        assert_eq!(a.display().to_string(), b.display().to_string(), "lossy alike");
+        assert_eq!(
+            a.display().to_string(),
+            b.display().to_string(),
+            "lossy alike"
+        );
         assert_ne!(log_dir(a), log_dir(b));
+    }
+
+    #[test]
+    fn a_chat_longer_than_u16_rows_still_shows_its_newest_line() {
+        let mut app = App::default();
+        for n in 0..70_000 {
+            app.note(format!("line {n}"), false);
+        }
+        app.update(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        app.update(Event::Key(KeyEvent::new(
+            KeyCode::Char('G'),
+            KeyModifiers::NONE,
+        )));
+        let screen = render(&app, 60, 12);
+        let text: String = screen.buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("line 69999"), "the newest line is on screen");
+        assert!(!text.contains("scrolled up"));
     }
 
     #[test]

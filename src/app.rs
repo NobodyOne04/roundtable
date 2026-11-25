@@ -24,6 +24,8 @@ pub enum Event {
     Resize(u16),
     /// The chat's scroll as last drawn (clamped, following the selection), from the loop.
     Viewport(u16),
+    /// Something shown depends on the clock and changed (a plan window reset): redraw.
+    Clock,
     /// Redraw throttle: at most one draw per tick.
     Tick,
     /// The terminal input stream ended or failed; nothing more can be typed.
@@ -516,6 +518,7 @@ impl App {
             | Event::RegistryFileChanged
             | Event::EditorClosed(_)
             | Event::Viewport(_)
+            | Event::Clock
             | Event::KeyResolved { .. }
             | Event::AskIncoming { .. } => vec![],
             Event::InputClosed(reason) => {
@@ -2384,6 +2387,12 @@ mod tests {
             "first tick draws"
         );
         assert!(app.update(Event::Tick).is_empty(), "nothing changed");
+        app.update(Event::Clock);
+        assert_eq!(
+            app.update(Event::Tick),
+            [Effect::Redraw],
+            "a clock change redraws"
+        );
         app.update(Event::Resize(120));
         app.update(Event::Resize(120));
         assert_eq!(

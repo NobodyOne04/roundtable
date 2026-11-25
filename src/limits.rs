@@ -230,6 +230,17 @@ pub fn report(
     rows.join("\n")
 }
 
+/// Whether a window of these readings resets in `(after_ms, until_ms]`: what is shown
+/// about it (`limited until`, a warning) changes then, so the screen must be redrawn.
+pub fn resets_between(limits: &BTreeMap<String, Limits>, after_ms: u64, until_ms: u64) -> bool {
+    limits
+        .values()
+        .flat_map(|l| [l.five_hour, l.weekly])
+        .flatten()
+        .map(|w| w.resets_at.max(0) as u64 * 1000)
+        .any(|at| at > after_ms && at <= until_ms)
+}
+
 /// For the status line: windows at 80% or more that have not reset yet, e.g. `codex 5h 86%`.
 pub fn warnings(limits: &BTreeMap<String, Limits>, now_ms: u64) -> Vec<String> {
     let mut out = vec![];
@@ -459,6 +470,17 @@ mod tests {
         llama   no limit data yet (after its first turn)
         ");
         assert_eq!(warnings(&limits, NOW), ["claude 5h 82%"]);
+        // The claude 5h window resets at 1_795_644_000 s: due in that tick, not before.
+        assert!(resets_between(
+            &limits,
+            1_795_643_999_000,
+            1_795_644_000_000
+        ));
+        assert!(!resets_between(
+            &limits,
+            1_795_644_000_000,
+            1_795_644_001_000
+        ));
         // A full window that hasn't reset yet is LIMITED, and warned about.
         limits.get_mut("codex").unwrap().five_hour = Some(Window {
             used_percent: 100.0,

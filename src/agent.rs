@@ -363,30 +363,44 @@ fn read_back<T>(file: &std::path::Path, chunk: u64, find: impl Fn(&str) -> Optio
     const LONGEST_LINE: usize = 16 << 20;
     let mut f = std::fs::File::open(file).ok()?;
     let mut end = f.metadata().ok()?.len();
-    // The start of a line cut by the previous chunk boundary, carried to the next.
-    let mut carry: Vec<u8> = Vec::new();
+    // The start of the line cut by the last boundary: the chunks after it, newest last,
+    // kept apart and joined once when the line's start is found (never re-copied per step).
+    let mut tail: Vec<Vec<u8>> = Vec::new();
+    let mut tail_len = 0usize;
+    let mut too_long = false;
     while end > 0 {
         let start = end.saturating_sub(chunk);
         f.seek(SeekFrom::Start(start)).ok()?;
-        let mut bytes = Vec::with_capacity((end - start) as usize + carry.len());
+        let mut bytes = Vec::with_capacity((end - start) as usize);
         f.by_ref().take(end - start).read_to_end(&mut bytes).ok()?;
-        bytes.extend_from_slice(&carry);
-        let cut = if start == 0 {
-            0
-        } else {
-            bytes
-                .iter()
-                .position(|&b| b == b'\n')
-                .map_or(bytes.len(), |i| i + 1)
+        end = start;
+        let cut = match bytes.iter().position(|&b| b == b'\n') {
+            Some(i) if start > 0 => i + 1,
+            None if start > 0 => {
+                // No line starts in this chunk: it all belongs to the cut line.
+                tail_len += bytes.len();
+                if tail_len > LONGEST_LINE {
+                    too_long = true;
+                    tail.clear();
+                } else if !too_long {
+                    tail.push(bytes);
+                }
+                continue;
+            }
+            _ => 0,
         };
-        if let Some(found) = find(&String::from_utf8_lossy(&bytes[cut..])) {
+        let mut text = bytes[cut..].to_vec();
+        if !too_long {
+            for part in tail.drain(..).rev() {
+                text.extend_from_slice(&part);
+            }
+        }
+        if let Some(found) = find(&String::from_utf8_lossy(&text)) {
             return Some(found);
         }
-        carry = bytes[..cut].to_vec();
-        if carry.len() > LONGEST_LINE {
-            carry.clear();
-        }
-        end = start;
+        tail = vec![bytes[..cut].to_vec()];
+        tail_len = cut;
+        too_long = false;
     }
     None
 }
@@ -749,6 +763,19 @@ mod tests {
         });
         assert_eq!(lines.get(), 2_001);
         assert_eq!(read_tail(&file, |_| None::<()>), None);
+        // A line far longer than a chunk arrives whole, exactly once.
+        let long = format!("{}needle", "A".repeat(10_000));
+        std::fs::write(&file, format!("first\n{long}\nlast\n")).unwrap();
+        let wholes = std::cell::Cell::new(0);
+        read_back(&file, 512, |text| {
+            wholes.set(wholes.get() + text.lines().filter(|l| *l == long).count());
+            assert!(
+                text.lines().all(|l| !l.starts_with('A') || *l == long),
+                "never cut"
+            );
+            None::<()>
+        });
+        assert_eq!(wholes.get(), 1);
     }
 
     #[test]

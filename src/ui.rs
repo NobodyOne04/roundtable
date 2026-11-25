@@ -180,53 +180,42 @@ fn focused(block: Block<'static>, focus: bool) -> Block<'static> {
 }
 
 fn draw_chat(frame: &mut Frame, app: &App, area: Rect) -> u16 {
-    let text = if app.lines.is_empty() {
-        let hint = if app.default_is_everyone() {
-            "Nothing at the table yet. Type to everyone, start with @<id> for one, or /help."
-        } else {
-            "Nothing at the table yet. Type to Claude, start with @codex or @all, or /help."
-        };
-        Text::styled(hint, Style::new().add_modifier(Modifier::DIM))
-    } else {
-        let selected = (app.focus == Focus::Chat)
-            .then_some(app.selected_line)
-            .flatten();
-        Text::from(
-            app.lines
-                .iter()
-                .enumerate()
-                .flat_map(|(i, line)| chat_lines(line, selected == Some(i)))
-                .collect::<Vec<_>>(),
-        )
-    };
-    // Keep the newest lines in view unless scrolled back (PgUp). Measured before the
-    // border is added: `line_count` counts border rows too.
-    let chat = Paragraph::new(text).wrap(Wrap { trim: false });
-    // Rows in `usize`: a long thread can pass `u16::MAX` wrapped rows; only the widget's
-    // scroll offset is `u16`, clamped at the end.
+    let width = area.width.saturating_sub(2);
     let inner_height = area.height.saturating_sub(2) as usize;
-    let total = chat.line_count(area.width.saturating_sub(2));
+    let selected = (app.focus == Focus::Chat)
+        .then_some(app.selected_line)
+        .flatten();
+    // Each entry rendered and measured once. Rows are `usize`: a long thread can pass
+    // `u16::MAX` wrapped rows, more than the widget's own scroll offset can address.
+    let entries: Vec<(Vec<Line>, usize)> = app
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let lines = chat_lines(line, selected == Some(i));
+            let rows = Paragraph::new(lines.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(width);
+            (lines, rows)
+        })
+        .collect();
+    // `starts[i]`: the row entry `i` begins at; the last item is the total.
+    let mut starts = Vec::with_capacity(entries.len() + 1);
+    starts.push(0usize);
+    for (_, rows) in &entries {
+        starts.push(starts.last().unwrap() + rows);
+    }
+    let total = *starts.last().unwrap();
+    // Keep the newest lines in view unless scrolled back (PgUp).
     let bottom = total.saturating_sub(inner_height);
     let mut top = bottom.saturating_sub(app.scroll as usize);
     // In Normal mode the selected line stays in view (j/k move it, ADR 0015).
     if let Some(i) = (app.focus == Focus::Chat && app.follow_selection)
         .then_some(app.selected_line)
         .flatten()
-        .filter(|&i| i < app.lines.len())
+        .filter(|&i| i < entries.len())
     {
-        let width = area.width.saturating_sub(2);
-        let rows = |lines: &[roundtable::app::ChatLine]| {
-            let text: Vec<Line> = lines
-                .iter()
-                .enumerate()
-                .flat_map(|(j, l)| chat_lines(l, j == i))
-                .collect();
-            Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .line_count(width)
-        };
-        let start = rows(&app.lines[..i]);
-        let end = rows(&app.lines[..=i]);
+        let (start, end) = (starts[i], starts[i + 1]);
         if start < top {
             top = start;
         } else if end > top + inner_height {
@@ -240,8 +229,29 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) -> u16 {
     } else {
         " roundtable ".to_string()
     };
-    let chat = chat
-        .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
+    // The widget gets the entries from the one holding row `top` on, and a small offset
+    // into that entry, so any `top` is reachable.
+    let first = starts.partition_point(|&s| s <= top).saturating_sub(1);
+    let text = if app.lines.is_empty() {
+        let hint = if app.default_is_everyone() {
+            "Nothing at the table yet. Type to everyone, start with @<id> for one, or /help."
+        } else {
+            "Nothing at the table yet. Type to Claude, start with @codex or @all, or /help."
+        };
+        Text::styled(hint, Style::new().add_modifier(Modifier::DIM))
+    } else {
+        Text::from(
+            entries
+                .into_iter()
+                .skip(first)
+                .flat_map(|(lines, _)| lines)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let offset = u16::try_from(top - starts[first.min(starts.len() - 1)]).unwrap_or(u16::MAX);
+    let chat = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .scroll((offset, 0))
         .block(focused(
             Block::bordered().title(title),
             app.focus == Focus::Chat,
