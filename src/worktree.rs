@@ -2,6 +2,7 @@
 //! brought to the writer's current state (HEAD plus uncommitted and untracked files) before
 //! each of that agent's turns, so what escapes its read-only flags lands in the mirror.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
@@ -18,6 +19,19 @@ use serde::{Deserialize, Serialize};
 pub struct Record {
     pub source: PathBuf,
     pub mirror: PathBuf,
+    /// The mirror folder's device and inode, written once git made it: a path can be
+    /// reused, a folder's identity can't, so nothing is reset or deleted without a match.
+    #[serde(default)]
+    pub folder: Option<(u64, u64)>,
+}
+
+/// A folder's (device, inode), links not followed.
+fn identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|m| m.is_dir())
+        .map(|m| (m.dev(), m.ino()))
 }
 
 /// The folder holding one checkout's mirrors and their records.
@@ -140,12 +154,16 @@ pub fn sync(
         }
         // The record first: a crash during `worktree add` leaves a mirror `/worktrees clean`
         // can find and remove.
-        let record = Record {
+        let mut record = Record {
             source: checkout.to_path_buf(),
             mirror: mirror.clone(),
+            folder: None,
         };
-        let bytes = serde_json::to_vec_pretty(&record).map_err(|e| e.to_string())?;
-        crate::transcript::write_atomic(&record_file, &bytes).map_err(|e| e.to_string())?;
+        let write = |record: &Record| {
+            let bytes = serde_json::to_vec_pretty(record).map_err(|e| e.to_string())?;
+            crate::transcript::write_atomic(&record_file, &bytes).map_err(|e| e.to_string())
+        };
+        write(&record)?;
         let path = mirror.to_string_lossy();
         // Locked with our mark as the reason: git writes it as it registers the worktree, so
         // no crash leaves an unmarked one; a record names only a path, and git could later
@@ -159,6 +177,8 @@ pub fn sync(
         )?;
         fs::set_permissions(&mirror, fs::Permissions::from_mode(0o700))
             .map_err(|e| e.to_string())?;
+        record.folder = identity(&mirror);
+        write(&record)?;
     }
     let admin = verify(&mirror, &record_file, checkout, cancel)?;
     // The CLI runs plain git in the mirror: its pointer must name this registration, whatever
@@ -280,7 +300,7 @@ pub fn sync(
                 None
             };
             if source.is_some() {
-                copy_entry(checkout, &mirror, name)
+                copy_entry(checkout, &mirror, name, cancel)
             } else if real_dirs_exist(&mirror, parent)? {
                 clear(&mirror.join(name))
             } else {
@@ -306,7 +326,11 @@ pub fn sync(
         &["ls-files", "-z", "-o", "--", ":(glob)**/.gitignore"],
         None,
     )?;
-    for name in stray.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+    let stray: Vec<&[u8]> = stray.split(|b| *b == 0).filter(|n| !n.is_empty()).collect();
+    // Inside a folder the writer ignores (`node_modules/`) they belong to the agent's own
+    // tree, which `clean` spares anyway: left alone.
+    let spared = ignored_by(checkout, &stray)?;
+    for name in stray.into_iter().filter(|n| !spared.contains(*n)) {
         let name = Path::new(OsStr::from_bytes(name));
         let parent = name.parent().unwrap_or(Path::new(""));
         real_dirs_exist(&mirror, parent)
@@ -406,7 +430,7 @@ fn verify(
 ) -> Result<PathBuf, String> {
     let refuse = |why: &str| {
         Err(format!(
-            "{}: {why}; `/worktrees clean` removes it",
+            "{}: {why}; left alone (`/worktrees clean` removes what roundtable made)",
             mirror.display()
         ))
     };
@@ -421,6 +445,15 @@ fn verify(
         .is_none_or(|r| r.mirror != mirror || r.source != checkout)
     {
         return refuse("not a mirror roundtable recorded for this checkout");
+    }
+    if record
+        .and_then(|r| r.folder)
+        .is_none_or(|f| identity(mirror) != Some(f))
+    {
+        return refuse("not the folder roundtable made there (moved or replaced?)");
+    }
+    if fs::symlink_metadata(mirror.join(".git")).is_ok_and(|m| !m.is_file()) {
+        return refuse("its `.git` is not a worktree's pointer file");
     }
     match owned_registration(checkout, mirror, cancel)? {
         Some(admin) => Ok(admin),
@@ -537,7 +570,12 @@ fn resolved(path: &Path) -> Option<PathBuf> {
 /// One untracked file into the mirror; a symlink stays a symlink. Never writes through a
 /// symlink the agent may have left (an ignored one survives `clean`): every folder on the
 /// way must be a real folder, and whatever is at the target is removed first.
-fn copy_entry(checkout: &Path, mirror: &Path, name: &Path) -> std::io::Result<()> {
+fn copy_entry(
+    checkout: &Path,
+    mirror: &Path,
+    name: &Path,
+    cancel: &AtomicBool,
+) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let from = checkout.join(name);
     let meta = fs::symlink_metadata(&from)?;
@@ -561,7 +599,17 @@ fn copy_entry(checkout: &Path, mirror: &Path, name: &Path) -> std::io::Result<()
             .mode(found.permissions().mode() & 0o777)
             .custom_flags(libc::O_NOFOLLOW)
             .open(to)?;
-        std::io::copy(&mut source, &mut target).map(drop)
+        // In chunks, so a cancel stops a large file too.
+        let mut buf = vec![0; 1 << 20];
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(std::io::Error::other("cancelled"));
+            }
+            match source.read(&mut buf)? {
+                0 => return Ok(()),
+                n => target.write_all(&buf[..n])?,
+            }
+        }
     } else {
         // A nested repository shows as a folder: not mirrored, and not silently missing.
         Err(std::io::Error::other(
@@ -614,6 +662,51 @@ fn open_beneath(root: &Path, rel: &Path) -> std::io::Result<fs::File> {
         nofollow | libc::O_NONBLOCK,
     )?;
     Ok(fs::File::from(file))
+}
+
+/// Which of `names` the checkout's ignore rules (the writer's) exclude, a folder rule
+/// covering the files in it.
+fn ignored_by(checkout: &Path, names: &[&[u8]]) -> Result<HashSet<Vec<u8>>, String> {
+    if names.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut command = Command::new("git");
+    command
+        .args(["-c", "core.fsmonitor=false", "-C"])
+        .arg(checkout)
+        .args(["check-ignore", "-z", "--stdin", "--no-index"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for var in REPO_ENV {
+        command.env_remove(var);
+    }
+    let mut child = command.spawn().map_err(|e| format!("git: {e}"))?;
+    let input: Vec<u8> = names
+        .iter()
+        .flat_map(|n| n.iter().chain(&[0]))
+        .copied()
+        .collect();
+    let stdin = child.stdin.take();
+    std::thread::spawn(move || {
+        if let Some(mut stdin) = stdin {
+            let _ = stdin.write_all(&input);
+        }
+    });
+    let out = child.wait_with_output().map_err(|e| format!("git: {e}"))?;
+    // 1 is "none ignored", not a failure.
+    if !matches!(out.status.code(), Some(0 | 1)) {
+        return Err(format!(
+            "git check-ignore: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|n| !n.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
 }
 
 /// Git in the owner's checkout.
@@ -759,10 +852,19 @@ pub fn remove(id: &str, record: &Record) -> Result<(), String> {
         // registration is then dropped as for a missing folder.
         fs::remove_file(&record.mirror).map_err(|e| e.to_string())?;
     }
+    let ours = record
+        .folder
+        .is_some_and(|f| identity(&record.mirror) == Some(f));
     if record.source.exists()
         && let Some(admin) = owned_registration(&record.source, &record.mirror, &never)?
     {
         if fs::symlink_metadata(&record.mirror).is_ok() {
+            if !ours {
+                return Err(format!(
+                    "{} is not the folder roundtable made there: left alone",
+                    record.mirror.display()
+                ));
+            }
             // Never `worktree prune`: it would touch the owner's own registrations.
             let path = record.mirror.to_string_lossy();
             // Twice `--force`: it is locked (our mark).
@@ -777,9 +879,14 @@ pub fn remove(id: &str, record: &Record) -> Result<(), String> {
             fs::remove_dir_all(&admin).map_err(|e| e.to_string())?;
         }
     }
+    if ours && !record.source.exists() {
+        // The checkout is gone (moved or deleted) and with it git's registration: the
+        // folder's identity is the proof it is the one we made.
+        fs::remove_dir_all(&record.mirror).map_err(|e| e.to_string())?;
+    }
     if fs::symlink_metadata(&record.mirror).is_ok() {
-        // No registration of ours vouches for it (a crash before git made one, or someone
-        // reused the path): not deleted on a guess.
+        // Nothing vouches for it (a crash before git made it, or someone reused the path):
+        // not deleted on a guess.
         return Err(format!(
             "{} is not a worktree roundtable can show it made: delete it yourself if it \
              is, then run this again",
@@ -1084,6 +1191,7 @@ mod tests {
         let record = Record {
             source: repo.clone(),
             mirror: dir.join("codex"),
+            folder: None,
         };
         fs::write(dir.join("codex.json"), serde_json::to_vec(&record).unwrap()).unwrap();
         let err = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap_err();
@@ -1150,7 +1258,7 @@ mod tests {
         run(&repo, &["worktree", "add", "-q", "--detach", path]);
         fs::write(mirror.join("work.txt"), "mine").unwrap();
         let err = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap_err();
-        assert!(err.contains("didn't make"), "{err}");
+        assert!(err.contains("not the folder"), "{err}");
         let (id, record) = list(&data, &repo).remove(0);
         assert!(remove(&id, &record).is_err());
         assert_eq!(fs::read_to_string(mirror.join("work.txt")).unwrap(), "mine");
@@ -1180,6 +1288,35 @@ mod tests {
             open_beneath(root, Path::new("real/g")).is_err(),
             "a linked file"
         );
+    }
+
+    #[test]
+    fn a_moved_mirror_is_never_reset_and_an_orphan_is_cleaned() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("repo")).unwrap();
+        let repo = tmp.path().join("repo").canonicalize().unwrap();
+        let data = tmp.path().join("data");
+        fs::DirBuilder::new().mode(0o700).create(&data).unwrap();
+        run(&repo, &["init", "-q"]);
+        run(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let mirror = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
+        // Moved aside by hand, another folder in its place: untouched.
+        let aside = tmp.path().join("aside");
+        fs::rename(&mirror, &aside).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&mirror).unwrap();
+        fs::write(mirror.join("keep.txt"), "k").unwrap();
+        let err = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap_err();
+        assert!(err.contains("not the folder"), "{err}");
+        let (id, record) = list(&data, &repo).remove(0);
+        assert!(remove(&id, &record).is_err());
+        assert!(mirror.join("keep.txt").exists());
+        fs::remove_dir_all(&mirror).unwrap();
+        fs::rename(&aside, &mirror).unwrap();
+        // The checkout is deleted: its mirror is still listed, and removed.
+        fs::remove_dir_all(&repo).unwrap();
+        let (id, record) = list(&data, Path::new("/elsewhere")).remove(0);
+        remove(&id, &record).unwrap();
+        assert!(!mirror.exists());
     }
 
     #[test]

@@ -1029,6 +1029,11 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         None
                     } else if let Some(why) = &rt.checkout_error {
                         Some(format!("no mirror, git can't name the checkout: {why}"))
+                    } else if rt.lock.is_none()
+                        && !matches!(writer_lock::resolve(&rt.cwd), Ok(Checkout::Outside))
+                    {
+                        // Outside git at startup, but `git init` since: no running in it.
+                        Some("this folder is in a git checkout now: restart roundtable".into())
                     } else if rt.lock.is_some() && rt.launch_sub.is_none() {
                         Some("no mirror: the launch folder can't be placed in the checkout".into())
                     } else if rt.cleaning.contains(&id) {
