@@ -8,7 +8,8 @@ use std::fs::{self, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -98,6 +99,10 @@ async fn start() -> Result<()> {
         Ok(Checkout::Outside) => (cwd.clone(), None, Some(EditLock::OutsideGit)),
         Err(why) => (cwd.clone(), None, Some(EditLock::Unknown(why))),
     };
+    let launch_sub = cwd.canonicalize().ok().and_then(|cwd| {
+        let base = checkout.canonicalize().ok()?;
+        cwd.strip_prefix(base).ok().map(Path::to_path_buf)
+    });
     let mut runtime = Runtime {
         store,
         thread: None,
@@ -107,6 +112,8 @@ async fn start() -> Result<()> {
         turn_cwd: HashMap::new(),
         checkout_error,
         cleaning: HashSet::new(),
+        syncs: Arc::new(()),
+        launch_sub,
         turns: HashMap::new(),
         checkout,
         lock,
@@ -344,6 +351,11 @@ struct Runtime {
     checkout_error: Option<String>,
     /// Mirrors `/worktrees clean` is removing: their agents' turns wait for it to finish.
     cleaning: HashSet<String>,
+    /// One clone per running mirror sync: quitting waits for them (ADR 0016).
+    syncs: Arc<()>,
+    /// Where roundtable was started, relative to the checkout root, fixed at startup: the
+    /// same folder in each mirror. `None` if it can't be placed (then no mirrors).
+    launch_sub: Option<PathBuf>,
     turns: HashMap<String, CancellationToken>,
     cwd: PathBuf,
     /// The git checkout root around `cwd` (or `cwd` outside git), recorded in each thread.
@@ -838,6 +850,11 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             },
             _ = tokio::time::sleep_until(deadline), if quit_by.is_some() => {
                 tracing::warn!(left = rt.turns.len(), "turns did not stop in time");
+                // A mirror sync must end before the instance lock goes, or the next
+                // roundtable could sync the same mirror; cancelled, it ends promptly.
+                while Arc::strong_count(&rt.syncs) > 1 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
                 return Ok(());
             }
             }
@@ -1006,6 +1023,8 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         None
                     } else if let Some(why) = &rt.checkout_error {
                         Some(format!("no mirror, git can't name the checkout: {why}"))
+                    } else if rt.lock.is_some() && rt.launch_sub.is_none() {
+                        Some("no mirror: the launch folder can't be placed in the checkout".into())
                     } else if rt.cleaning.contains(&id) {
                         Some("its mirror is being removed (/worktrees clean); try again".into())
                     } else {
@@ -1017,16 +1036,8 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         local.push_back(Event::Agent(id, PEvent::Done(Outcome::Failed)));
                         continue;
                     }
-                    let mirror = (mirror && rt.lock.is_some()).then(|| {
-                        rt.cwd
-                            .canonicalize()
-                            .ok()
-                            .and_then(|cwd| {
-                                let base = rt.checkout.canonicalize().ok()?;
-                                cwd.strip_prefix(base).ok().map(Path::to_path_buf)
-                            })
-                            .unwrap_or_default()
-                    });
+                    let mirror = (mirror && rt.lock.is_some()).then(|| rt.launch_sub.clone());
+                    let mirror = mirror.flatten();
                     let cwd = match &mirror {
                         Some(sub) => worktree::cwd(&rt.data_root, &rt.checkout, &id, sub),
                         None => rt.cwd.clone(),
@@ -1064,19 +1075,35 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         writable,
                         permission_mode,
                         ask,
+                        mirror: mirror.is_some(),
                     };
                     let tx = tx.clone();
                     let (data, checkout) = (rt.data_root.clone(), rt.checkout.clone());
+                    let syncing = rt.syncs.clone();
                     tokio::spawn(async move {
                         if let Some(sub) = mirror {
                             let who = id.clone();
-                            // shortcut: a cancel waits for the sync to end (git isn't killed),
-                            // then the CLI is never started; kill git if large syncs show.
+                            // A cancel kills the sync's git and stops its copying.
+                            let stop = Arc::new(AtomicBool::new(false));
+                            let watch = tokio::spawn({
+                                let (stop, token) = (stop.clone(), token.clone());
+                                async move {
+                                    token.cancelled().await;
+                                    stop.store(true, Ordering::Relaxed);
+                                }
+                            });
                             let synced = tokio::task::spawn_blocking(move || {
-                                worktree::sync(&data, &checkout, &who, &sub)
+                                worktree::sync(&data, &checkout, &who, &sub, &stop)
                             })
                             .await
                             .unwrap_or_else(|e| Err(e.to_string()));
+                            watch.abort();
+                            drop(syncing);
+                            if token.is_cancelled() {
+                                let done = PEvent::Done(Outcome::Interrupted);
+                                let _ = tx.send(Event::Agent(id, done)).await;
+                                return;
+                            }
                             // Fail closed: never fall back to running in the checkout.
                             if let Err(why) = synced {
                                 let why = format!("mirror sync failed: {why}");
@@ -1084,11 +1111,6 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                                 let _ = tx
                                     .send(Event::Agent(id, PEvent::Done(Outcome::Failed)))
                                     .await;
-                                return;
-                            }
-                            if token.is_cancelled() {
-                                let done = PEvent::Done(Outcome::Interrupted);
-                                let _ = tx.send(Event::Agent(id, done)).await;
                                 return;
                             }
                         }
@@ -1565,6 +1587,8 @@ mod tests {
             turn_cwd: HashMap::new(),
             checkout_error: None,
             cleaning: HashSet::new(),
+            syncs: Arc::new(()),
+            launch_sub: Some(PathBuf::new()),
             turns: HashMap::new(),
             cwd: root.into(),
             checkout: root.into(),

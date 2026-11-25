@@ -4,11 +4,12 @@
 
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -37,10 +38,38 @@ pub fn cwd(data_root: &Path, checkout: &Path, id: &str, sub: &Path) -> PathBuf {
     }
 }
 
+/// Repository overrides (an index, an object store, config) that would point git at another
+/// repository's state: `git rev-parse --local-env-vars`, plus config injection. Cleared for
+/// every git call here and for the CLI that runs in a mirror.
+pub const REPO_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_SHALLOW_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+];
+
 /// Creates the mirror of `id` if needed and syncs it with `checkout`; returns the folder
 /// `sub` (the launch folder, relative to the root) inside it, created if git has nothing
-/// there. Blocking (runs git); any failure is the turn's failure, never a fallback.
-pub fn sync(data_root: &Path, checkout: &Path, id: &str, sub: &Path) -> Result<PathBuf, String> {
+/// there. Blocking (runs git); `cancel` stops it between files and kills a running git. Any
+/// failure is the turn's failure, never a fallback to the checkout.
+pub fn sync(
+    data_root: &Path,
+    checkout: &Path,
+    id: &str,
+    sub: &Path,
+    cancel: &AtomicBool,
+) -> Result<PathBuf, String> {
     let (Ok(data), Ok(source)) = (data_root.canonicalize(), checkout.canonicalize()) else {
         return Err("can't resolve the data folder or the checkout".into());
     };
@@ -52,41 +81,57 @@ pub fn sync(data_root: &Path, checkout: &Path, id: &str, sub: &Path) -> Result<P
             source.display()
         ));
     }
+    let git = |args: &[&str], input: Option<&[u8]>| git(checkout, args, input, cancel);
+    let head = match git(&["rev-parse", "--verify", "-q", "HEAD^{commit}"], None) {
+        Ok(head) => head,
+        Err(_) if cancel.load(Ordering::Relaxed) => return Err("cancelled".into()),
+        // shortcut: ADR 0016's `worktree add --orphan` would add a branch to the owner's
+        // repo; refused until the first commit instead.
+        Err(_) => {
+            return Err(
+                "the checkout has no commit yet: commit once to give agents a mirror".into(),
+            );
+        }
+    };
+    let head = String::from_utf8_lossy(&head).trim().to_string();
+    // shortcut: submodules aren't mirrored (`worktree add` leaves them empty); a populated
+    // one fails the turn rather than show the reviewer an empty folder. Mirror them if asked.
+    let stage = git(&["ls-files", "-z", "--stage"], None)?;
+    for entry in stage
+        .split(|b| *b == 0)
+        .filter(|e| e.starts_with(b"160000 "))
+    {
+        let path = entry.splitn(2, |b| *b == b'\t').nth(1).unwrap_or_default();
+        let path = Path::new(OsStr::from_bytes(path));
+        if checkout.join(path).join(".git").exists() {
+            return Err(format!(
+                "{} is a submodule: mirrors don't carry submodules yet",
+                path.display()
+            ));
+        }
+    }
     let dir = checkout_dir(data_root, checkout);
     for folder in [&data_root.join("worktrees"), &dir] {
         crate::transcript::owned_private_dir(folder)
             .map_err(|e| format!("{}: {e}", folder.display()))?;
     }
     let mirror = dir.join(id);
-    let Some(head) = git(
-        checkout,
-        &["rev-parse", "--verify", "-q", "HEAD^{commit}"],
-        None,
-    )
-    .ok() else {
-        // shortcut: ADR 0016's `worktree add --orphan` would add a branch to the owner's
-        // repo; refused until the first commit instead.
-        return Err("the checkout has no commit yet: commit once to give agents a mirror".into());
-    };
-    let head = String::from_utf8_lossy(&head).trim().to_string();
     let record_file = dir.join(format!("{id}.json"));
     if fs::symlink_metadata(&mirror).is_err() {
-        let path = mirror.to_string_lossy();
-        git(
-            checkout,
-            &["worktree", "add", "--detach", &path, &head],
-            None,
-        )?;
-        fs::set_permissions(&mirror, fs::Permissions::from_mode(0o700))
-            .map_err(|e| e.to_string())?;
+        // The record first: a crash during `worktree add` leaves a mirror `/worktrees clean`
+        // can find and remove.
         let record = Record {
             source: checkout.to_path_buf(),
             mirror: mirror.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&record).map_err(|e| e.to_string())?;
         crate::transcript::write_atomic(&record_file, &bytes).map_err(|e| e.to_string())?;
+        let path = mirror.to_string_lossy();
+        git(&["worktree", "add", "--detach", &path, &head], None)?;
+        fs::set_permissions(&mirror, fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
     }
-    let admin = verify(&mirror, &record_file, checkout)?;
+    let admin = verify(&mirror, &record_file, checkout, cancel)?;
     // The CLI runs plain git in the mirror: its pointer must name this registration, whatever
     // the last turn wrote there.
     let pointer = mirror.join(".git");
@@ -106,7 +151,7 @@ pub fn sync(data_root: &Path, checkout: &Path, id: &str, sub: &Path) -> Result<P
             OsStr::new("-C"),
             mirror.as_os_str(),
         ];
-        run_git(&base, args, input)
+        run_git(&base, args, input, cancel)
     };
     in_mirror(&["checkout", "-q", "--detach", "--force", &head], None)?;
     // `reset --hard` also drops what the last sync staged (a force-added ignored file),
@@ -128,25 +173,28 @@ pub fn sync(data_root: &Path, checkout: &Path, id: &str, sub: &Path) -> Result<P
             "--src-prefix=a/",
             "--dst-prefix=b/",
         ]);
-        git(checkout, &args, None)
+        git(&args, None)
     };
+    // `--whitespace=nowarn`: a configured `apply.whitespace=fix` would change the files.
     for (patch, apply) in [
         (
             diff(&["--cached", &head])?,
-            &["apply", "--binary", "--index"][..],
+            &["apply", "--binary", "--whitespace=nowarn", "--index"][..],
         ),
-        (diff(&[])?, &["apply", "--binary"][..]),
+        (
+            diff(&[])?,
+            &["apply", "--binary", "--whitespace=nowarn"][..],
+        ),
     ] {
         if !patch.is_empty() {
             in_mirror(apply, Some(&patch))?;
         }
     }
-    let untracked = git(
-        checkout,
-        &["ls-files", "-z", "-o", "--exclude-standard"],
-        None,
-    )?;
+    let untracked = git(&["ls-files", "-z", "-o", "--exclude-standard"], None)?;
     for name in untracked.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
         let name = Path::new(OsStr::from_bytes(name));
         copy_entry(&checkout.join(name), &mirror, name)
             .map_err(|e| format!("copying {}: {e}", name.display()))?;
@@ -187,8 +235,18 @@ fn real_dirs(root: &Path, rel: &Path) -> std::io::Result<()> {
 /// registration (its git dir), which every git call in the mirror is given explicitly: the
 /// mirror's own `.git` file is the agent's to rewrite, and could point git at a config of
 /// its making (`core.fsmonitor` runs a program).
-fn verify(mirror: &Path, record_file: &Path, checkout: &Path) -> Result<PathBuf, String> {
-    let refuse = |why: &str| Err(format!("{}: {why}; remove it", mirror.display()));
+fn verify(
+    mirror: &Path,
+    record_file: &Path,
+    checkout: &Path,
+    cancel: &AtomicBool,
+) -> Result<PathBuf, String> {
+    let refuse = |why: &str| {
+        Err(format!(
+            "{}: {why}; `/worktrees clean` removes it",
+            mirror.display()
+        ))
+    };
     if !fs::symlink_metadata(mirror).is_ok_and(|m| m.file_type().is_dir()) {
         return refuse("not a folder");
     }
@@ -201,14 +259,24 @@ fn verify(mirror: &Path, record_file: &Path, checkout: &Path) -> Result<PathBuf,
     {
         return refuse("not a mirror roundtable recorded for this checkout");
     }
-    let common = git(
-        checkout,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        None,
-    )?;
-    let common = PathBuf::from(String::from_utf8_lossy(&common).trim());
+    match registration(checkout, mirror, cancel)? {
+        Some(admin) => Ok(admin),
+        None => refuse("the checkout's repository has no worktree there"),
+    }
+}
+
+/// The checkout's registration (`<common git dir>/worktrees/<name>`) of a worktree at
+/// `mirror`, if there is one.
+fn registration(
+    checkout: &Path,
+    mirror: &Path,
+    cancel: &AtomicBool,
+) -> Result<Option<PathBuf>, String> {
+    // No `--path-format=absolute` (git 2.31): relative to the checkout on older git.
+    let common = git(checkout, &["rev-parse", "--git-common-dir"], None, cancel)?;
+    let common = checkout.join(String::from_utf8_lossy(&common).trim());
     let want = mirror.canonicalize().ok();
-    let admin = fs::read_dir(common.join("worktrees"))
+    Ok(fs::read_dir(common.join("worktrees"))
         .into_iter()
         .flatten()
         .flatten()
@@ -220,11 +288,7 @@ fn verify(mirror: &Path, record_file: &Path, checkout: &Path) -> Result<PathBuf,
                 gitdir.file_name() == Some(OsStr::new(".git"))
                     && gitdir.parent().and_then(|p| p.canonicalize().ok()) == want
             })
-        });
-    match admin {
-        Some(admin) => Ok(admin),
-        None => refuse("the checkout's repository has no worktree there"),
-    }
+        }))
 }
 
 /// One untracked file into the mirror; a symlink stays a symlink. Never writes through a
@@ -251,14 +315,25 @@ fn copy_entry(from: &Path, mirror: &Path, name: &Path) -> std::io::Result<()> {
 }
 
 /// Git in the owner's checkout.
-fn git(dir: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, String> {
-    run_git(&[OsStr::new("-C"), dir.as_os_str()], args, input)
+fn git(
+    dir: &Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    run_git(&[OsStr::new("-C"), dir.as_os_str()], args, input, cancel)
 }
 
 /// Runs git without hooks (a checkout in the mirror must not fire `post-checkout`) or an
-/// fsmonitor program, returning stdout or the error text.
-fn run_git(base: &[&OsStr], args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, String> {
-    let mut child = Command::new("git")
+/// fsmonitor program, returning stdout or the error text. Killed when `cancel` is set.
+fn run_git(
+    base: &[&OsStr],
+    args: &[&str],
+    input: Option<&[u8]>,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    let mut command = Command::new("git");
+    command
         .args([
             "-c",
             "core.hooksPath=/dev/null",
@@ -273,37 +348,51 @@ fn run_git(base: &[&OsStr], args: &[&str], input: Option<&[u8]>) -> Result<Vec<u
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Repository overrides (an index, an object store) would point the mirror's
-        // commands at another repository's state: `git rev-parse --local-env-vars`.
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_IMPLICIT_WORK_TREE")
-        .env_remove("GIT_GRAFT_FILE")
-        .env_remove("GIT_SHALLOW_FILE")
-        .env_remove("GIT_NO_REPLACE_OBJECTS")
-        .env_remove("GIT_REPLACE_REF_BASE")
-        .env_remove("GIT_PREFIX")
-        .env_remove("GIT_CONFIG")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_CONFIG_COUNT")
-        .spawn()
-        .map_err(|e| format!("git: {e}"))?;
-    if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
-        stdin.write_all(bytes).map_err(|e| format!("git: {e}"))?;
+        .stderr(Stdio::piped());
+    for var in REPO_ENV {
+        command.env_remove(var);
     }
-    let out = child.wait_with_output().map_err(|e| format!("git: {e}"))?;
-    if out.status.success() {
-        Ok(out.stdout)
+    let mut child = command.spawn().map_err(|e| format!("git: {e}"))?;
+    // Pipes on threads of their own, so this one can watch `cancel` without deadlocking.
+    let stdin = child.stdin.take();
+    let input = input.map(<[u8]>::to_vec);
+    std::thread::spawn(move || {
+        if let (Some(mut stdin), Some(bytes)) = (stdin, input) {
+            let _ = stdin.write_all(&bytes);
+        }
+    });
+    let read = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = vec![];
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = read(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = read(child.stderr.take().map(|p| Box::new(p) as _));
+    let status = loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("cancelled".into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(e) => return Err(format!("git: {e}")),
+        }
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    if status.success() {
+        Ok(stdout)
     } else {
         Err(format!(
             "git {}: {}",
             args.first().unwrap_or(&""),
-            String::from_utf8_lossy(&out.stderr).trim()
+            String::from_utf8_lossy(&stderr).trim()
         ))
     }
 }
@@ -333,15 +422,21 @@ pub fn list(data_root: &Path, checkout: &Path) -> Vec<(String, Record)> {
     found
 }
 
-/// Removes one mirror `list` returned, and its record.
+/// Removes one mirror `list` returned, and its record. A mirror git never registered (a
+/// crash during creation) is just deleted.
 pub fn remove(id: &str, record: &Record) -> Result<(), String> {
-    if record.source.exists() {
+    let never = AtomicBool::new(false);
+    if record.source.exists()
+        && fs::symlink_metadata(&record.mirror).is_ok()
+        && registration(&record.source, &record.mirror, &never)?.is_some()
+    {
         // Never `worktree prune`: it would touch the owner's own registrations.
         let path = record.mirror.to_string_lossy();
         git(
             &record.source,
             &["worktree", "remove", "--force", &path],
             None,
+            &never,
         )?;
     }
     if fs::symlink_metadata(&record.mirror).is_ok() {
@@ -372,6 +467,8 @@ mod tests {
     use super::*;
     use std::os::unix::fs::DirBuilderExt;
 
+    static NO: AtomicBool = AtomicBool::new(false);
+
     fn run(dir: &Path, args: &[&str]) {
         let ok = Command::new("git")
             .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
@@ -401,7 +498,7 @@ mod tests {
         run(&repo, &["commit", "-qm", "init"]);
 
         assert!(
-            sync(&data, &repo, "codex", Path::new("")).is_ok(),
+            sync(&data, &repo, "codex", Path::new(""), &NO).is_ok(),
             "first sync creates the mirror"
         );
         // The writer's uncommitted work: an edit, a deletion, a new file with a space, a
@@ -415,17 +512,17 @@ mod tests {
         // A force-added ignored file comes over staged, and a second sync doesn't trip on it.
         fs::write(repo.join("target/forced"), "f").unwrap();
         run(&repo, &["add", "-f", "target/forced"]);
-        let mirror = sync(&data, &repo, "codex", Path::new("")).unwrap();
+        let mirror = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
         assert!(mirror.join("target/forced").exists());
         run(&repo, &["rm", "-q", "--cached", "target/forced"]);
-        let mirror = sync(&data, &repo, "codex", Path::new("")).unwrap();
+        let mirror = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
         assert!(
             !mirror.join("target/forced").exists(),
             "unstaged: gone again"
         );
         // Something the agent left in the mirror is gone after the next sync.
         fs::write(mirror.join("stray.txt"), "x").unwrap();
-        let mirror = sync(&data, &repo, "codex", Path::new("")).unwrap();
+        let mirror = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
 
         assert_eq!(fs::read_to_string(mirror.join("a.txt")).unwrap(), "two\n");
         assert!(!mirror.join("gone.txt").exists());
@@ -441,7 +538,7 @@ mod tests {
             !mirror.join("target/out").exists(),
             "ignored files stay behind"
         );
-        let sub = sync(&data, &repo, "codex", Path::new("empty/dir")).unwrap();
+        let sub = sync(&data, &repo, "codex", Path::new("empty/dir"), &NO).unwrap();
         assert!(
             sub.is_dir() && sub.starts_with(&mirror),
             "the launch folder exists"
@@ -494,24 +591,24 @@ mod tests {
         fs::write(repo.join("a.txt"), "one\n").unwrap();
         run(&repo, &["add", "."]);
         run(&repo, &["commit", "-qm", "init"]);
-        let mirror = sync(&data, &repo, "codex", Path::new("")).unwrap();
+        let mirror = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
         // The agent rewrites the mirror's `.git` pointer: git is never steered by it.
         fs::write(mirror.join(".git"), "gitdir: /nonexistent\n").unwrap();
-        sync(&data, &repo, "codex", Path::new("")).unwrap();
+        sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
         run(&mirror, &["status", "-s"]);
         // A symlink where the launch folder goes is refused, not followed.
         // (Ignored, so `clean` leaves it, as it would a build folder.)
         fs::write(repo.join(".gitignore"), "target/\nout\n").unwrap();
-        sync(&data, &repo, "codex", Path::new("")).unwrap();
+        sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
         std::os::unix::fs::symlink(&repo, mirror.join("out")).unwrap();
-        let err = sync(&data, &repo, "codex", Path::new("out/x")).unwrap_err();
+        let err = sync(&data, &repo, "codex", Path::new("out/x"), &NO).unwrap_err();
         assert!(err.contains("not a folder"), "{err}");
         assert!(!repo.join("x").exists(), "nothing created through the link");
         fs::remove_file(mirror.join("out")).unwrap();
         fs::write(repo.join("a.txt"), "writer's work\n").unwrap();
         fs::remove_dir_all(&mirror).unwrap();
         std::os::unix::fs::symlink(&repo, &mirror).unwrap();
-        assert!(sync(&data, &repo, "codex", Path::new("")).is_err());
+        assert!(sync(&data, &repo, "codex", Path::new(""), &NO).is_err());
         assert_eq!(
             fs::read_to_string(repo.join("a.txt")).unwrap(),
             "writer's work\n",
@@ -519,8 +616,43 @@ mod tests {
         );
         let inside = repo.join("data");
         fs::DirBuilder::new().mode(0o700).create(&inside).unwrap();
-        let err = sync(&inside, &repo, "codex", Path::new("")).unwrap_err();
+        let err = sync(&inside, &repo, "codex", Path::new(""), &NO).unwrap_err();
         assert!(err.contains("overlap"), "{err}");
+    }
+
+    #[test]
+    fn a_cancelled_sync_stops_and_a_half_made_mirror_is_cleaned() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("repo")).unwrap();
+        let repo = tmp.path().join("repo").canonicalize().unwrap();
+        let data = tmp.path().join("data");
+        fs::DirBuilder::new().mode(0o700).create(&data).unwrap();
+        run(&repo, &["init", "-q"]);
+        run(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let stop = AtomicBool::new(true);
+        assert_eq!(
+            sync(&data, &repo, "codex", Path::new(""), &stop).unwrap_err(),
+            "cancelled"
+        );
+        // A crash between the record and `worktree add`: a folder git never registered.
+        let dir = checkout_dir(&data, &repo);
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir.join("codex"))
+            .unwrap();
+        let record = Record {
+            source: repo.clone(),
+            mirror: dir.join("codex"),
+        };
+        fs::write(dir.join("codex.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+        let err = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap_err();
+        assert!(err.contains("/worktrees clean"), "{err}");
+        let found = list(&data, &repo);
+        assert_eq!(found, vec![("codex".to_string(), record.clone())]);
+        remove("codex", &record).unwrap();
+        assert!(list(&data, &repo).is_empty());
+        sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
     }
 
     #[test]
@@ -531,7 +663,7 @@ mod tests {
         let data = tmp.path().join("data");
         fs::DirBuilder::new().mode(0o700).create(&data).unwrap();
         run(&repo, &["init", "-q"]);
-        let err = sync(&data, &repo, "codex", Path::new("")).unwrap_err();
+        let err = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap_err();
         assert!(err.contains("no commit yet"), "{err}");
     }
 }
