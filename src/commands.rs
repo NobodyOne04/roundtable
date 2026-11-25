@@ -54,6 +54,11 @@ pub const COMMANDS: &[Command] = &[
         help: "what each participant has seen and how full its window is",
     },
     Command {
+        name: "/handoff",
+        args: "<id> [from <id>] [note] | <id> raw [n]",
+        help: "a summary of the thread to <id>, which then becomes the default",
+    },
+    Command {
         name: "/models",
         args: "",
         help: "list the models",

@@ -3,6 +3,17 @@
 
 use crate::transcript::{EventLine, Kind, day_of};
 
+/// One rendered piece of the thread: a message, a tool line, an error. `/handoff`
+/// (ADR 0020) checks each against who it came from and went to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    pub text: String,
+    pub from: String,
+    pub to: Vec<String>,
+    /// A message (yours or a model's), as opposed to a tool line or an error.
+    pub message: bool,
+}
+
 /// The thread as Markdown. `offset_at` gives the local UTC offset in seconds at a Unix second,
 /// so each time is shifted by its own offset (the loop passes the real one; tests a constant).
 pub fn render(title: &str, events: &[EventLine], offset_at: impl Fn(i64) -> i64) -> String {
@@ -13,7 +24,19 @@ pub fn render(title: &str, events: &[EventLine], offset_at: impl Fn(i64) -> i64)
             .first()
             .map_or_else(String::new, |e| day_of(local(e.ts)))
     );
+    for entry in entries(events, &offset_at) {
+        out += &entry.text;
+    }
+    out
+}
+
+/// The thread's entries in order, as `render` writes them (without its title line).
+pub fn entries(events: &[EventLine], offset_at: impl Fn(i64) -> i64) -> Vec<Entry> {
+    let local = |ts: u64| ts.saturating_add_signed(offset_at((ts / 1000) as i64) * 1000);
+    let mut list = vec![];
     for e in events {
+        let mut out = String::new();
+        let mut message = true;
         let text = |key: &str| e.payload[key].as_str().unwrap_or("").trim_end().to_string();
         let to: Vec<&str> = e.to.iter().map(|p| p.id.as_str()).collect();
         let when = clock(local(e.ts));
@@ -49,13 +72,25 @@ pub fn render(title: &str, events: &[EventLine], offset_at: impl Fn(i64) -> i64)
                     quote(&text("prompt"))
                 );
             }
-            Kind::ToolCall => out += &format!("\n`[{}: {}]`\n", e.from.id, text("summary")),
-            Kind::Error => out += &format!("\n> ! {}: {}\n", e.from.id, text("text")),
+            Kind::ToolCall => {
+                message = false;
+                out += &format!("\n`[{}: {}]`\n", e.from.id, text("summary"));
+            }
+            Kind::Error => {
+                message = false;
+                out += &format!("\n> ! {}: {}\n", e.from.id, text("text"));
+            }
             // Bookkeeping lines: deliveries, settles, approvals, registry notes.
-            _ => {}
+            _ => continue,
         }
+        list.push(Entry {
+            text: out,
+            from: e.from.id.clone(),
+            to: to.iter().map(|t| (*t).to_string()).collect(),
+            message,
+        });
     }
-    out
+    list
 }
 
 /// `HH:MM` of a Unix-milliseconds time.
