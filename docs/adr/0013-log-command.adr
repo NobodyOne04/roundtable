@@ -1,6 +1,8 @@
 # 0013. `/log`: read the thread in your editor
 
-- Status: Proposed
+- Status: Rejected (owner, 2026-11-25): not what was agreed. The whole thread is copied as
+  Markdown to a temp file deleted when the editor closes, and the editor comes from the
+  config, not hardcoded or `$EDITOR`. Replaced by [0024](0024-log-command.adr).
 - Date: 2026-11-25
 
 Copying several lines out of the TUI picks up pane borders, side panes and wrap breaks,

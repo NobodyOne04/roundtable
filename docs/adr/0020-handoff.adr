@@ -32,7 +32,7 @@ decides who writes the summary, what it contains and what changes after.
   history: they have no earlier context to keep.
 - Consequences: switching who leads takes one command and keeps the reasoning, not just
   the last message. Costs: a summary turn (tokens, time), and summaries lose detail; the
-  full thread stays readable with `/log` ([0013](0013-log-command.adr)).
+  full thread stays readable with `/log` ([0024](0024-log-command.adr)).
 
 ## Technologies and alternatives
 - Alternatives:

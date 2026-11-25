@@ -1,0 +1,75 @@
+# 0024. `/log`: the whole thread as Markdown in the configured editor
+
+- Status: Proposed
+- Date: 2026-11-25
+- Replaces: [0013](0013-log-command.adr) (rejected)
+
+Copying several lines out of the TUI picks up pane borders and wrap breaks, because
+terminal copy works on screen cells. `/log` copies the whole current thread as Markdown
+into a temp file and opens it in the editor set in the config (nvim in the default
+config); when the editor session closes, the file is deleted.
+
+## Technical details
+- **Command**: `/log`, no arguments: always the whole current thread. Added to the command
+  table ([0008](0008-slash-commands-and-mentions.adr), `commands::COMMANDS` +
+  `App::command`). No thread yet: "nothing to log yet", no file.
+- **Editor from the config, not from code**: a top-level key in `models.toml`
+  ([0011](0011-hot-model-registry.adr)), hot like the rest of the file:
+  ```toml
+  # The editor /log opens the thread in; the file is deleted when it closes.
+  editor = "nvim"
+  ```
+  - The default file roundtable writes on first start contains `editor = "nvim"`. The
+    code has no built-in editor name and doesn't read `$EDITOR`/`$VISUAL`: the config is
+    the one place it is set.
+  - The value is a command line, split with shell-words, so `editor = "nvim -R"` or
+    `editor = "code --wait"` work; the file path is added as the last argument.
+  - Key missing or empty: `/log` answers "set `editor` in models.toml" and writes no
+    file. Validation is the registry's usual all-or-nothing parse (a non-string `editor`
+    is an error with its line).
+- **The file**: the whole thread rendered as Markdown from its transcript
+  (`events.jsonl`, [0010](0010-filesystem-event-log.adr)), never from the screen, so
+  there are no borders or wrap breaks, and key values are already redacted:
+  ```
+  # <thread title> · 2026-11-25
+
+  ## you · 19:41
+  @codex review this
+
+  ## codex · 19:42
+  <reply, verbatim>
+
+  > claude → codex (ask)
+  > <prompt>
+  >
+  > <answer>
+  ```
+  Messages verbatim (code blocks keep their fences), `ask` exchanges in full as quotes,
+  tool calls one line each, errors as `> ! <text>`. A pure function
+  `log::render(&[EventLine]) -> String` in the library, covered by insta snapshots.
+- **Temp file**: in the system temp folder (`std::env::temp_dir()`, the per-user
+  `$TMPDIR` on macOS), named `roundtable-<ulid>.md`, created with `create_new` and mode
+  0600. Deleted as soon as the editor process exits, whatever its exit code. A
+  `roundtable-*.md` left behind by a crash is removed at the next start.
+- **Opening**: roundtable leaves the screen and runs the editor in the same terminal: the
+  terminal-input task pauses (else it steals the editor's keys), raw mode and the alternate
+  screen are turned off, the editor runs and is waited for, then the screen is restored
+  and fully redrawn. Replies keep streaming into `App` meanwhile; only drawing pauses.
+  The editor not found, or exiting non-zero: an error line in the chat, the file deleted.
+- **State/IO split** ([0002](0002-single-owner-event-loop.adr)): `App::update` returns
+  `Effect::OpenLog`; the loop reads the transcript, renders, writes the file and runs the
+  editor.
+- **A snapshot**: the file holds the thread as it was at `/log`; edits to it are
+  discarded with the file.
+- Consequences: copying, searching and reading back use the owner's own editor and keys,
+  with no in-TUI selection. Costs: a Markdown render to maintain next to the TUI's, and the
+  terminal hand-over to the editor.
+
+## Technologies and alternatives
+- Involved: crossterm (raw mode, alternate screen), `shell-words`, ulid, insta
+- Alternatives:
+  - `$VISUAL`/`$EDITOR` with nvim as fallback (0013): the owner wants it in the config.
+  - `/log <n>` for the last messages (0013): the agreement is the whole thread.
+  - A tmux popup instead of leaving the screen (0013): a second launch path; can come
+    later as an option of this one.
+  - In-TUI selection with mouse capture: breaks tmux mouse selection over the pane.

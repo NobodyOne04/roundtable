@@ -37,6 +37,6 @@ guided `/model add` as later. This ADR decides its steps and where the key goes.
 - Involved: `toml_edit` (already used), the OpenAI-compatible `/models` endpoint
 - Alternatives:
   - Open `models.toml` in `$EDITOR` with a filled-in template: no wizard, reuses `/log`'s
-    editor launch ([0013](0013-log-command.adr)); a good fallback, `/model add --edit`.
+    editor launch ([0024](0024-log-command.adr)); a good fallback, `/model add --edit`.
   - Typing the key into roundtable and storing it in the keychain: easier, but the key
     would pass through roundtable's input, history and possibly the terminal scrollback.
