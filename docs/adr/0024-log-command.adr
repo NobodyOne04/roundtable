@@ -1,6 +1,6 @@
 # 0024. `/log`: the whole thread as Markdown in the configured editor
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-25)
 - Date: 2026-11-25
 - Replaces: [0013](0013-log-command.adr) (rejected)
 

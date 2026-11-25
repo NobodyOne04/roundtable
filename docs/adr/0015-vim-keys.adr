@@ -1,6 +1,6 @@
 # 0015. Vim keys for moving around
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-25)
 - Date: 2026-11-25
 - Amends: [0008](0008-slash-commands-and-mentions.adr) (keys)
 
