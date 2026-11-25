@@ -28,7 +28,8 @@ cmd = "claude"
 role = "lead"
 enabled = true
 # model = "claude-opus-5-5"          # passed as --model
-# permission_mode = "acceptEdits"    # used only for the writer's own turns
+# permission_mode = "acceptEdits"    # the writer's own turns; unset means acceptEdits, and
+#                                    # commands that need approval are asked in the chat
 
 [[model]]
 id = "codex"
@@ -36,6 +37,8 @@ kind = "cli"
 cmd = "codex"
 role = "reviewer"
 enabled = true
+# auto_review = true                 # writer only: Codex's own reviewer approves escalations
+#                                    # (network, writes outside the checkout); off by default
 
 # A free model over an OpenAI-compatible API (answers arrive with ADR 0005):
 # [[model]]
@@ -84,6 +87,8 @@ struct RawEntry {
     enabled: bool,
     role: Option<String>,
     permission_mode: Option<String>,
+    #[serde(default)]
+    auto_review: bool,
 }
 
 fn yes() -> bool {
@@ -161,6 +166,9 @@ pub struct Participant {
     pub enabled: bool,
     pub role: Option<String>,
     pub permission_mode: Option<String>,
+    /// Codex only: its own reviewer approves escalations for the writer (ADR 0018). Wider
+    /// than the workspace sandbox (network, writes outside the checkout), so opt-in.
+    pub auto_review: bool,
     /// Names the exact destination; history and sessions are bound to it, not to `id`.
     pub identity: String,
 }
@@ -324,9 +332,15 @@ fn participant(e: RawEntry) -> Result<Participant, String> {
                     )));
                 }
             }
+            if e.auto_review && kind != agent::Kind::Codex {
+                return Err(at("`auto_review` is for codex only"));
+            }
             Adapter::Cli(kind)
         }
         EntryKind::Openai => {
+            if e.auto_review {
+                return Err(at("openai models take no `auto_review`"));
+            }
             if e.cmd.is_some() || e.permission_mode.is_some() {
                 return Err(at("openai models take no `cmd` or `permission_mode`"));
             }
@@ -377,6 +391,7 @@ fn participant(e: RawEntry) -> Result<Participant, String> {
         enabled: e.enabled,
         role: e.role,
         permission_mode: e.permission_mode,
+        auto_review: e.auto_review,
         identity,
     })
 }
@@ -495,6 +510,23 @@ mod tests {
         assert!(set("editor = \"\"").unwrap().editor.is_empty());
         let err = set("editor = \"nvim 'unclosed\"").unwrap_err();
         assert!(err.contains("editor"), "{err}");
+    }
+
+    #[test]
+    fn auto_review_is_for_codex_only() {
+        let codex = DEFAULT_FILE.replace(
+            "role = \"reviewer\"",
+            "role = \"reviewer\"\nauto_review = true",
+        );
+        assert!(
+            Registry::parse(&codex)
+                .unwrap()
+                .get("codex")
+                .unwrap()
+                .auto_review
+        );
+        let claude = DEFAULT_FILE.replace("role = \"lead\"", "role = \"lead\"\nauto_review = true");
+        assert!(Registry::parse(&claude).unwrap_err().contains("codex only"));
     }
 
     #[test]

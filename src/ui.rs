@@ -457,6 +457,8 @@ pub fn chat_lines(line: &ChatLine, selected: bool) -> Vec<Line<'static>> {
     let body = match line.kind {
         LineKind::Error => Style::new().fg(Color::Red),
         LineKind::Info => dim,
+        // A tool approval card (ADR 0018): it waits on the owner.
+        LineKind::Approval(_) => Style::new().fg(Color::Yellow),
         _ => Style::new(),
     };
     let suffix = match line.kind {

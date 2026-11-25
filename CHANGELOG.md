@@ -5,6 +5,7 @@
 ### Added
 - `/handoff <id>` (ADR 0020): the default (or writer) summarizes the thread read-only, `<id>` takes it over and becomes the default; asks before sending entries the summarizer never saw; `raw [n]` sends the last messages verbatim after asking
 - A git worktree per read-only agent (ADR 0016): every CLI agent but the writer runs in its own mirror, synced with the checkout before each turn; `/worktrees` lists them, `/worktrees clean [id]` removes them; sessions are bound to the folder they ran in
+- Tool approvals in the chat (ADR 0018): what the writer Claude wants to run shows as a card; `Ctrl-A`, then `y` once, `a` its suggested rule for the thread, `n` deny; every decision logged, grants bound to the destination and restored on `/resume`. Codex: opt-in `auto_review`
 - `/usage` shows Claude's and Codex's plan limits (ADR 0014): 5-hour and weekly use and reset times, from Claude's stream and Codex's session files; 80%+ shows in the status line; kept across restarts in `limits.json`
 - Vim keys (ADR 0015): `Esc` to Normal mode (`j`/`k`, `gg`/`G`, `Ctrl-U`/`Ctrl-D`, `h`/`l`, `o`, `y` copies via OSC 52, `x`, `?`, `q`), `i`/`a`/`/`/`:` back to typing; the mode shows in the status line
 - `/log` (ADR 0024): the whole thread as Markdown in a temp file, opened in the `editor` set in `models.toml` (new files get `editor = "nvim"`), deleted when the editor closes
@@ -35,6 +36,7 @@
 - Transcript, sessions and logs are readable by the owner only (data folder 0700, files 0600)
 
 ### Changed
+- The writer's unset `permission_mode` is now `acceptEdits` for Claude (was `default`, which refused every edit it couldn't ask about): an existing config without the key behaves differently after the upgrade (ADR 0018)
 - The writer may edit from any message that reaches it, `@all` and `default = "all"` included (ADR 0017); `@all?` keeps everyone read-only, and the echo shows who may edit
 - ADRs 0016-0023 accepted, each revised after Codex's critique: worktree per agent, writer edits from any message, approvals in the chat, `/fork`, `/handoff`, `/compact`, `/model add`, ACP adapter
 - Proposed ADRs 0014-0024: `/usage` plan limits, vim keys, worktree per agent, writer edits from any message, approvals in the chat, `/fork`, `/handoff`, `/compact`, `/model add`, ACP adapter, `/log` (0024; the first `/log` draft, 0013, rejected)

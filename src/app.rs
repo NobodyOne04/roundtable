@@ -181,12 +181,22 @@ pub enum Effect {
         /// The writer's own turn, which may edit files (ADR 0004).
         writable: bool,
         permission_mode: Option<String>,
+        /// Codex only: `--approve-for-me` on the writer's turns (ADR 0018).
+        auto_review: bool,
         /// Give this turn the `ask` tool (ADR 0007); the loop builds the bridge.
         ask_tool: bool,
         /// The identity the turn runs with: native sessions are keyed by it (and the folder).
         identity: String,
         /// Not the writer: runs in its own synced worktree, inside git (ADR 0016).
         mirror: bool,
+    },
+    /// Answer an approval request of `id`'s running turn on its stdin (ADR 0018).
+    AnswerApproval {
+        id: String,
+        request_id: String,
+        allow: bool,
+        input: serde_json::Value,
+        message: String,
     },
     /// Cancel the running turn of one participant.
     CancelTurn(String),
@@ -253,6 +263,8 @@ pub enum LineKind {
     Tool,
     Info,
     Error,
+    /// A tool approval card (ADR 0018), by its key in `App::approvals`.
+    Approval(u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +316,57 @@ pub struct ContextRow {
     /// Estimated fill of the window, 0..1, only when knowable (chat-only models).
     pub fill: Option<f64>,
     pub tokens: (u64, u64),
+}
+
+/// A tool request waiting for the owner (ADR 0018).
+#[derive(Debug, Clone)]
+struct Pending {
+    /// Its card's `LineKind::Approval` key.
+    key: u64,
+    id: String,
+    request: agent::ApprovalRequest,
+    /// The destination asking: an answer never reaches a repointed participant.
+    identity: Option<String>,
+}
+
+/// "Allow for this thread" (ADR 0018): matched by roundtable, bound to the destination.
+#[derive(Debug, Clone, PartialEq)]
+struct Grant {
+    identity: String,
+    tool: String,
+    rule: String,
+    /// The approval event that made it, for the log's `who`.
+    key: u64,
+}
+
+/// Whether Claude's suggested `rule` (its `ruleContent`) covers this request: `prefix *` or
+/// `prefix:*` match a Bash command starting with `prefix` (whole words), anything else must
+/// be the command or path exactly.
+fn rule_covers(rule: &str, request: &agent::ApprovalRequest) -> bool {
+    let subject = &request.summary;
+    match rule.strip_suffix(" *").or_else(|| rule.strip_suffix(":*")) {
+        Some(prefix) => {
+            subject == prefix
+                || subject
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with(' '))
+        }
+        None => subject == rule,
+    }
+}
+
+/// An approval card's text: the request, then its state or the keys to answer it.
+fn card(request: &agent::ApprovalRequest, state: &str) -> String {
+    let head = format!("{}: {}", request.tool, request.summary);
+    if state != "waiting" {
+        return format!("{head}\n{state}");
+    }
+    let thread = request
+        .rule
+        .as_ref()
+        .map(|r| format!(" · [a] allow `{}({r})` in this thread", request.tool))
+        .unwrap_or_default();
+    format!("{head}\nCtrl-A, then [y] allow once{thread} · [n] deny")
 }
 
 /// How a recorded event hangs together (ADR 0010 `turn`/`parent`), in `App`'s own keys: the
@@ -416,6 +479,12 @@ pub struct App {
     pub follow_selection: bool,
     /// Paging typed after `gg` and before the top offset was drawn, applied once it is.
     pending_page: isize,
+    /// Tool requests waiting for the owner, oldest first (ADR 0018).
+    approvals: Vec<Pending>,
+    /// `Ctrl-A` gave the oldest waiting card the keys: `y`, `a`, `n` answer it.
+    pub approving: bool,
+    /// This thread's "allow for this thread" grants.
+    grants: Vec<Grant>,
     /// The threads pane: past threads, newest first, and the picked one.
     pub threads: Vec<ThreadRow>,
     pub thread_pick: usize,
@@ -474,6 +543,9 @@ impl App {
             width: WIDE,
             follow_selection: true,
             pending_page: 0,
+            approvals: vec![],
+            approving: false,
+            grants: vec![],
             threads: vec![],
             thread_pick: 0,
             show_threads: true,
@@ -649,7 +721,31 @@ impl App {
             self.push("roundtable", "Ctrl-C again to quit".into(), LineKind::Info);
             return vec![];
         }
+        // An approval card has the keys (ADR 0018): only these answer, nothing else acts.
+        if self.approving {
+            return match key.code {
+                KeyCode::Char('y') => self.answer_approval(true, false),
+                KeyCode::Char('a')
+                    if self
+                        .approvals
+                        .first()
+                        .is_some_and(|p| p.request.rule.is_some()) =>
+                {
+                    self.answer_approval(true, true)
+                }
+                KeyCode::Char('n') => self.answer_approval(false, false),
+                KeyCode::Esc => {
+                    self.approving = false;
+                    vec![]
+                }
+                _ => vec![],
+            };
+        }
         match key.code {
+            KeyCode::Char('a') if ctrl => {
+                self.focus_approval();
+                return vec![];
+            }
             KeyCode::Char('b') if ctrl => {
                 self.show_threads = !self.show_threads;
                 self.leave_hidden_pane();
@@ -984,10 +1080,15 @@ impl App {
             ""
         };
         format!(
-            "talk:{} · {turns}/{} turns · {tokens}/{} tokens{edits}",
+            "talk:{} · {turns}/{} turns · {tokens}/{} tokens{edits}{waiting}",
             if self.talk_on { "on" } else { "off" },
             talk.max_turns,
-            talk.budget_tokens
+            talk.budget_tokens,
+            waiting = match self.approvals.len() {
+                0 => String::new(),
+                1 => " · 1 approval waiting (Ctrl-A)".into(),
+                n => format!(" · {n} approvals waiting (Ctrl-A)"),
+            }
         )
     }
 
@@ -1256,11 +1357,35 @@ impl App {
         self.origins.clear();
         self.handoff = None;
         self.scroll = 0;
+        self.grants.clear();
         for seat in &mut self.seats {
             seat.session = None;
             seat.history = Default::default();
             seat.queue.clear();
             seat.thread_tokens = (0, 0);
+        }
+        // The thread's own grants come back (ADR 0018); `same` below keeps only the ones of
+        // destinations that still are what they were.
+        for e in events
+            .iter()
+            .filter(|e| e.kind == transcript::Kind::Approval)
+        {
+            if let (Some(identity), Some(tool), Some(rule)) = (
+                e.from.identity.clone(),
+                e.payload["grant"]["tool"].as_str(),
+                e.payload["grant"]["rule"].as_str(),
+            ) && self
+                .registry
+                .get(&e.from.id)
+                .is_some_and(|p| p.identity == identity)
+            {
+                self.grants.push(Grant {
+                    identity,
+                    tool: tool.into(),
+                    rule: rule.into(),
+                    key: e.seq,
+                });
+            }
         }
         let current: BTreeMap<String, String> = self
             .registry
@@ -1383,6 +1508,7 @@ impl App {
         self.scroll = 0;
         self.read_only = None;
         self.handoff = None;
+        self.grants.clear();
         for seat in &mut self.seats {
             seat.session = None;
             seat.history = Default::default();
@@ -2299,6 +2425,7 @@ impl App {
                 session,
                 writable,
                 permission_mode: p.permission_mode.clone(),
+                auto_review: p.auto_review,
                 ask_tool: self.may_ask(&p.id, kind),
                 identity: p.identity.clone(),
                 mirror: self.registry.writer() != Some(p.id.as_str()),
@@ -2416,6 +2543,10 @@ impl App {
                 seat.usage = Some((input, output, cost_usd, estimated));
                 vec![]
             }
+            PEvent::Approval(request) => {
+                let identity = seat.turn_identity.clone();
+                self.approval_requested(id, identity, request, link)
+            }
             PEvent::Limits(mut limits) => {
                 limits.identity = seat.turn_identity.clone();
                 // Never replace a newer reading of the same destination with an older one.
@@ -2446,6 +2577,13 @@ impl App {
     }
 
     fn finish(&mut self, id: &str, outcome: Outcome) -> Vec<Effect> {
+        let expired = self.expire_approvals(id);
+        let mut effects = self.finish_turn(id, outcome);
+        effects.extend(expired);
+        effects
+    }
+
+    fn finish_turn(&mut self, id: &str, outcome: Outcome) -> Vec<Effect> {
         let party = self.turn_party(id);
         let summary = self
             .handoff
@@ -2739,6 +2877,203 @@ impl App {
             }
         }
         effects
+    }
+
+    /// Claude asks to use a tool (ADR 0018): answered at once by a matching grant of this
+    /// thread, otherwise shown as a card for the owner.
+    fn approval_requested(
+        &mut self,
+        id: &str,
+        identity: Option<String>,
+        request: agent::ApprovalRequest,
+        link: Link,
+    ) -> Vec<Effect> {
+        let grant = identity.as_ref().and_then(|ident| {
+            self.grants
+                .iter()
+                .find(|g| {
+                    &g.identity == ident && g.tool == request.tool && rule_covers(&g.rule, &request)
+                })
+                .cloned()
+        });
+        if let Some(grant) = grant {
+            self.push(
+                "roundtable",
+                format!(
+                    "{id}: {} allowed by this thread's rule `{}({})`",
+                    request.summary, grant.tool, grant.rule
+                ),
+                LineKind::Info,
+            );
+            return vec![
+                Effect::AnswerApproval {
+                    id: id.into(),
+                    request_id: request.request_id.clone(),
+                    allow: true,
+                    input: request.input.clone(),
+                    message: String::new(),
+                },
+                self.approval_event(
+                    id,
+                    &request,
+                    "allow",
+                    &format!("rule {}", grant.key),
+                    None,
+                    link,
+                ),
+            ];
+        }
+        let key = self.next_key();
+        let text = card(&request, "waiting");
+        self.push(&format!("{id} asks"), text, LineKind::Approval(key));
+        self.approvals.push(Pending {
+            key,
+            id: id.into(),
+            request,
+            identity,
+        });
+        vec![]
+    }
+
+    /// The owner's answer to the oldest waiting card (`y`, `a`, `n` after `Ctrl-A`).
+    fn answer_approval(&mut self, allow: bool, for_thread: bool) -> Vec<Effect> {
+        if self.approvals.is_empty() {
+            self.approving = false;
+            return vec![];
+        }
+        let p = self.approvals.remove(0);
+        // Bound to the destination that asked: a repointed participant gets no answer from
+        // a card shown for another.
+        let current = self.registry.get(&p.id).map(|x| x.identity.clone());
+        let repointed = current != p.identity;
+        let allow = allow && !repointed;
+        let grant = (allow && for_thread)
+            .then(|| p.request.rule.clone())
+            .flatten()
+            .zip(p.identity.clone());
+        if let Some((rule, identity)) = &grant {
+            self.grants.push(Grant {
+                identity: identity.clone(),
+                tool: p.request.tool.clone(),
+                rule: rule.clone(),
+                key: p.key,
+            });
+        }
+        let state = match (repointed, allow, &grant) {
+            (true, ..) => "expired: the model was repointed".to_string(),
+            (_, true, Some((rule, _))) => {
+                format!("allowed in this thread: `{}({rule})`", p.request.tool)
+            }
+            (_, true, None) => "allowed once".to_string(),
+            _ => "denied".to_string(),
+        };
+        self.set_card(p.key, &card(&p.request, &state));
+        let link = self.seat_link(&p.id);
+        let decision = if allow { "allow" } else { "deny" };
+        let event_grant = grant.map(|(rule, _)| (p.request.tool.clone(), rule));
+        let mut effects = vec![
+            Effect::AnswerApproval {
+                id: p.id.clone(),
+                request_id: p.request.request_id.clone(),
+                allow,
+                input: p.request.input.clone(),
+                message: "denied by the owner in roundtable".into(),
+            },
+            self.approval_event(&p.id, &p.request, decision, "you", event_grant, link),
+        ];
+        if repointed {
+            effects.truncate(1);
+            effects.push(self.approval_event(&p.id, &p.request, "expired", "registry", None, link));
+        }
+        self.approving = !self.approvals.is_empty();
+        if self.approving {
+            self.show_card();
+        }
+        effects
+    }
+
+    /// A turn ended: its waiting requests can't be answered any more.
+    fn expire_approvals(&mut self, id: &str) -> Vec<Effect> {
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.approvals)
+            .into_iter()
+            .partition(|p| p.id == id);
+        self.approvals = kept;
+        if self.approvals.is_empty() {
+            self.approving = false;
+        }
+        let link = self.seat_link(id);
+        gone.iter()
+            .map(|p| {
+                self.set_card(p.key, &card(&p.request, "expired: the turn ended"));
+                self.approval_event(id, &p.request, "expired", "turn ended", None, link)
+            })
+            .collect()
+    }
+
+    /// `Ctrl-A`: the oldest waiting card gets the keys, selected and in view.
+    fn focus_approval(&mut self) {
+        if self.approvals.is_empty() {
+            self.push("roundtable", "no approval waiting".into(), LineKind::Info);
+            return;
+        }
+        self.approving = true;
+        self.show_card();
+    }
+
+    fn show_card(&mut self) {
+        let Some(key) = self.approvals.first().map(|p| p.key) else {
+            return;
+        };
+        self.focus = Focus::Chat;
+        self.selected_line = self
+            .lines
+            .iter()
+            .position(|l| l.kind == LineKind::Approval(key));
+        self.follow_selection = true;
+    }
+
+    fn set_card(&mut self, key: u64, text: &str) {
+        if let Some(line) = self
+            .lines
+            .iter_mut()
+            .find(|l| l.kind == LineKind::Approval(key))
+        {
+            line.text = text.into();
+        }
+    }
+
+    /// The running turn's place in the transcript, for approval events.
+    fn seat_link(&self, id: &str) -> Link {
+        self.seats
+            .iter()
+            .find(|s| s.id == id)
+            .map_or(Link::default(), |s| Link {
+                key: 0,
+                turn: s.origin,
+                parent: s.delivery_key,
+            })
+    }
+
+    /// An `approval` event (ADR 0010 kind, ADR 0018): what, the decision and who made it.
+    fn approval_event(
+        &self,
+        id: &str,
+        request: &agent::ApprovalRequest,
+        decision: &str,
+        who: &str,
+        grant: Option<(String, String)>,
+        link: Link,
+    ) -> Effect {
+        let mut payload = json!({
+            "tool": request.tool,
+            "request": request.summary,
+            "decision": decision,
+            "who": who,
+        });
+        if let Some((tool, rule)) = grant {
+            payload["grant"] = json!({ "tool": tool, "rule": rule });
+        }
+        record(self.party(id), vec![], transcript::Kind::Approval, payload).linked(link)
     }
 
     /// A fresh key for an origin or a `Link`.
@@ -4569,6 +4904,200 @@ mod tests {
         app.update(key(KeyCode::Char('/'), KeyModifiers::NONE));
         app.update(key(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.input, "half a thought");
+    }
+
+    fn bash(id: &str, command: &str, rule: Option<&str>) -> PEvent {
+        PEvent::Approval(agent::ApprovalRequest {
+            request_id: id.into(),
+            tool: "Bash".into(),
+            input: json!({ "command": command }),
+            summary: command.into(),
+            rule: rule.map(str::to_string),
+        })
+    }
+
+    fn answers(effects: &[Effect]) -> Vec<(String, bool)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::AnswerApproval {
+                    request_id, allow, ..
+                } => Some((request_id.clone(), *allow)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn approval_payloads(effects: &[Effect]) -> Vec<serde_json::Value> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Record { event, .. } if event.kind == transcript::Kind::Approval => {
+                    Some(event.payload.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn approvals_wait_for_the_owner_and_answer_only_after_ctrl_a() {
+        let mut app = App::default();
+        type_line(&mut app, "run the tests");
+        let ctrl_a = || key(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert!(
+            app.update(agent(
+                "claude",
+                bash("R1", "cargo test --locked", Some("cargo test:*"))
+            ))
+            .is_empty()
+        );
+        assert!(app.status_line().ends_with("1 approval waiting (Ctrl-A)"));
+        assert!(matches!(
+            app.lines.last().unwrap().kind,
+            LineKind::Approval(_)
+        ));
+        // Typed for something else: `y` is text in Insert mode, not an answer.
+        app.update(key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.input, "y");
+        app.input.clear();
+        // Ctrl-A: the card has the keys. `a` allows and grants the suggested rule.
+        app.update(ctrl_a());
+        assert!(app.approving);
+        let effects = app.update(key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(answers(&effects), [("R1".to_string(), true)]);
+        let logged = approval_payloads(&effects);
+        assert_eq!(logged[0]["decision"], "allow");
+        assert_eq!(logged[0]["who"], "you");
+        assert_eq!(
+            logged[0]["grant"],
+            json!({"tool": "Bash", "rule": "cargo test:*"})
+        );
+        assert!(!app.approving && app.status_line().ends_with("tokens"));
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| l.text.contains("allowed in this thread"))
+        );
+        // The grant answers a matching request by itself, and says so.
+        let effects = app.update(agent("claude", bash("R2", "cargo test --release", None)));
+        assert_eq!(answers(&effects), [("R2".to_string(), true)]);
+        assert!(
+            approval_payloads(&effects)[0]["who"]
+                .as_str()
+                .unwrap()
+                .starts_with("rule ")
+        );
+        // Not covered (another command, or a word that only starts like it): asked again.
+        for (rid, cmd) in [("R3", "rm -rf target"), ("R4", "cargo testx")] {
+            assert!(
+                app.update(agent("claude", bash(rid, cmd, None))).is_empty(),
+                "{cmd}"
+            );
+        }
+        // `n` denies the oldest; the next one then has the keys.
+        app.update(ctrl_a());
+        assert_eq!(
+            answers(&app.update(key(KeyCode::Char('n'), KeyModifiers::NONE))),
+            [("R3".to_string(), false)]
+        );
+        assert!(app.approving, "the next card is focused");
+        // `a` does nothing for a request without a suggested rule; Esc leaves it waiting.
+        assert!(
+            app.update(key(KeyCode::Char('a'), KeyModifiers::NONE))
+                .is_empty()
+        );
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.approving);
+        // The turn ends: what still waits expires, logged as such.
+        let effects = app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        assert!(
+            approval_payloads(&effects)
+                .iter()
+                .any(|p| p["decision"] == "expired")
+        );
+        assert!(
+            app.status_line().ends_with("tokens"),
+            "nothing waits any more"
+        );
+    }
+
+    #[test]
+    fn an_approval_never_reaches_a_repointed_participant() {
+        let mut app = App::default();
+        type_line(&mut app, "run it");
+        app.update(agent("claude", bash("R1", "make", None)));
+        reload(
+            &mut app,
+            &DEFAULT_FILE.replace("role = \"lead\"", "role = \"lead\"\nmodel = \"other\""),
+        );
+        app.update(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        let effects = app.update(key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(
+            answers(&effects),
+            [("R1".to_string(), false)],
+            "denied, not allowed"
+        );
+        assert!(
+            approval_payloads(&effects)
+                .iter()
+                .any(|p| p["decision"] == "expired")
+        );
+    }
+
+    #[test]
+    fn resume_brings_back_the_threads_grants() {
+        let mut app = App::default();
+        let claude = app.registry.get("claude").unwrap().identity.clone();
+        let grant = |identity: &str| transcript::EventLine {
+            seq: 4,
+            ts: 0,
+            turn: None,
+            parent: None,
+            from: transcript::Party {
+                id: "claude".into(),
+                identity: Some(identity.into()),
+            },
+            to: vec![],
+            kind: transcript::Kind::Approval,
+            payload: json!({"tool": "Bash", "decision": "allow", "who": "you",
+                "grant": {"tool": "Bash", "rule": "make:*"}}),
+            tokens_in: None,
+            tokens_out: None,
+        };
+        app.update(Event::Resumed {
+            title: "t".into(),
+            events: vec![grant(&claude), grant("another-destination")],
+            sessions: BTreeMap::new(),
+            elsewhere: None,
+        });
+        assert_eq!(app.grants.len(), 1, "only the current destination's");
+        type_line(&mut app, "go");
+        assert_eq!(
+            answers(&app.update(agent("claude", bash("R1", "make all", None)))),
+            [("R1".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn grants_are_bound_to_the_destination() {
+        let mut app = App::default();
+        type_line(&mut app, "go");
+        app.update(agent("claude", bash("R1", "make", Some("make:*"))));
+        app.update(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.update(key(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.update(agent("claude", PEvent::Done(Outcome::Complete)));
+        // Repointed: the grant doesn't carry over to the new destination.
+        reload(
+            &mut app,
+            &DEFAULT_FILE.replace("role = \"lead\"", "role = \"lead\"\nmodel = \"other\""),
+        );
+        type_line(&mut app, "again");
+        assert!(
+            app.update(agent("claude", bash("R2", "make all", None)))
+                .is_empty(),
+            "asked again"
+        );
     }
 
     #[test]
