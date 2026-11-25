@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Added
+- `/usage` shows Claude's and Codex's plan limits (ADR 0014): 5-hour and weekly use and reset times, from Claude's stream and Codex's session files; 80%+ shows in the status line; kept across restarts in `limits.json`
+- Vim keys (ADR 0015): `Esc` to Normal mode (`j`/`k`, `gg`/`G`, `Ctrl-U`/`Ctrl-D`, `h`/`l`, `o`, `y` copies via OSC 52, `x`, `?`, `q`), `i`/`a`/`/`/`:` back to typing; the mode shows in the status line
 - `/log` (ADR 0024): the whole thread as Markdown in a temp file, opened in the `editor` set in `models.toml` (new files get `editor = "nvim"`), deleted when the editor closes
 - Three-pane layout (ADR 0009): threads (`Ctrl-B`, `Enter` resumes), context per participant (`Ctrl-K`), status line, collapsible tool and handoff lines, Markdown replies, `Tab` focus
 - `/resume` (ADR 0008, 0010): reopen a past thread with its chat, CLI sessions and model histories (only for participants still pointing where they did); threads from another checkout open read-only

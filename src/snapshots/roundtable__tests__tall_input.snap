@@ -16,5 +16,5 @@ expression: screen
 "│line 10                                                   │"
 "│line 11                                                   │"
 "│line 12                                                   │"
-"└ Enter send · Alt-Enter new line · Tab panes · /help · Esc┘"
-" talk:on · 0/6 turns · 0/50000 tokens                       "
+"└ Enter send · Alt-Enter new line · Esc normal mode · /help┘"
+" -- INSERT -- · talk:on · 0/6 turns · 0/50000 tokens        "

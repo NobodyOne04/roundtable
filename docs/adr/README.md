@@ -18,7 +18,7 @@ Implementation order: see the note under the table.
 | [0011](0011-hot-model-registry.adr) | Model registry lives in memory, changes hot, persists to TOML (replaces 0006) | Accepted |
 | [0012](0012-checkout-writer-lock.adr) | The writer lock lives in the checkout (amends 0010) | Accepted |
 | [0013](0013-log-command.adr) | `/log`: read the thread in your editor | Rejected |
-| [0014](0014-usage-plan-limits.adr) | `/usage` shows each CLI's plan limits | Proposed |
+| [0014](0014-usage-plan-limits.adr) | `/usage` shows each CLI's plan limits | Accepted |
 | [0015](0015-vim-keys.adr) | Vim keys for moving around (amends 0008) | Accepted |
 | [0016](0016-worktree-per-agent.adr) | A git worktree per read-only agent | Proposed |
 | [0017](0017-writer-edits-from-any-message.adr) | The writer may edit from any message (amends 0004) | Proposed |

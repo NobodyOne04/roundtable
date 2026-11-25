@@ -124,6 +124,12 @@ async fn start() -> Result<()> {
         ),
     };
     let mut app = App::new(registry, checks.clone());
+    // The last known plan limits (ADR 0014); a missing or unreadable file just means none.
+    if let Ok(bytes) = fs::read(root.join("limits.json"))
+        && let Ok(limits) = serde_json::from_slice(&bytes)
+    {
+        app.limits = limits;
+    }
     for (id, check) in &checks {
         tracing::info!(id, ?check, "preflight");
         match check {
@@ -212,6 +218,12 @@ fn log_files() -> impl Iterator<Item = PathBuf> {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("roundtable-") && n.ends_with(".md"))
         })
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// The local time zone's offset from UTC now, in seconds.
@@ -797,6 +809,17 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                 Effect::Redraw => {
                     terminal.draw(|frame| ui::draw(frame, &app))?;
                 }
+                Effect::Copy(text) => {
+                    use crossterm::clipboard::CopyToClipboard;
+                    // OSC 52: the terminal sets the clipboard, so it works over ssh and in tmux
+                    // (with `set-clipboard on`).
+                    if let Err(err) = crossterm::execute!(
+                        std::io::stdout(),
+                        CopyToClipboard::to_clipboard_from(text)
+                    ) {
+                        local.push_back(Event::Notice(format!("copy: {err}")));
+                    }
+                }
                 Effect::OpenLog { .. } if editing.is_some() => {
                     local.push_back(Event::Notice("/log is already open".into()));
                 }
@@ -916,7 +939,23 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     rt.thread = None;
                     rt.sessions.clear();
                 }
-                Effect::Usage(scope) => local.push_back(Event::Report(rt.usage_report(&scope))),
+                Effect::Usage(scope) => {
+                    let agents = app.cli_agents();
+                    let agents: Vec<&str> = agents.iter().map(String::as_str).collect();
+                    let limits =
+                        roundtable::limits::report(&agents, &app.limits, now_ms(), utc_offset_s());
+                    let usage = rt.usage_report(&scope);
+                    local.push_back(Event::Report(format!("{limits}\n{usage}")));
+                }
+                Effect::SaveLimits(limits) => {
+                    let path = rt.data_root.join("limits.json");
+                    let saved = serde_json::to_vec_pretty(&limits)
+                        .map_err(std::io::Error::other)
+                        .and_then(|bytes| transcript::write_atomic(&path, &bytes));
+                    if let Err(err) = saved {
+                        tracing::warn!(%err, "saving limits.json failed");
+                    }
+                }
                 Effect::Resume(which) => local.push_back(rt.resume(which.as_deref())),
                 Effect::TestModel { id, target } => {
                     let tx = tx.clone();
@@ -1465,8 +1504,19 @@ mod tests {
             "codex".into(),
             PEvent::Message("Yes, `ok`.".into()),
         ));
-        // Tab to the chat, Enter expands the handoff.
-        app.update(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        // Esc to Normal mode, k up to the handoff, Enter expands it (ADR 0015).
+        app.update(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        let handoff = app
+            .lines
+            .iter()
+            .position(|l| l.kind == roundtable::app::LineKind::Handoff)
+            .unwrap();
+        while app.selected_line != Some(handoff) {
+            app.update(Event::Key(KeyEvent::new(
+                KeyCode::Char('k'),
+                KeyModifiers::NONE,
+            )));
+        }
         app.update(Event::Key(KeyEvent::new(
             KeyCode::Enter,
             KeyModifiers::NONE,

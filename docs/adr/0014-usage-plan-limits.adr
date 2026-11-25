@@ -1,6 +1,6 @@
 # 0014. `/usage` shows each CLI's plan limits
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-25)
 - Date: 2026-11-25
 
 `/usage` today sums tokens and cost from the transcript, so it only ever shows what

@@ -90,15 +90,43 @@ pub fn draw(frame: &mut Frame, app: &App) {
             .collect::<Vec<_>>(),
     )
     .block(focused(
-        Block::bordered()
-            .title_bottom(" Enter send · Alt-Enter new line · Tab panes · /help · Esc cancel "),
+        Block::bordered().title_bottom(if app.focus == Focus::Input {
+            " Enter send · Alt-Enter new line · Esc normal mode · /help "
+        } else {
+            " i insert · j/k move · gg/G · o open · y copy · x cancel · ? help "
+        }),
         app.focus == Focus::Input,
     ));
     frame.render_widget(input, input_area);
-    let status = Paragraph::new(Line::styled(
-        format!(" {}", app.status_line()),
-        Style::new().add_modifier(Modifier::DIM),
-    ));
+    // The mode, vim-style (ADR 0015): Insert while the input has the keys.
+    let mode = if app.focus == Focus::Input {
+        "-- INSERT --"
+    } else {
+        "-- NORMAL --"
+    };
+    let status = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!(" {mode} "),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("· {}", app.status_line()),
+            Style::new().add_modifier(Modifier::DIM),
+        ),
+        // Plan windows at 80% or more (ADR 0014); the clock is read here, not in `App`.
+        Span::styled(
+            roundtable::limits::warnings(
+                &app.limits,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64),
+            )
+            .iter()
+            .map(|w| format!(" · {w}"))
+            .collect::<String>(),
+            Style::new().fg(Color::Yellow),
+        ),
+    ]));
     frame.render_widget(status, status_area);
     if app.focus == Focus::Input {
         // The cursor is always at the end of the input: after the last row.
@@ -172,7 +200,32 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
     let inner_height = area.height.saturating_sub(2);
     let total = chat.line_count(area.width.saturating_sub(2)) as u16;
     let bottom = total.saturating_sub(inner_height);
-    let top = bottom.saturating_sub(app.scroll);
+    let mut top = bottom.saturating_sub(app.scroll);
+    // In Normal mode the selected line stays in view (j/k move it, ADR 0015).
+    if let Some(i) = (app.focus == Focus::Chat)
+        .then_some(app.selected_line)
+        .flatten()
+        .filter(|&i| i < app.lines.len())
+    {
+        let width = area.width.saturating_sub(2);
+        let rows = |lines: &[roundtable::app::ChatLine]| {
+            let text: Vec<Line> = lines
+                .iter()
+                .enumerate()
+                .flat_map(|(j, l)| chat_lines(l, j == i))
+                .collect();
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .line_count(width) as u16
+        };
+        let start = rows(&app.lines[..i]);
+        let end = rows(&app.lines[..=i]);
+        if start < top {
+            top = start;
+        } else if end > top + inner_height {
+            top = end.saturating_sub(inner_height).min(start);
+        }
+    }
     let title = if top < bottom {
         format!(" roundtable · scrolled up {} lines (PgDn) ", bottom - top)
     } else {

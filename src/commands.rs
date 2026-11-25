@@ -36,7 +36,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "/usage",
         args: "[thread|today|all]",
-        help: "tokens and cost per model, from the transcript",
+        help: "plan limits of claude and codex (5h, week), then tokens and cost per model",
     },
     Command {
         name: "/log",
