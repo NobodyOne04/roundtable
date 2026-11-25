@@ -38,7 +38,8 @@ the reply, and the tokens it cost.
 
 - `@claude`, `@codex`, `@all` to address participants; no mention goes to the default.
   With `@all`, every enabled participant answers you independently. `default = "all"`
-  (or `/model use all`) makes every message without a mention an `@all`, read-only.
+  (or `/model use all`) makes every message without a mention an `@all`. `@all?` sends to
+  everyone with nobody editing.
 - Slash commands like Claude Code (`/help` lists them, `Tab` completes them and `@` ids):
   `/status`, `/usage [thread|today|all]`, `/context [id]`, `/models`,
   `/model enable|disable|use|test <id>`, `/talk on|off|show|allow a->b|deny a->b`,
@@ -153,14 +154,15 @@ context) and tokens this thread. The status line shows the talk switch and the l
 message's model-to-model turns and tokens against their limits. `Tab` completes, or moves
 between input, chat and threads. Under 100 columns the side panes hide.
 
-**Who may edit.** Only the `writer` from `models.toml` (default `claude`), and only when a
-message goes to it alone: the chat shows `you → claude (may edit)`. It runs with your own
+**Who may edit.** Only the `writer` from `models.toml` (default `claude`), whenever a message
+reaches it, alone or in a broadcast ([ADR 0017](docs/adr/0017-writer-edits-from-any-message.adr)):
+the chat shows `you → claude (may edit)` or `you → claude, codex (claude may edit)`. Start a
+message with `@all?` and nobody edits. It runs with your own
 setup and the `permission_mode` you give it (`acceptEdits` lets Claude edit without asking;
 unset means a safe explicit default, never what your own CLI config says: Claude
-`default`, which refuses edits it can't ask about, and Codex `workspace-write`). Everyone else, and the
-writer itself when reached through `@all` or several mentions, is read-only: plan mode for
-Claude, the read-only sandbox for Codex, both without your own MCP servers, hooks and
-plugins.
+`default`, which refuses edits it can't ask about, and Codex `workspace-write`). Everyone else
+is read-only: plan mode for Claude, the read-only sandbox for Codex, both without your own
+MCP servers, hooks and plugins.
 
 **After a crash.** Only one writer edits a checkout at a time, across every roundtable on
 it, whatever its data folder: the lock and a crash marker live in the checkout's own git
@@ -227,6 +229,8 @@ Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
 | 10 | [0024](docs/adr/0024-log-command.adr) | `/log`: the whole thread as Markdown in your configured editor | done |
 | 11 | [0015](docs/adr/0015-vim-keys.adr) | Vim keys: Insert and Normal modes | done |
 | 12 | [0014](docs/adr/0014-usage-plan-limits.adr) | `/usage` shows Claude's and Codex's 5-hour and weekly limits; 80%+ in the status line | done |
+| 13 | [0017](docs/adr/0017-writer-edits-from-any-message.adr) | The writer edits from any message; `@all?` keeps everyone read-only | done |
+| 14 | [0018](docs/adr/0018-approvals-in-the-chat.adr) | Tool approvals in the chat | next |
 
 Later, each with its own ADR first: git worktree per agent, `/model add` (guided),
 `/compact`, `/handoff`, `/fork`, approvals, an ACP adapter.

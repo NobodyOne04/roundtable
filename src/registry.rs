@@ -12,8 +12,8 @@ pub const DEFAULT_FILE: &str = r#"# roundtable model registry (ADR 0011).
 # Edits apply live while roundtable runs. A file with an error is not applied at all:
 # the chat shows the error and the previous registry stays in use.
 
-# Who gets a message without an @mention; "all" sends to everyone (read-only, so nobody
-# edits: address the writer alone, @claude, to let it edit).
+# Who gets a message without an @mention; "all" sends to everyone. The writer may edit from
+# any message that reaches it; start one with @all? when nobody should (ADR 0017).
 default = "claude"
 # The only participant that may edit files; remove the line and everyone is read-only.
 writer = "claude"

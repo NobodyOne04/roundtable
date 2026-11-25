@@ -977,7 +977,7 @@ impl App {
         if let Some(rest) = input.trim_start().strip_prefix("\\/") {
             input = format!("/{rest}");
         }
-        let (targets, prompt, broadcast) = match self.route(&input) {
+        let (targets, prompt, read_only) = match self.route(&input) {
             Ok(routed) => routed,
             Err(why) => {
                 self.input = input; // keep what was typed, so it can be fixed
@@ -985,12 +985,21 @@ impl App {
                 return vec![];
             }
         };
-        // Only a message to the writer alone may edit: `@all` and several mentions are
-        // read-only for everyone (ADR 0004).
-        let to_writer =
-            !broadcast && targets.len() == 1 && self.registry.writer() == Some(targets[0].as_str());
+        // The writer may edit whenever a message reaches it, broadcasts and `default = "all"`
+        // included; everyone else stays read-only. `@all?` keeps it read-only too (ADR 0017).
+        let writer = self.registry.writer().map(str::to_string);
+        let to_writer = !read_only
+            && writer
+                .as_deref()
+                .is_some_and(|w| targets.iter().any(|t| t == w));
         let writable = to_writer && !self.locked();
-        let edits = if writable { " (may edit)" } else { "" };
+        // The echo shows the permission in effect, after every check.
+        let edits = match (&writer, writable) {
+            (Some(w), true) if targets.len() > 1 => format!(" ({w} may edit)"),
+            (_, true) => " (may edit)".into(),
+            _ if targets.len() > 1 || read_only => " (read-only)".into(),
+            _ => String::new(),
+        };
         self.push(
             &format!("you → {}{edits}", targets.join(", ")),
             prompt.clone(),
@@ -1013,7 +1022,8 @@ impl App {
             }),
         ];
         for id in targets {
-            effects.extend(self.deliver(&id, prompt.clone(), writable, origin));
+            let may_edit = writable && writer.as_deref() == Some(id.as_str());
+            effects.extend(self.deliver(&id, prompt.clone(), may_edit, origin));
         }
         effects
     }
@@ -1617,15 +1627,19 @@ impl App {
     /// `@id` and `@all` at the start pick recipients; none means the default. The flag says
     /// it was a broadcast (`@all` or several mentions), whatever it expanded to: broadcasts
     /// are read-only even if only the writer is left (ADR 0004).
+    /// Who a message goes to, its text, and whether the owner asked that nobody edit
+    /// (`@all?`, ADR 0017).
     fn route(&self, input: &str) -> Result<(Vec<String>, String, bool), String> {
         let mut targets: Vec<String> = vec![];
         let mut mentions = 0;
+        let mut read_only = false;
         let mut rest = input.trim_start();
         while let Some(mention) = rest.strip_prefix('@') {
             let end = mention.find(char::is_whitespace).unwrap_or(mention.len());
             let name = &mention[..end];
-            mentions += if name == "all" { 2 } else { 1 };
-            if name == "all" {
+            mentions += if name.starts_with("all") { 2 } else { 1 };
+            if name == "all" || name == "all?" {
+                read_only |= name == "all?";
                 targets.extend(self.everyone());
             } else if self.registry.get(name).is_some() {
                 targets.push(name.into());
@@ -1642,11 +1656,8 @@ impl App {
         // must not fall back to it.
         if mentions == 0 {
             match self.registry.default() {
-                // Everyone by default: the same broadcast as `@all`, read-only for all.
-                Some("all") => {
-                    targets.extend(self.everyone());
-                    mentions = 2;
-                }
+                // Everyone by default: the same broadcast as `@all` (ADR 0017).
+                Some("all") => targets.extend(self.everyone()),
                 Some(id) => targets.push(id.into()),
                 None => return Err("no default model: start with @<id> (see /models)".into()),
             }
@@ -1661,7 +1672,7 @@ impl App {
             seen.push(id.clone());
             new
         });
-        Ok((targets, prompt.into(), mentions > 1))
+        Ok((targets, prompt.into(), read_only))
     }
 
     /// Every enabled participant that can take a turn now: who `@all` reaches.
@@ -2565,7 +2576,7 @@ mod tests {
         assert_eq!(
             shown,
             [
-                ("you → claude, codex", "go"),
+                ("you → claude, codex (claude may edit)", "go"),
                 ("claude", "Read"),
                 ("claude", "hi"),
                 ("codex", "ls"),
@@ -2602,11 +2613,15 @@ mod tests {
         assert!(effects.contains(&Effect::EditRegistry(FileEdit::Default("all".into()))));
         let effects = type_line(&mut app, "hi");
         assert_eq!(started(&effects), ["claude", "codex"]);
+        // ADR 0017: the writer may edit from the default broadcast, nobody else.
+        assert_eq!(
+            writable(&effects),
+            [("claude".into(), true), ("codex".into(), false)]
+        );
         assert!(
-            effects
+            app.lines
                 .iter()
-                .all(|e| !matches!(e, Effect::StartTurn { writable: true, .. })),
-            "a default broadcast never writes: {effects:?}"
+                .any(|l| l.who == "you → claude, codex (claude may edit)")
         );
         // Naming the writer alone still lets it edit (a fresh table: claude is busy above).
         let mut app = App::default();
@@ -2689,7 +2704,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_message_to_the_writer_alone_may_edit() {
+    fn only_the_writer_edits() {
         let mut app = App::default();
         let effects = type_line(&mut app, "fix the bug");
         assert_eq!(writable(&effects), [("claude".into(), true)]);
@@ -2706,7 +2721,17 @@ mod tests {
             "the reply closes the marker"
         );
 
-        for line in ["@all fix", "@claude @codex fix", "@codex fix"] {
+        // ADR 0017: the writer edits whenever a message reaches it; nobody else ever does.
+        for line in ["@all fix", "@claude @codex fix"] {
+            let mut app = App::default();
+            let effects = type_line(&mut app, line);
+            assert_eq!(
+                writable(&effects),
+                [("claude".into(), true), ("codex".into(), false)],
+                "{line}"
+            );
+        }
+        for line in ["@codex fix", "@all? fix"] {
             let mut app = App::default();
             let effects = type_line(&mut app, line);
             assert!(writable(&effects).iter().all(|(_, w)| !w), "{line}");
@@ -2857,7 +2882,7 @@ mod tests {
     }
 
     #[test]
-    fn a_broadcast_stays_read_only_even_when_only_the_writer_is_left() {
+    fn a_broadcast_lets_the_writer_edit_unless_asked_not_to() {
         let registry = Registry::parse(DEFAULT_FILE).unwrap();
         let checks = Checks::from([
             ("claude".into(), Ok("v".into())),
@@ -2866,13 +2891,24 @@ mod tests {
         let mut app = App::new(registry, checks);
         assert_eq!(
             writable(&type_line(&mut app, "@all fix this")),
-            [("claude".into(), false)]
+            [("claude".into(), true)]
         );
         let mut app = App::default();
         assert_eq!(
             writable(&type_line(&mut app, "@claude @claude fix")),
-            [("claude".into(), false)],
-            "two mentions are a broadcast even if they name the same one"
+            [("claude".into(), true)],
+            "the same one named twice is still the writer"
+        );
+        let mut app = App::default();
+        assert_eq!(
+            writable(&type_line(&mut app, "@all? just discuss")),
+            [("claude".into(), false), ("codex".into(), false)],
+            "@all? keeps everyone read-only"
+        );
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| l.who == "you → claude, codex (read-only)")
         );
     }
 

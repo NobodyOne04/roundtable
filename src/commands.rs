@@ -130,7 +130,8 @@ pub fn complete(input: &str, ids: &[String]) -> Vec<String> {
         return ids
             .iter()
             .map(String::as_str)
-            .chain(["all"])
+            // `@all?`: everyone, nobody edits (ADR 0017).
+            .chain(["all", "all?"])
             .filter(|id| id.starts_with(partial) && *id != partial)
             .map(|id| format!("@{id}"))
             .collect();
@@ -160,7 +161,8 @@ mod tests {
         assert_eq!(complete("/model use c", &ids()), ["claude", "codex"]);
         assert_eq!(complete("/context l", &ids()), ["llama"]);
         assert_eq!(complete("@c", &ids()), ["@claude", "@codex"]);
-        assert_eq!(complete("@codex @a", &ids()), ["@all"]);
+        assert_eq!(complete("@codex @a", &ids()), ["@all", "@all?"]);
+        assert_eq!(complete("@all", &ids()), ["@all?"]);
         assert!(
             complete("hello @c", &ids()).is_empty(),
             "only leading mentions route"
