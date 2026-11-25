@@ -1066,6 +1066,14 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         ),
                         None => prompt,
                     };
+                    // A relative command path (`../tools/codex`) was checked from the launch
+                    // folder; from the mirror it would name another file.
+                    let cmd =
+                        if mirror.is_some() && cmd.contains('/') && Path::new(&cmd).is_relative() {
+                            rt.cwd.join(&cmd).to_string_lossy().into_owned()
+                        } else {
+                            cmd
+                        };
                     rt.turn_cwd.insert(id.clone(), cwd.clone());
                     let token = CancellationToken::new();
                     rt.turns.insert(id.clone(), token.clone());

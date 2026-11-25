@@ -161,6 +161,9 @@ pub fn sync(
     }
     .and_then(|()| fs::write(&pointer, format!("gitdir: {}\n", admin.display())))
     .map_err(|e| format!("{}: {e}", pointer.display()))?;
+    // A lock left in the mirror's own git dir by a sync that was stopped hard: only this
+    // agent's syncs use it, one at a time.
+    let _ = fs::remove_file(admin.join("index.lock"));
     let in_mirror = |args: &[&str], input: Option<&[u8]>| {
         let base = [
             OsStr::new("--git-dir"),
@@ -170,7 +173,7 @@ pub fn sync(
             OsStr::new("-C"),
             mirror.as_os_str(),
         ];
-        run_git(&base, args, input, cancel)
+        run_git(&base, args, input, &[], cancel)
     };
     // What the last sync copied in as untracked goes first, before the reset (which restores any of them
     // tracked since) (whatever the ignore rules say
@@ -191,68 +194,90 @@ pub fn sync(
     }
     in_mirror(&["checkout", "-q", "--detach", "--force", &head], None)?;
     in_mirror(&["reset", "-q", "--hard"], None)?;
-    // The writer's index as a tree (objects only, its index untouched), read into the
-    // mirror's index and files whole: renames, file-to-folder swaps and deletions included.
-    let tree = match git(&["write-tree"], None) {
+    // A private copy of the writer's index (git replaces it by rename, so the copy is whole):
+    // building the tree may rewrite the index it reads, and a cancel must never leave a lock
+    // on the writer's own. The changed files below are listed against the same snapshot.
+    let index = git(&["rev-parse", "--git-path", "index"], None)?;
+    let index = checkout.join(String::from_utf8_lossy(&index).trim());
+    let snapshot = dir.join(format!("{id}.index"));
+    fs::copy(&index, &snapshot).map_err(|e| format!("{}: {e}", index.display()))?;
+    let src = |args: &[&str]| {
+        let env = [("GIT_INDEX_FILE", snapshot.as_os_str())];
+        run_git(
+            &[OsStr::new("-C"), checkout.as_os_str()],
+            args,
+            None,
+            &env,
+            cancel,
+        )
+    };
+    // The index as a tree (objects only), read into the mirror's index and files whole:
+    // renames, file-to-folder swaps and deletions included.
+    let tree = match src(&["write-tree"]) {
         Ok(tree) => String::from_utf8_lossy(&tree).trim().to_string(),
         Err(why) => return Err(format!("the writer's index (a merge in progress?): {why}")),
     };
     in_mirror(&["read-tree", "--reset", "-u", &tree], None)?;
     // Then its unstaged work, file by file: changed files copied, deleted ones removed.
-    let changed = git(
-        &["diff", "--name-only", "--no-renames", "--no-relative", "-z"],
-        None,
-    )?;
-    let changed: Vec<&[u8]> = changed
-        .split(|b| *b == 0)
-        .filter(|n| !n.is_empty())
-        .collect();
-    let mirror_file = |name: &Path| -> Result<(), String> {
+    let changed = src(&["diff", "--name-only", "--no-renames", "--no-relative", "-z"])?;
+    // `changed`: a tracked path the writer replaced by a folder is a deletion here; its new
+    // files come with the untracked ones. Reading through a symlinked folder of the
+    // checkout would copy what lies outside it, so such a path counts as deleted.
+    let mirror_file = |name: &Path, changed: bool| -> Result<(), String> {
         let from = checkout.join(name);
-        if fs::symlink_metadata(&from).is_ok() {
+        let parent = name.parent().unwrap_or(Path::new(""));
+        let source = real_dirs_exist(checkout, parent)
+            .then(|| fs::symlink_metadata(&from).ok())
+            .flatten()
+            .filter(|m| !(changed && m.is_dir()));
+        if source.is_some() {
             copy_entry(&from, &mirror, name)
-        } else if real_dirs_exist(&mirror, name.parent().unwrap_or(Path::new(""))) {
+        } else if real_dirs_exist(&mirror, parent) {
             clear(&mirror.join(name))
         } else {
             Ok(())
         }
         .map_err(|e| format!("copying {}: {e}", name.display()))
     };
-    for name in &changed {
-        mirror_file(Path::new(OsStr::from_bytes(name)))?;
+    for name in changed.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        mirror_file(Path::new(OsStr::from_bytes(name)), true)?;
     }
     // Under the writer's ignore rules (its `.gitignore` edits came above): ignored build
     // output stays, so a build there survives; `-ff` also removes a repository a turn
     // cloned there.
     in_mirror(&["clean", "-ffdq"], None)?;
     // Untracked files, and intent-to-add ones (`git add -N`: in the writer's index, not in
-    // its tree, so untracked here), copied last, and listed for the next sync.
-    let untracked = git(&["ls-files", "-z", "-o", "--exclude-standard"], None)?;
-    let intent = git(
-        &[
-            "diff",
-            "--name-only",
-            "--no-renames",
-            "--no-relative",
-            "--diff-filter=A",
-            "-z",
-        ],
-        None,
-    )?;
-    let mut copied = vec![];
-    for name in untracked
+    // its tree, so untracked here), copied last. Listed before copying, so a sync cut
+    // short still has the next one remove whatever it copied.
+    let untracked = src(&["ls-files", "-z", "-o", "--exclude-standard"])?;
+    let intent = src(&[
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--no-relative",
+        "--diff-filter=A",
+        "-z",
+    ])?;
+    let names: Vec<&[u8]> = untracked
         .split(|b| *b == 0)
         .chain(intent.split(|b| *b == 0))
         .filter(|n| !n.is_empty())
-    {
+        .collect();
+    let listed: Vec<u8> = names
+        .iter()
+        .flat_map(|n| n.iter().chain(&[0]))
+        .copied()
+        .collect();
+    crate::transcript::write_atomic(&copied_file, &listed).map_err(|e| e.to_string())?;
+    for name in names {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
-        mirror_file(Path::new(OsStr::from_bytes(name)))?;
-        copied.extend_from_slice(name);
-        copied.push(0);
+        mirror_file(Path::new(OsStr::from_bytes(name)), false)?;
     }
-    crate::transcript::write_atomic(&copied_file, &copied).map_err(|e| e.to_string())?;
     // Through real folders only: an ignored symlink left there could lead the CLI out.
     real_dirs(&mirror, sub).map_err(|e| format!("the launch folder: {e}"))?;
     Ok(cwd(data_root, checkout, id, sub))
@@ -399,7 +424,13 @@ fn git(
     input: Option<&[u8]>,
     cancel: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
-    run_git(&[OsStr::new("-C"), dir.as_os_str()], args, input, cancel)
+    run_git(
+        &[OsStr::new("-C"), dir.as_os_str()],
+        args,
+        input,
+        &[],
+        cancel,
+    )
 }
 
 /// Runs git without hooks (a checkout in the mirror must not fire `post-checkout`) or an
@@ -408,6 +439,7 @@ fn run_git(
     base: &[&OsStr],
     args: &[&str],
     input: Option<&[u8]>,
+    env: &[(&str, &OsStr)],
     cancel: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
     let mut command = Command::new("git");
@@ -432,6 +464,7 @@ fn run_git(
     for var in REPO_ENV {
         command.env_remove(var);
     }
+    command.envs(env.iter().copied());
     let mut child = command.spawn().map_err(|e| format!("git: {e}"))?;
     // Pipes on threads of their own, so this one can watch `cancel` without deadlocking.
     let stdin = child.stdin.take();
@@ -454,10 +487,22 @@ fn run_git(
     let stderr = read(child.stderr.take().map(|p| Box::new(p) as _));
     let status = loop {
         if cancel.load(Ordering::Relaxed) {
-            if let Ok(group) = i32::try_from(child.id()) {
-                // SAFETY: kill has no memory preconditions; a negative pid names the group.
-                unsafe { libc::kill(-group, libc::SIGKILL) };
+            // SIGTERM first: git removes its lock files on it. SIGKILL if it lingers.
+            let group = i32::try_from(child.id()).ok();
+            let signal = |sig| {
+                if let Some(group) = group {
+                    // SAFETY: kill has no memory preconditions; a negative pid is the group.
+                    unsafe { libc::kill(-group, sig) };
+                }
+            };
+            signal(libc::SIGTERM);
+            for _ in 0..100 {
+                if child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
+            signal(libc::SIGKILL);
             let _ = child.kill();
             let _ = child.wait();
             return Err("cancelled".into());
@@ -537,6 +582,7 @@ pub fn remove(id: &str, record: &Record) -> Result<(), String> {
     }
     let dir = record.mirror.parent().unwrap_or(Path::new(""));
     let _ = fs::remove_file(dir.join(format!("{id}.copied")));
+    let _ = fs::remove_file(dir.join(format!("{id}.index")));
     fs::remove_file(dir.join(format!("{id}.json"))).map_err(|e| e.to_string())
 }
 
@@ -662,6 +708,26 @@ mod tests {
         run(&repo, &["reset", "-q", "renamed.txt", "staged.txt"]);
         fs::rename(repo.join("renamed.txt"), repo.join("staged.txt")).unwrap();
         run(&repo, &["add", "staged.txt"]);
+        // Unstaged: a tracked file replaced by a folder, and a tracked folder replaced by a
+        // link to outside the checkout (whose same-named file must not be read).
+        fs::create_dir(repo.join("d")).unwrap();
+        fs::write(repo.join("d/f"), "tracked").unwrap();
+        run(&repo, &["add", "d/f"]);
+        run(&repo, &["commit", "-qm", "d"]);
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("f"), "secret").unwrap();
+        fs::remove_dir_all(repo.join("d")).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("d")).unwrap();
+        fs::remove_file(repo.join("gone.txt")).ok();
+        let m = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
+        assert!(
+            fs::read_link(m.join("d")).is_ok() || !m.join("d/f").exists(),
+            "never the outside file's contents"
+        );
+        fs::remove_file(repo.join("d")).unwrap();
+        run(&repo, &["rm", "-q", "--cached", "d/f"]);
+        run(&repo, &["commit", "-qm", "no d"]);
         // Something the agent left in the mirror is gone after the next sync.
         fs::write(mirror.join("stray.txt"), "x").unwrap();
         let mirror = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
@@ -794,6 +860,15 @@ mod tests {
         remove("codex", &record).unwrap();
         assert!(list(&data, &repo).is_empty());
         let mirror = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
+        // Unstaged: a tracked file replaced by a folder with a new file in it.
+        fs::write(repo.join("x"), "x").unwrap();
+        run(&repo, &["add", "x"]);
+        run(&repo, &["commit", "-qm", "x"]);
+        fs::remove_file(repo.join("x")).unwrap();
+        fs::create_dir(repo.join("x")).unwrap();
+        fs::write(repo.join("x/y"), "y").unwrap();
+        sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
+        assert_eq!(fs::read_to_string(mirror.join("x/y")).unwrap(), "y");
         // Deleted from outside, its registration left: the next sync makes it again.
         fs::remove_dir_all(&mirror).unwrap();
         sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
