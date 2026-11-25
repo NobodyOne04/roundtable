@@ -118,6 +118,11 @@ pub fn sync(
     let mirror = dir.join(id);
     let record_file = dir.join(format!("{id}.json"));
     if fs::symlink_metadata(&mirror).is_err() {
+        // Deleted from outside, its registration left: git would refuse the path. It
+        // names our own folder, so it is ours to drop (never `worktree prune`).
+        if let Some(stale) = registration(checkout, &mirror, cancel)? {
+            fs::remove_dir_all(&stale).map_err(|e| format!("{}: {e}", stale.display()))?;
+        }
         // The record first: a crash during `worktree add` leaves a mirror `/worktrees clean`
         // can find and remove.
         let record = Record {
@@ -275,7 +280,7 @@ fn registration(
     // No `--path-format=absolute` (git 2.31): relative to the checkout on older git.
     let common = git(checkout, &["rev-parse", "--git-common-dir"], None, cancel)?;
     let common = checkout.join(String::from_utf8_lossy(&common).trim());
-    let want = mirror.canonicalize().ok();
+    let want = resolved(mirror);
     Ok(fs::read_dir(common.join("worktrees"))
         .into_iter()
         .flatten()
@@ -286,9 +291,16 @@ fn registration(
                 // Relative with `worktree.useRelativePaths`: to the admin folder.
                 let gitdir = admin.join(gitdir.trim());
                 gitdir.file_name() == Some(OsStr::new(".git"))
-                    && gitdir.parent().and_then(|p| p.canonicalize().ok()) == want
+                    && gitdir.parent().and_then(resolved) == want
             })
         }))
+}
+
+/// `path` with links resolved; for a path that no longer exists, its folder's.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    path.canonicalize()
+        .ok()
+        .or_else(|| Some(path.parent()?.canonicalize().ok()?.join(path.file_name()?)))
 }
 
 /// One untracked file into the mirror; a symlink stays a symlink. Never writes through a
@@ -309,8 +321,10 @@ fn copy_entry(from: &Path, mirror: &Path, name: &Path) -> std::io::Result<()> {
     } else if meta.is_file() {
         fs::copy(from, to).map(drop)
     } else {
-        // A nested repository shows as a folder: not mirrored.
-        Ok(())
+        // A nested repository shows as a folder: not mirrored, and not silently missing.
+        Err(std::io::Error::other(
+            "a nested repository: mirrors don't carry those yet",
+        ))
     }
 }
 
@@ -426,18 +440,26 @@ pub fn list(data_root: &Path, checkout: &Path) -> Vec<(String, Record)> {
 /// crash during creation) is just deleted.
 pub fn remove(id: &str, record: &Record) -> Result<(), String> {
     let never = AtomicBool::new(false);
-    if record.source.exists()
-        && fs::symlink_metadata(&record.mirror).is_ok()
-        && registration(&record.source, &record.mirror, &never)?.is_some()
+    let meta = fs::symlink_metadata(&record.mirror);
+    if meta.as_ref().is_ok_and(|m| m.file_type().is_symlink()) {
+        // Not ours: a link to who knows which worktree. Only the link goes.
+        fs::remove_file(&record.mirror).map_err(|e| e.to_string())?;
+    } else if record.source.exists()
+        && let Some(admin) = registration(&record.source, &record.mirror, &never)?
     {
-        // Never `worktree prune`: it would touch the owner's own registrations.
-        let path = record.mirror.to_string_lossy();
-        git(
-            &record.source,
-            &["worktree", "remove", "--force", &path],
-            None,
-            &never,
-        )?;
+        if meta.is_ok() {
+            // Never `worktree prune`: it would touch the owner's own registrations.
+            let path = record.mirror.to_string_lossy();
+            git(
+                &record.source,
+                &["worktree", "remove", "--force", &path],
+                None,
+                &never,
+            )?;
+        } else {
+            // The folder went missing: drop just its registration.
+            fs::remove_dir_all(&admin).map_err(|e| e.to_string())?;
+        }
     }
     if fs::symlink_metadata(&record.mirror).is_ok() {
         fs::remove_dir_all(&record.mirror).map_err(|e| e.to_string())?;
@@ -652,7 +674,27 @@ mod tests {
         assert_eq!(found, vec![("codex".to_string(), record.clone())]);
         remove("codex", &record).unwrap();
         assert!(list(&data, &repo).is_empty());
+        let mirror = sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
+        // Deleted from outside, its registration left: the next sync makes it again.
+        fs::remove_dir_all(&mirror).unwrap();
         sync(&data, &repo, "codex", Path::new(""), &NO).unwrap();
+        // Swapped for a link to the owner's own worktree: cleanup drops only the link.
+        let owners = tmp.path().join("owners");
+        run(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                owners.to_str().unwrap(),
+            ],
+        );
+        fs::write(owners.join("work.txt"), "mine").unwrap();
+        fs::remove_dir_all(&mirror).unwrap();
+        std::os::unix::fs::symlink(&owners, &mirror).unwrap();
+        remove("codex", &record).unwrap();
+        assert_eq!(fs::read_to_string(owners.join("work.txt")).unwrap(), "mine");
     }
 
     #[test]

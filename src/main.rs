@@ -351,7 +351,7 @@ struct Runtime {
     checkout_error: Option<String>,
     /// Mirrors `/worktrees clean` is removing: their agents' turns wait for it to finish.
     cleaning: HashSet<String>,
-    /// One clone per running mirror sync: quitting waits for them (ADR 0016).
+    /// One clone per running mirror sync or removal: quitting waits for them (ADR 0016).
     syncs: Arc<()>,
     /// Where roundtable was started, relative to the checkout root, fixed at startup: the
     /// same folder in each mirror. `None` if it can't be placed (then no mirrors).
@@ -427,6 +427,14 @@ impl Runtime {
             self.keys.insert(link.key, seq);
         }
         Ok(())
+    }
+
+    /// Mirror syncs and removals must end before the instance lock goes, or the next
+    /// roundtable could work on the same mirror (ADR 0016); a cancelled sync ends promptly.
+    async fn mirror_work_done(&self) {
+        while Arc::strong_count(&self.syncs) > 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     fn save_session(&mut self, id: &str, identity: &str, session: String) -> Result<()> {
@@ -850,11 +858,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             },
             _ = tokio::time::sleep_until(deadline), if quit_by.is_some() => {
                 tracing::warn!(left = rt.turns.len(), "turns did not stop in time");
-                // A mirror sync must end before the instance lock goes, or the next
-                // roundtable could sync the same mirror; cancelled, it ends promptly.
-                while Arc::strong_count(&rt.syncs) > 1 {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
+                rt.mirror_work_done().await;
                 return Ok(());
             }
             }
@@ -1079,7 +1083,8 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     };
                     let tx = tx.clone();
                     let (data, checkout) = (rt.data_root.clone(), rt.checkout.clone());
-                    let syncing = rt.syncs.clone();
+                    // Only a mirror sync holds the quit barrier, and only while it syncs.
+                    let syncing = mirror.is_some().then(|| rt.syncs.clone());
                     tokio::spawn(async move {
                         if let Some(sub) = mirror {
                             let who = id.clone();
@@ -1187,8 +1192,12 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         .collect();
                     rt.cleaning.extend(ids.iter().cloned());
                     let tx = tx.clone();
+                    // Removals hold the quit barrier too: the next roundtable must not
+                    // sync a mirror this one is still deleting.
+                    let removing = clean.then(|| rt.syncs.clone());
                     // Sizes and removals walk whole trees: off the loop.
                     tokio::task::spawn_blocking(move || {
+                        let _removing = removing;
                         let mut lines = vec![];
                         for (who, record) in &found {
                             if busy.contains(who) {
@@ -1358,6 +1367,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             local.push_back(Event::Threads(rt.thread_rows()));
         }
         if quit_by.is_some() && rt.turns.is_empty() {
+            rt.mirror_work_done().await;
             return Ok(());
         }
     }
@@ -1366,7 +1376,17 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
 /// Native sessions are bound to the folder the CLI ran in (ADR 0016): Claude Code only
 /// resumes a session from the folder it was started in.
 fn session_key(id: &str, identity: &str, cwd: &Path) -> String {
-    format!("{id}/{identity}/{}", cwd.display())
+    use std::os::unix::ffi::OsStrExt;
+    // Lossless: `display()` would map two non-UTF-8 folders to one key.
+    let cwd = match cwd.to_str() {
+        Some(cwd) => cwd.to_string(),
+        None => cwd
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .fold("hex:".to_string(), |s, b| format!("{s}{b:02x}")),
+    };
+    format!("{id}/{identity}/{cwd}")
 }
 
 /// Where the `ask` socket lives: the owner-only data folder, unless that path is too long
