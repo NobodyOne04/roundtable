@@ -33,9 +33,13 @@ Implementation order: see the note under the table.
 Implementation order follows dependencies, not numbers: 0001, 0002, 0010, 0004, 0011,
 0005, 0007, 0008, 0009; 0012 lands with the writer fixes (0010 and 0011 replace earlier numbers that others depend on).
 
-0014, 0015, 0016, 0017 and 0024 are built (0018 in review). 0016 deviates in one point: a
-checkout with no commit yet is refused instead of getting an `--orphan` mirror, which would
-add a branch to the owner's repo. 0016-0023 were accepted after Codex's critique, which
+0014, 0015, 0016, 0017 and 0024 are built (0018 in review). 0016 differs from its text in
+how, not what (found over Codex's reviews): the sync reads the writer's index as a tree
+(`write-tree`/`read-tree`) and copies changed and untracked files instead of applying
+`git diff HEAD --binary`; mirrors are locked worktrees (`--lock --reason`, git 2.35) and
+records carry the folder's identity; a checkout with no commit, a sparse checkout, a
+populated submodule or an untracked nested repository gets no mirror (the turn fails and
+says why) instead of an `--orphan` mirror or a partial one. 0016-0023 were accepted after Codex's critique, which
 changed each of them; build order: 0017, 0018 (together they let the writer work from
 roundtable: edits from any message, approvals in the chat), 0016, 0019 (after 0018: forks
 start without grants), 0020, 0021, 0022, then 0023 (needs 0016's worktrees).
