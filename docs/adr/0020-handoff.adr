@@ -1,0 +1,42 @@
+# 0020. `/handoff`: pass the thread to another model
+
+- Status: Proposed
+- Date: 2026-11-25
+
+[0008](0008-slash-commands-and-mentions.adr) lists `/handoff <id>`: "send a summary of the
+thread to `<id>` and make it default". Useful when one model hits its limit
+([0014](0014-usage-plan-limits.adr)) or another is better placed to carry on. This ADR
+decides who writes the summary, what it contains and what changes after.
+
+## Technical details
+- **`/handoff <id> [note]`**:
+  1. The current default model (or, with `default = "all"`, the writer; if neither, the
+     command asks for `/handoff <id> from <id>`) gets a read-only turn with a fixed
+     prompt: summarize this thread for a colleague who takes over: goal, decisions,
+     current state of the work, open questions, files touched, next step. Plus `note` if
+     given.
+  2. That summary goes to `<id>` as a message: `handoff from claude: <summary>`, with the
+     owner's `note`, in the same thread. `<id>` replies with what it understood and its
+     first step.
+  3. `default` becomes `<id>` (written to `models.toml`, [0011](0011-hot-model-registry.adr)).
+     It does **not** change `writer`: who edits stays an explicit config choice. The chat
+     says so if `<id>` is not the writer: `codex is now the default; it is read-only
+     (writer: claude)`.
+- **Transcript**: one `handoff` event (kind already in [0010](0010-filesystem-event-log.adr))
+  with `from`, `to`, the summary and the note; `turn`/`parent` link it to the summary turn.
+  In the chat it shows as one collapsed line, `Enter` expands it (0008's key note).
+- **The summary turn is read-only** (as any non-writer turn) and counts toward the
+  summarizer's usage; with the summarizer out of quota, `/handoff <id> raw` sends the last
+  `n` messages verbatim instead (`n` fitting `<id>`'s window, default 20).
+- **Free models** as targets get the summary as their first user message in a fresh
+  history: they have no earlier context to keep.
+- Consequences: switching who leads takes one command and keeps the reasoning, not just
+  the last message. Costs: a summary turn (tokens, time), and summaries lose detail; the
+  full thread stays readable with `/log` ([0013](0013-log-command.adr)).
+
+## Technologies and alternatives
+- Alternatives:
+  - roundtable builds the summary itself from the transcript (no model turn): free and
+    instant, but a list of messages is not a handover; kept as the `raw` fallback.
+  - Moving the writer role along with the default: a model that never edited here would
+    start editing without the owner choosing it.

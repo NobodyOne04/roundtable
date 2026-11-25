@@ -1,0 +1,48 @@
+# 0023. An ACP adapter for other coding agents
+
+- Status: Proposed
+- Date: 2026-11-25
+
+[0004](0004-cli-agent-adapters.adr) planned an `acp` adapter "once ACP v2 settles". This
+ADR decides what it is for. Neither Claude Code (2.1.332) nor Codex (0.172.0) speaks ACP
+natively, and both already have direct adapters, so ACP's value is adding **other** agents
+(Gemini CLI, and any agent with an ACP mode) without code per agent.
+
+## Technical details
+- **Registry**: a new `kind = "acp"` entry:
+  ```toml
+  [[model]]
+  id = "gemini"
+  kind = "acp"
+  cmd = "gemini"
+  args = ["--experimental-acp"]
+  ```
+  `cmd` + `args` launch the agent; roundtable talks ACP (JSON-RPC over stdio) to it.
+- **Mapping** to the `Participant` trait: `session/new` and `session/load` for the
+  per-thread native session; `session/prompt` per turn; `session/update` notifications to
+  `PEvent` (text chunks, tool calls, plans); `session/cancel` on `Esc`.
+- **Permissions**: ACP agents ask the client through `session/request_permission`; this
+  maps onto [0018](0018-approvals-in-the-chat.adr)'s approval card for the writer, and is
+  answered `deny` automatically on read-only turns. An ACP agent is read-only unless it is
+  the `writer`.
+- **Files**: ACP lets the client serve `fs/read_text_file` / `fs/write_text_file`.
+  roundtable serves reads from the agent's working folder and refuses writes on
+  read-only turns, which is a stronger guard than flags. Terminal (`terminal/*`) methods
+  are refused in v1.
+- **`ask`** ([0007](0007-model-to-model-communication.adr)): passed as an MCP server in
+  `session/new`'s `mcpServers`, the same `roundtable mcp` Claude gets.
+- **Versioning**: the crate is pinned, and each supported agent gets a recorded fixture,
+  as for the CLIs.
+- **Not in scope**: switching Claude or Codex to ACP (through the Zed adapters). Their
+  JSON adapters stay, per 0004.
+- Consequences: one adapter covers a family of agents. Costs: a large protocol surface to
+  map and test, and each agent implements ACP differently; real use needs at least one
+  agent the owner wants at the table.
+
+## Technologies and alternatives
+- Involved: `agent-client-protocol` crate (5.6.1 at writing), JSON-RPC over stdio
+- Alternatives:
+  - One hand-written adapter per extra agent (as for Claude and Codex): precise, but code
+    for each new agent.
+  - Wait: no agent beyond Claude and Codex is planned today; the owner may prefer to keep
+    this Proposed until one is.

@@ -1,0 +1,50 @@
+# 0015. Vim keys for moving around
+
+- Status: Proposed
+- Date: 2026-11-25
+- Amends: [0008](0008-slash-commands-and-mentions.adr) (keys)
+
+The owner prefers vim keys in every tool they build. Roundtable's keys are a mix
+(`Ctrl-B`, `Ctrl-K`, `Tab` cycling, arrows in panes, `PgUp`/`PgDn`). This ADR gives the
+panes vim navigation while typing stays plain, and keeps `PgUp`/`PgDn` as the owner asked.
+No jump mode (easyjump-style labels): tmux copy mode covers that.
+
+## Technical details
+- **Two modes, shown in the status line** (`-- INSERT --` / `-- NORMAL --`):
+  - Insert (start-up mode): the input box takes every printable key, as today. `Enter`
+    sends, `Alt-Enter` new line, `Tab` completes. `Esc` goes to Normal.
+  - Normal: keys move and act; nothing is typed. `i`, `a` or `/` (with `/` pre-typed) go
+    back to Insert. `:` opens Insert with `/` pre-typed, so `:help` and `/help` both work.
+- **Normal-mode keys**:
+  | Key | Does |
+  |---|---|
+  | `j` / `k` | next / previous chat line (expandable lines first, as today's Up/Down) |
+  | `Ctrl-D` / `Ctrl-U` | half a page down / up |
+  | `gg` / `G` | top / bottom of the thread (`G` also leaves scroll-back) |
+  | `Enter` or `o` | expand or collapse the selected line (ask, handoff, tool call) |
+  | `h` / `l` | focus the pane to the left / right (threads, chat, context) |
+  | `y` | copy the selected message to the clipboard (OSC 52, works over ssh and tmux) |
+  | `q` | close the side panes; twice quits like `Ctrl-C` twice |
+  | `x` | cancel running replies (as `Esc` does today) |
+  | `?` | `/help` |
+  In the threads pane `j`/`k` move and `Enter` resumes.
+- **Unchanged**: `PgUp`/`PgDn` scroll in both modes; `Ctrl-C` twice quits; `Ctrl-D` on an
+  empty input quits in Insert only (in Normal it is half a page); `Ctrl-B` and
+  `Ctrl-K` still toggle the side panes (vim users rarely need them, nothing to unlearn).
+- **Cancel moves**: `Esc` in Insert now switches to Normal. With replies running, the
+  first `Esc` also cancels them as today, so muscle memory still works; the help text
+  says so.
+- **Implementation**: `App::mode: Mode { Insert, Normal }`, keys dispatched in
+  `App::key` by mode; a pending `g` is state, cleared by any other key. Covered by unit
+  tests per key and an insta snapshot of the status line in each mode.
+- Consequences: the owner's vim habits work in the panes; Insert mode means typing is
+  never captured by a motion. Costs: one more mode to show and explain; `Esc` gains a
+  second meaning.
+
+## Technologies and alternatives
+- Involved: crossterm key events, OSC 52 for `y` (no clipboard crate)
+- Alternatives:
+  - Modeless with `Ctrl-J`/`Ctrl-K`-style chords: no Insert/Normal split, but not vim.
+  - A `vim = true` switch keeping both layouts: two key maps to test, for one user.
+  - Vim editing inside the input box (motions, `ciw`): large; `/log` and a future
+    "edit prompt in $EDITOR" give real vim for long text.

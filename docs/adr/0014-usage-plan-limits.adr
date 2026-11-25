@@ -1,0 +1,58 @@
+# 0014. `/usage` shows each CLI's plan limits
+
+- Status: Proposed
+- Date: 2026-11-25
+
+`/usage` today sums tokens and cost from the transcript, so it only ever shows what
+roundtable itself spent, and Codex never appears when its turns fail. The owner wants what
+Claude Code's `/usage` and Codex's `/status` show: how much of each subscription's 5-hour
+and weekly limit is used, and when it resets, to know how long the table can keep going.
+
+## Technical details
+- **Sources**, read-only, no extra request to either vendor:
+  - Claude: `claude -p --output-format stream-json` emits
+    `{"type":"rate_limit_event","rate_limit_info":{…,"unifiedWindows":{"five_hour":
+    {"utilization":0.82,"resetsAt":1795620000,"status":"allowed"},"seven_day":{…}}}}`
+    during every turn (seen with 2.1.332). The adapter maps it to a new
+    `PEvent::Limits(Limits)` ([0004](0004-cli-agent-adapters.adr)).
+  - Codex: `codex exec --json` carries no limits. Codex writes them to its own session
+    file, `~/.codex/sessions/YYYY/MM/DD/rollout-*-<thread_id>.jsonl`, as
+    `token_count` events with `rate_limits: {primary: {used_percent, window_minutes: 300,
+    resets_at}, secondary: {… window_minutes: 10080 …}, plan_type}` (seen with 0.172.0).
+    After each Codex turn ends, the adapter reads the last `rate_limits` with a non-null
+    `primary` from the file whose name ends in the turn's `thread_id`. Missing file,
+    unknown shape or `$CODEX_HOME` elsewhere: no limits, logged at `debug`, never an error.
+    `$CODEX_HOME` is honoured when set.
+- **State**: `Limits { five_hour: Option<Window>, weekly: Option<Window>, seen_at }`,
+  `Window { used_percent: f32, resets_at: i64 }`, kept per participant in `App` (in memory)
+  and in `<data_root>/limits.json` (atomic write, 0600) so a fresh start shows the last
+  known values with their age. Only percentages and reset times are stored: no account
+  ids, no plan names beyond `plan_type`.
+- **`/usage`** (all scopes) prints the limits block first, then the existing token/cost
+  table:
+  ```
+  limits (as of 20:45):
+  claude  5h 82%  resets 22:00 · week 32%  resets Mon 09:00
+  codex   5h 86%  resets 22:25 · week 66%  resets Sat 14:13
+  usage (thread): …
+  ```
+  A participant with no data says `no limit data yet (after its first turn)`. Values older
+  than their window are shown as `stale`.
+- **Status line**: when any window is at 80% or more, the status line adds
+  `codex 5h 86%`; at 100% (or Claude `status` other than `allowed`) the context pane marks
+  the participant `limited until 22:25`.
+- **Free models** (OpenAI-compatible, [0005](0005-openai-compatible-models.adr)) keep
+  today's token/cost lines only; providers' rate-limit headers are a later addition.
+- Consequences: one glance answers "how long can we go on" for both subscriptions, from data
+  the CLIs already produce. Costs: the Codex path depends on Codex's private file layout,
+  so it is pinned and tested like the stream formats (fixture lines in
+  `tests/fixtures/`), and must fail quietly when the layout changes.
+
+## Technologies and alternatives
+- Involved: claude CLI `rate_limit_event` (2.1.332), codex session rollout files (0.172.0), serde_json
+- Alternatives:
+  - Running `codex /status` or `claude /usage`: interactive TUIs only, nothing to parse.
+  - Calling the vendors' usage endpoints with the CLIs' credentials: breaks 0004's rule that
+    roundtable never reads the CLIs' credentials.
+  - Codex `app-server` (JSON-RPC, has rate-limit notifications): experimental, and a second
+    way of driving Codex next to `exec`; reconsider if `exec --json` never gets limits.
