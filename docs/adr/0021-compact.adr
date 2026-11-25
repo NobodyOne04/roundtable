@@ -30,7 +30,9 @@ their beginning. CLI agents compact on their own and are out of scope.
      and its replies are never part of ordinary history, live or on `/resume`.
 - **Bound to the destination**: a checkpoint applies only while the participant's
   identity matches ([0011](0011-hot-model-registry.adr)); after a repoint the new
-  destination starts from the full history again, as for any new identity.
+  destination starts empty, as any new identity does under
+  [0005](0005-openai-compatible-models.adr): history only ever holds exchanges delivered to
+  the matching identity.
 - **Automatic**: when a free model's history would be trimmed by more than 25% of its
   window, the chat suggests `/compact <id>` once per thread. No automatic compaction:
   summaries cost turns and lose detail, so the owner decides.

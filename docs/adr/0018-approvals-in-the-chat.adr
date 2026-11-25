@@ -24,14 +24,15 @@ work properly from rt", without bypass flags.
   - stdin stays open for the whole writable turn (today it is closed after the prompt);
     it closes when the `result` arrives or the turn is cancelled.
 - **In the chat**: a request becomes an approval card in the chat, and the turn's line and
-  the status line show `approval waiting (A)`:
+  the status line show `approval waiting (Ctrl-A)`:
   ```
   claude wants to run  Bash: cargo test --locked
     [y] allow once   [a] allow `Bash(cargo test:*)` for this thread   [n] deny   [e] deny with a note
   ```
-  - The card answers only when it has the focus: `A` in Normal mode
-    ([0015](0015-vim-keys.adr)) focuses the oldest waiting card, visibly (bordered,
-    scrolled into view). Until then `y`, `a`, `n` keep their usual meaning, so nothing is
+  - The card answers only when it has the focus: `Ctrl-A`, in either mode
+    ([0015](0015-vim-keys.adr)), focuses the oldest waiting card, visibly (bordered,
+    scrolled into view). It cancels nothing, unlike `Esc` from Insert mode, which still
+    cancels running replies (and so the request); the hint says `Ctrl-A`. Until then `y`, `a`, `n` keep their usual meaning, so nothing is
     granted by keys typed for something else. `Esc` leaves the card unanswered.
   - Each answer is bound to its turn and request id. An answer to a request whose turn was
     cancelled, whose process exited, or whose participant changed identity in the

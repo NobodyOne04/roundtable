@@ -43,7 +43,8 @@ worktree is kept in step with the writer's checkout, and cleanup.
      (NUL-separated: any file name works) copied over, symlinks kept as symlinks.
   An unborn `HEAD` (a repository with no commit yet) has nothing to check out: the mirror
   is created empty with `git worktree add --orphan` (git ≥ 2.42; older git: refused with
-  that reason) and gets the untracked files only.
+  that reason) and gets every file of `git ls-files -z -c -o --exclude-standard` that
+  exists in the checkout: staged ones as well as untracked.
   Each reviewer sees the state at the moment its own turn starts (see
   [0017](0017-writer-edits-from-any-message.adr) for broadcasts).
   Done by the loop as one effect before the turn's spawn; a sync failure fails that turn
@@ -67,8 +68,9 @@ worktree is kept in step with the writer's checkout, and cleanup.
 - **The writer lock is unchanged** ([0012](0012-checkout-writer-lock.adr)): it guards the
   checkout; worktrees need no lock because only their own agent uses them, one turn at a
   time.
-- Consequences: the single-writer rule becomes a filesystem fact, not only CLI flags; it
-  is also the base for giving agents writable turns in their own worktree later
+- Consequences: what escapes a non-writer's flags and writes relative to its folder no
+  longer reaches the writer's files (absolute paths and the shared `.git` still can, see
+  the top); it is also the base for giving agents writable turns in their own worktree later
   ([0017](0017-writer-edits-from-any-message.adr)). Costs: disk (one checkout copy per agent, plus its build
   output), a sync step before each turn, and agents can't use ignored local files.
 

@@ -17,20 +17,24 @@ decides who writes the summary, what it contains and what changes after.
      ([0024](0024-log-command.adr)) of this thread, oldest messages dropped to fit the
      summarizer's window, with the instruction: summarize for a colleague who takes over
      (goal, decisions, state of the work, open questions, files touched, next step), plus
-     `note`. The summarizer is already at this table, so this sends nothing to a new
-     provider.
+     `note`. The summarizer may never have received parts of that log (other models'
+     exchanges), so before anything is sent the chat names both sides and what is new to
+     the summarizer, and asks: `claude summarizes for codex; claude has not seen 12
+     messages (llama, codex) — send them to claude? y/n`. No unseen messages: no question.
   2. **Dispatch.** The summary goes to `<id>` as `handoff from <summarizer>: <summary>`
      plus the note; `<id>` replies with what it understood and its first step. Only the
      summary crosses to `<id>`'s provider, never other participants' raw replies.
-  3. **Default.** Only after `<id>`'s reply completes does `default` become `<id>`, written
-     to `models.toml` ([0011](0011-hot-model-registry.adr)); if that write fails the chat
-     says so and the default stays as it was. `writer` never changes: the chat says
+  3. **Default.** Only after `<id>`'s reply completes does `default` become `<id>`, the same
+     way `/model use <id>` does it ([0011](0011-hot-model-registry.adr)): the live registry
+     changes at once, then `models.toml` is written; if that write fails the chat says so
+     and the new default stays active for this session only. `writer` never changes: the chat says
      `codex is now the default; it is read-only (writer: claude)` when that applies.
 - **Durable and unambiguous** ([0010](0010-filesystem-event-log.adr)): a `handoff` intent
   event, synced before step 1, pins both participants' identities. Before step 2 the
   target is rechecked: disabled or repointed since (identity differs) settles the handoff
   `blocked` with that reason. Every handoff ends in one `settle`: `complete`, `failed`
-  (either turn failed), `cancelled` (`Esc`), or `blocked`. Only `complete` changes the
+  (either turn failed), `interrupted` (`Esc`, as 0010 names it), or `blocked`;
+  `cancelled` stays a delivery status. Only `complete` changes the
   default. `turn`/`parent` link the summary turn, the dispatch and the reply to the intent.
   In the chat it is one collapsed line that `Enter` expands (0008).
 - **`raw` instead of a summary**: `/handoff <id> raw [n]` sends the last `n` messages

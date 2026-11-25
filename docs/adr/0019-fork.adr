@@ -10,10 +10,10 @@ here") as later; [0010](0010-filesystem-event-log.adr) already reserves `parent_
 ## Technical details
 - **`/fork [title]`**: a new thread that starts with everything the current one has, and
   goes its own way from here. The old thread stays as it was and can be resumed.
-- **Branch point: the end of the thread only** (v1). Both CLIs fork a session as a whole
-  (Claude `--resume <id> --fork-session`, Codex `codex exec fork <id>` /
-  `codex fork`); neither can branch at an earlier message, and the 0003 rule still holds:
-  ship only what both adapters can do natively. Forking from a selected earlier line is
+- **Branch point: the end of the thread only** (v1). This is roundtable's limit across
+  adapters, not Claude's: Claude can resume at an earlier message (`--resume-session-at`),
+  Codex forks a session only as a whole (`codex exec fork <id>`), and the 0003 rule still
+  holds: ship only what both adapters can do natively. Forking from a selected earlier line is
   a later extension (it would need a summary seeded into fresh sessions, see
   [0020](0020-handoff.adr)).
 - **Refused while busy**: a fork with a reply running or queued says "wait for replies to
@@ -29,9 +29,13 @@ here") as later; [0010](0010-filesystem-event-log.adr) already reserves `parent_
     its `turn`/`parent` resolve within its own thread, so equal `seq` numbers in parent
     and child never collide. A missing parent, a `fork_event` past the parent's end, or
     a cycle in `parent_id` fails visibly ("cannot open fork: …"), never a partial thread.
-  - **Inherited is conversation only**: messages, tool lines and handoffs. Approval grants
-    ([0018](0018-approvals-in-the-chat.adr)), registry notes and usage stay with the thread
-    that made them; a fork starts with no grants and counts only its own tokens.
+  - **The reader returns everything up to the fork point; each consumer filters**:
+    deliveries, settles and `/compact` checkpoints ([0021](0021-compact.adr)) are needed to
+    rebuild a model's history exactly as the parent had it (0010: history uses only `sent`
+    deliveries), so they are inherited. What a consumer takes from inherited events is its
+    own rule: the chat and `/log` show the conversation; `/usage` counts only the fork's
+    own events; approval grants ([0018](0018-approvals-in-the-chat.adr)) are never restored
+    from inherited events, so a fork starts with none.
   - **Native sessions are pinned at the fork point**, because the parent's session keeps
     moving if the parent is resumed and used before the child's first turn:
     - Claude: `/fork` stores the parent session id and the id of its last message; the
@@ -42,6 +46,9 @@ here") as later; [0010](0010-filesystem-event-log.adr) already reserves `parent_
     - Both boundaries are verified by a recorded fixture where the parent advances after
       `/fork` and before the child's first turn; an adapter whose boundary cannot be
       pinned refuses `/fork` for its sessions with that reason.
+    - Exception, ACP agents ([0023](0023-acp-adapter.adr)): no native fork; in a fork they
+      start a new session, seeded only with what that agent itself was sent before, under
+      its current identity.
     Parent and child never share a native session.
   - free models: their history is rebuilt from the inherited events, so nothing extra.
 - **Usage**: tokens of the shared part stay counted in the parent; the fork's
