@@ -23,7 +23,7 @@ pub enum Event {
     /// The terminal's new width: below `WIDE` the side panes are hidden.
     Resize(u16),
     /// The chat's scroll as last drawn (clamped, following the selection), from the loop.
-    Viewport(u16),
+    Viewport(usize),
     /// Something shown depends on the clock and changed (a plan window reset): redraw.
     Clock,
     /// Redraw throttle: at most one draw per tick.
@@ -354,7 +354,7 @@ pub struct App {
     /// Why nobody may edit right now; `None` lets the writer edit.
     edit_lock: Option<EditLock>,
     /// Lines scrolled up from the newest (PgUp/PgDn); 0 follows the conversation.
-    pub scroll: u16,
+    pub scroll: usize,
     /// A resumed thread from another checkout: nothing may be sent into it (ADR 0010).
     read_only: Option<std::path::PathBuf>,
     pub focus: Focus,
@@ -710,7 +710,7 @@ impl App {
 
     /// Scrolls `lines` up (positive) or down; the view stops following the selection.
     fn page(&mut self, lines: i32) {
-        self.scroll = self.scroll.saturating_add_signed(lines as i16);
+        self.scroll = self.scroll.saturating_add_signed(lines as isize);
         self.follow_selection = false;
     }
 
@@ -763,7 +763,7 @@ impl App {
                 self.select_last();
             }
             (Focus::Chat, KeyCode::Char('g')) if pending_g => {
-                self.scroll = u16::MAX;
+                self.scroll = usize::MAX;
                 self.selected_line = (!self.lines.is_empty()).then_some(0);
                 self.follow_selection = true;
             }
@@ -3643,6 +3643,7 @@ mod tests {
                 blocked: false,
             }),
             seen_at,
+            limited_until: None,
             identity: None,
         };
         type_line(&mut app, "@codex go");
@@ -3716,7 +3717,7 @@ mod tests {
         );
         press(&mut app, 'g');
         press(&mut app, 'g');
-        assert_eq!((app.selected_line, app.scroll), (Some(0), u16::MAX));
+        assert_eq!((app.selected_line, app.scroll), (Some(0), usize::MAX));
         press(&mut app, 'G');
         assert_eq!((app.selected_line, app.scroll), (Some(last), 0));
         app.update(key(KeyCode::Char('u'), KeyModifiers::CONTROL));

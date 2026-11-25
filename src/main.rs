@@ -1520,6 +1520,35 @@ mod tests {
         let text: String = screen.buffer().content.iter().map(|c| c.symbol()).collect();
         assert!(text.contains("line 69999"), "the newest line is on screen");
         assert!(!text.contains("scrolled up"));
+        // From the very top, PgDn moves ten rows, not thousands.
+        let mut shown = 0;
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        app.update(key(KeyCode::Char('g')));
+        app.update(key(KeyCode::Char('g')));
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|frame| shown = ui::draw(frame, &app))
+            .unwrap();
+        app.update(Event::Viewport(shown));
+        app.update(key(KeyCode::PageDown));
+        terminal
+            .draw(|frame| shown = ui::draw(frame, &app))
+            .unwrap();
+        let top_row: String = terminal.backend().buffer().content[60..120]
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(top_row.contains("line 10 "), "{top_row}");
+        // One entry alone past u16::MAX rows: its last line still shows at the bottom.
+        let mut app = App::default();
+        let huge: Vec<String> = (0..70_000).map(|n| format!("row {n}")).collect();
+        app.note(huge.join("\n"), false);
+        let screen = render(&app, 60, 12);
+        let text: String = screen.buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(
+            text.contains("row 69999"),
+            "the end of the huge entry is on screen"
+        );
     }
 
     #[test]

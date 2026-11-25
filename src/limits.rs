@@ -27,6 +27,11 @@ pub struct Limits {
     pub weekly: Option<Window>,
     /// Unix milliseconds when the CLI reported these.
     pub seen_at: u64,
+    /// The CLI said it was limited without saying by which window (Codex's
+    /// `rate_limit_reached_type` below 100%): limited until the first window resets, since
+    /// any of them may be the cause. Unix seconds.
+    #[serde(default)]
+    pub limited_until: Option<i64>,
     /// The destination that reported them (the participant's identity, ADR 0011): a
     /// reading never carries over to a repointed id.
     #[serde(default)]
@@ -40,7 +45,7 @@ pub fn from_claude(event: &Value, seen_at: u64) -> Option<Limits> {
         let w = windows.get(name)?;
         Some(Window {
             used_percent: w.get("utilization")?.as_f64()? * 100.0,
-            resets_at: w.get("resetsAt")?.as_i64()?,
+            resets_at: w.get("resetsAt")?.as_i64().filter(|&r| plausible(r))?,
             blocked: w
                 .get("status")
                 .and_then(Value::as_str)
@@ -56,6 +61,7 @@ pub fn from_claude(event: &Value, seen_at: u64) -> Option<Limits> {
         five_hour,
         weekly,
         seen_at,
+        limited_until: None,
         identity: None,
     })
 }
@@ -75,6 +81,7 @@ pub fn from_codex_session(text: &str) -> Option<Limits> {
             five_hour: None,
             weekly: None,
             seen_at,
+            limited_until: None,
             identity: None,
         };
         let reached = !limits["rate_limit_reached_type"].is_null();
@@ -82,7 +89,7 @@ pub fn from_codex_session(text: &str) -> Option<Limits> {
             let w = &limits[key];
             let (Some(used), Some(resets), Some(minutes)) = (
                 w["used_percent"].as_f64(),
-                w["resets_at"].as_i64(),
+                w["resets_at"].as_i64().filter(|&r| plausible(r)),
                 w["window_minutes"].as_u64(),
             ) else {
                 continue;
@@ -100,18 +107,33 @@ pub fn from_codex_session(text: &str) -> Option<Limits> {
         }
         // Codex leaves `rate_limit_reached_type` empty even at 100% (0.172.0), so a full
         // window blocks by itself (`blocked_until`). When it is set without a full window,
-        // it doesn't say which one: every window counts as blocking until it resets.
+        // it doesn't say which one: limited until the first of them resets.
         let full = [out.five_hour, out.weekly]
             .iter()
             .flatten()
             .any(|w| w.used_percent >= 100.0);
         if reached && !full {
-            for w in [&mut out.five_hour, &mut out.weekly].into_iter().flatten() {
-                w.blocked = true;
-            }
+            out.limited_until = [out.five_hour, out.weekly]
+                .iter()
+                .flatten()
+                .map(|w| w.resets_at)
+                .min();
         }
         (out.five_hour.is_some() || out.weekly.is_some()).then_some(out)
     })
+}
+
+/// Unix seconds no later than year 9999: anything else is a malformed reading, dropped.
+const LAST_SECOND: i64 = 253_402_300_799;
+
+fn plausible(resets_at: i64) -> bool {
+    (0..=LAST_SECOND).contains(&resets_at)
+}
+
+/// Whole seconds of a Unix-milliseconds time, for comparing with `resets_at` in seconds
+/// (never multiplying it: a malformed reading must not overflow).
+fn secs(ms: u64) -> i64 {
+    (ms / 1000) as i64
 }
 
 /// Unix milliseconds of an RFC 3339 UTC time as Codex writes it (`2026-11-25T15:42:05.550Z`).
@@ -123,6 +145,32 @@ fn iso_ms(text: &str) -> Option<u64> {
     let num = |r: std::ops::Range<usize>| text.get(r)?.parse::<i64>().ok();
     let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
     let (h, min, s) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let month_days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let valid = (1..=12).contains(&m)
+        && (1..=month_days[(m - 1).clamp(0, 11) as usize]).contains(&d)
+        && (0..24).contains(&h)
+        && (0..60).contains(&min)
+        && (0..=60).contains(&s)
+        && b[7] == b'-'
+        && b[13] == b':'
+        && b[16] == b':';
+    if !valid {
+        return None;
+    }
     let millis = match text.get(19..text.len() - 1) {
         Some("") => 0,
         Some(frac) => {
@@ -146,8 +194,9 @@ pub fn blocked_until(l: &Limits, now_ms: u64) -> Option<i64> {
     [l.five_hour, l.weekly]
         .into_iter()
         .flatten()
-        .filter(|w| (w.blocked || w.used_percent >= 100.0) && w.resets_at * 1000 > now_ms as i64)
+        .filter(|w| (w.blocked || w.used_percent >= 100.0) && w.resets_at > secs(now_ms))
         .map(|w| w.resets_at)
+        .chain(l.limited_until.filter(|&t| t > secs(now_ms)))
         .max()
 }
 
@@ -190,7 +239,10 @@ pub fn report(
     now_ms: u64,
     offset_at: impl Fn(i64) -> i64,
 ) -> String {
-    let local = |s: i64| (s + offset_at(s)).max(0) as u64 * 1000;
+    let local = |s: i64| {
+        let s = s.clamp(0, LAST_SECOND);
+        (s + offset_at(s)).max(0) as u64 * 1000
+    };
     let width = ids.iter().map(|id| id.len()).max().unwrap_or(0);
     let mut rows = vec!["limits:".to_string()];
     for id in ids {
@@ -202,7 +254,7 @@ pub fn report(
         };
         let window = |name: &str, w: Option<Window>| match w {
             None => None,
-            Some(w) if w.resets_at * 1000 <= now_ms as i64 => {
+            Some(w) if w.resets_at <= secs(now_ms) => {
                 Some(format!("{name} reset since (was {:.0}%)", w.used_percent))
             }
             Some(w) => Some(format!(
@@ -237,8 +289,7 @@ pub fn resets_between(limits: &BTreeMap<String, Limits>, after_ms: u64, until_ms
         .values()
         .flat_map(|l| [l.five_hour, l.weekly])
         .flatten()
-        .map(|w| w.resets_at.max(0) as u64 * 1000)
-        .any(|at| at > after_ms && at <= until_ms)
+        .any(|w| w.resets_at > secs(after_ms) && w.resets_at <= secs(until_ms))
 }
 
 /// For the status line: windows at 80% or more that have not reset yet, e.g. `codex 5h 86%`.
@@ -248,7 +299,7 @@ pub fn warnings(limits: &BTreeMap<String, Limits>, now_ms: u64) -> Vec<String> {
         for (name, w) in [("5h", l.five_hour), ("week", l.weekly)] {
             if let Some(w) = w
                 && w.used_percent >= 80.0
-                && w.resets_at * 1000 > now_ms as i64
+                && w.resets_at > secs(now_ms)
             {
                 out.push(format!("{id} {name} {:.0}%", w.used_percent));
             }
@@ -355,6 +406,19 @@ mod tests {
             Some(1795641000),
             "reached below 100%: still limited"
         );
+        // Which window it was is unknown: limited until the first one resets, not the week.
+        let both = json!({"timestamp":"2026-11-25T20:44:00Z","payload":{"rate_limits":{
+            "primary":{"used_percent":90.0,"window_minutes":300,"resets_at":1795641000},
+            "secondary":{"used_percent":40.0,"window_minutes":10080,"resets_at":1796137200},
+            "rate_limit_reached_type":"rate_limit"}}})
+        .to_string();
+        let l = from_codex_session(&both).unwrap();
+        assert_eq!(blocked_until(&l, NOW), Some(1795641000));
+        assert_eq!(
+            blocked_until(&l, 1_795_641_001_000),
+            None,
+            "after the 5h reset: free"
+        );
         let full = line(json!({"used_percent":100.0,"window_minutes":300,"resets_at":1}));
         assert!(
             blocked_until(&from_codex_session(&full).unwrap(), 0).is_some(),
@@ -389,6 +453,34 @@ mod tests {
     }
 
     #[test]
+    fn absurd_reset_times_never_crash() {
+        let huge = Limits {
+            five_hour: Some(Window {
+                used_percent: 100.0,
+                resets_at: i64::MAX,
+                blocked: true,
+            }),
+            weekly: Some(Window {
+                used_percent: 0.0,
+                resets_at: i64::MIN,
+                blocked: false,
+            }),
+            seen_at: u64::MAX,
+            limited_until: None,
+            identity: None,
+        };
+        // As if loaded from a damaged limits.json: every reader copes.
+        let map = BTreeMap::from([("codex".to_string(), huge.clone())]);
+        let _ = report(&["codex"], &map, NOW, |_| 0);
+        let _ = warnings(&map, NOW);
+        let _ = blocked_until(&huge, NOW);
+        let _ = resets_between(&map, 0, u64::MAX);
+        // And the parsers never store one.
+        let bad = json!({"rate_limit_info":{"unifiedWindows":{"five_hour":{"utilization":0.5,"resetsAt":i64::MAX,"status":"allowed"}}}});
+        assert_eq!(from_claude(&bad, NOW), None);
+    }
+
+    #[test]
     fn codex_timestamps() {
         assert_eq!(iso_ms("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(iso_ms("2026-11-25T20:45:00.000Z"), Some(NOW));
@@ -396,6 +488,9 @@ mod tests {
         assert_eq!(iso_ms("2024-02-29T00:00:00Z"), Some(1_709_164_800_000));
         assert_eq!(iso_ms("2026-11-25 20:45:00"), None);
         assert_eq!(iso_ms("garbage-but-long-enough-Z"), None);
+        assert_eq!(iso_ms("2026-99-25T15:42:05Z"), None, "no month 99");
+        assert_eq!(iso_ms("2026-02-30T00:00:00Z"), None, "no 30 February");
+        assert_eq!(iso_ms("2026-11-25T24:00:00Z"), None);
     }
 
     #[test]
@@ -408,6 +503,7 @@ mod tests {
             }),
             weekly: None,
             seen_at: 0,
+            limited_until: None,
             identity: None,
         };
         assert_eq!(
@@ -447,6 +543,7 @@ mod tests {
                     blocked: false,
                 }),
                 seen_at: NOW - 60_000,
+                limited_until: None,
                 identity: None,
             },
         );
@@ -460,6 +557,7 @@ mod tests {
                 }),
                 weekly: None,
                 seen_at: NOW - 3_600_000,
+                limited_until: None,
                 identity: None,
             },
         );

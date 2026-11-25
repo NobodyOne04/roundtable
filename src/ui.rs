@@ -24,7 +24,7 @@ const INPUT_MAX_ROWS: usize = 8;
 
 /// Draws the screen; returns how many lines the chat is shown scrolled up from its newest
 /// line, after clamping and following the selection, so paging can start from there.
-pub fn draw(frame: &mut Frame, app: &App) -> u16 {
+pub fn draw(frame: &mut Frame, app: &App) -> usize {
     // The input wraps to the box and grows with its rows, up to a few; past that it shows
     // the last ones, where the cursor is. The box spans the whole width, inside its border.
     let input_lines = input_lines(&app.input, frame.area().width.saturating_sub(2) as usize);
@@ -179,43 +179,44 @@ fn focused(block: Block<'static>, focus: bool) -> Block<'static> {
     }
 }
 
-fn draw_chat(frame: &mut Frame, app: &App, area: Rect) -> u16 {
+fn draw_chat(frame: &mut Frame, app: &App, area: Rect) -> usize {
     let width = area.width.saturating_sub(2);
     let inner_height = area.height.saturating_sub(2) as usize;
     let selected = (app.focus == Focus::Chat)
         .then_some(app.selected_line)
         .flatten();
-    // Each entry rendered and measured once. Rows are `usize`: a long thread can pass
-    // `u16::MAX` wrapped rows, more than the widget's own scroll offset can address.
-    let entries: Vec<(Vec<Line>, usize)> = app
-        .lines
-        .iter()
-        .enumerate()
-        .map(|(i, line)| {
-            let lines = chat_lines(line, selected == Some(i));
-            let rows = Paragraph::new(lines.clone())
+    // Every rendered line with its wrapped row count, measured once; `entry_start[i]` is the
+    // index of entry `i`'s first line. Rows are `usize`: a long thread, or one huge entry,
+    // can pass `u16::MAX` wrapped rows, more than the widget's own offset can address.
+    let mut lines: Vec<(Line, usize)> = Vec::new();
+    let mut entry_start = Vec::with_capacity(app.lines.len() + 1);
+    for (i, line) in app.lines.iter().enumerate() {
+        entry_start.push(lines.len());
+        for l in chat_lines(line, selected == Some(i)) {
+            let rows = Paragraph::new(l.clone())
                 .wrap(Wrap { trim: false })
                 .line_count(width);
-            (lines, rows)
-        })
-        .collect();
-    // `starts[i]`: the row entry `i` begins at; the last item is the total.
-    let mut starts = Vec::with_capacity(entries.len() + 1);
-    starts.push(0usize);
-    for (_, rows) in &entries {
-        starts.push(starts.last().unwrap() + rows);
+            lines.push((l, rows));
+        }
     }
-    let total = *starts.last().unwrap();
+    entry_start.push(lines.len());
+    // `row_start[k]`: the row line `k` begins at; the last item is the total.
+    let mut row_start = Vec::with_capacity(lines.len() + 1);
+    row_start.push(0usize);
+    for (_, rows) in &lines {
+        row_start.push(row_start.last().unwrap() + rows);
+    }
+    let total = *row_start.last().unwrap();
     // Keep the newest lines in view unless scrolled back (PgUp).
     let bottom = total.saturating_sub(inner_height);
-    let mut top = bottom.saturating_sub(app.scroll as usize);
+    let mut top = bottom.saturating_sub(app.scroll);
     // In Normal mode the selected line stays in view (j/k move it, ADR 0015).
     if let Some(i) = (app.focus == Focus::Chat && app.follow_selection)
         .then_some(app.selected_line)
         .flatten()
-        .filter(|&i| i < entries.len())
+        .filter(|&i| i < app.lines.len())
     {
-        let (start, end) = (starts[i], starts[i + 1]);
+        let (start, end) = (row_start[entry_start[i]], row_start[entry_start[i + 1]]);
         if start < top {
             top = start;
         } else if end > top + inner_height {
@@ -223,15 +224,16 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) -> u16 {
         }
     }
     let top = top.min(bottom);
-    let scrolled = u16::try_from(bottom - top).unwrap_or(u16::MAX);
+    let scrolled = bottom - top;
     let title = if scrolled > 0 {
         format!(" roundtable · scrolled up {scrolled} lines (PgDn) ")
     } else {
         " roundtable ".to_string()
     };
-    // The widget gets the entries from the one holding row `top` on, and a small offset
-    // into that entry, so any `top` is reachable.
-    let first = starts.partition_point(|&s| s <= top).saturating_sub(1);
+    // The widget gets the rendered lines from the one holding row `top` on, and an offset
+    // into that line only: under `u16::MAX` unless a single line wraps that far.
+    let first = row_start.partition_point(|&r| r <= top).saturating_sub(1);
+    let offset = u16::try_from(top - row_start[first.min(lines.len())]).unwrap_or(u16::MAX);
     let text = if app.lines.is_empty() {
         let hint = if app.default_is_everyone() {
             "Nothing at the table yet. Type to everyone, start with @<id> for one, or /help."
@@ -241,14 +243,13 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) -> u16 {
         Text::styled(hint, Style::new().add_modifier(Modifier::DIM))
     } else {
         Text::from(
-            entries
+            lines
                 .into_iter()
                 .skip(first)
-                .flat_map(|(lines, _)| lines)
+                .map(|(l, _)| l)
                 .collect::<Vec<_>>(),
         )
     };
-    let offset = u16::try_from(top - starts[first.min(starts.len() - 1)]).unwrap_or(u16::MAX);
     let chat = Paragraph::new(text)
         .wrap(Wrap { trim: false })
         .scroll((offset, 0))
@@ -293,6 +294,11 @@ fn draw_threads(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_context(frame: &mut Frame, app: &App, area: Rect) {
     let mut rows = vec![];
+    // Once per draw, not per row.
+    let limits = app.shown_limits();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
     for r in app.context_rows() {
         let name = Style::new().fg(colour(&r.id)).add_modifier(Modifier::BOLD);
         let state = Style::new().add_modifier(if r.state == "streaming" {
@@ -301,11 +307,7 @@ fn draw_context(frame: &mut Frame, app: &App, area: Rect) {
             Modifier::DIM
         });
         // A full plan window blocks the CLI until it resets (ADR 0014).
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64);
-        let limited = app
-            .shown_limits()
+        let limited = limits
             .get(&r.id)
             .and_then(|l| roundtable::limits::blocked_until(l, now))
             .map(|until| {
