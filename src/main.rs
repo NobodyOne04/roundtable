@@ -29,6 +29,7 @@ use roundtable::mcp::{self, AskAnswer};
 use roundtable::openai;
 use roundtable::registry::{self, Adapter, Registry};
 use roundtable::transcript::{self, NewEvent, Store, Thread};
+use roundtable::worktree;
 use roundtable::writer_lock::{
     self, Checkout, CheckoutLock, Cleared, MarkerState, Refusal, WriterGuard,
 };
@@ -101,6 +102,7 @@ async fn start() -> Result<()> {
         keys: HashMap::new(),
         viewing: None,
         sessions: BTreeMap::new(),
+        turn_cwd: HashMap::new(),
         turns: HashMap::new(),
         checkout,
         lock,
@@ -328,8 +330,11 @@ struct Runtime {
     viewing: Option<Thread>,
     /// `App`'s `Link` keys to the `seq` they were written at, for the open thread only.
     keys: HashMap<u64, u64>,
-    /// Native sessions by `id/identity`, so a new destination never resumes an old session.
+    /// Native sessions by `id/identity/cwd`, so a new destination, or a move between the
+    /// checkout and a mirror (ADR 0016), never resumes a session made elsewhere.
     sessions: BTreeMap<String, String>,
+    /// The folder each running turn runs in, for keying the session it reports.
+    turn_cwd: HashMap<String, PathBuf>,
     turns: HashMap<String, CancellationToken>,
     cwd: PathBuf,
     /// The git checkout root around `cwd` (or `cwd` outside git), recorded in each thread.
@@ -404,7 +409,9 @@ impl Runtime {
     }
 
     fn save_session(&mut self, id: &str, identity: &str, session: String) -> Result<()> {
-        self.sessions.insert(format!("{id}/{identity}"), session);
+        let cwd = self.turn_cwd.get(id).unwrap_or(&self.cwd);
+        self.sessions
+            .insert(session_key(id, identity, cwd), session);
         if let Some(thread) = &self.thread {
             thread.save_sessions(&self.sessions)?;
         }
@@ -955,6 +962,8 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     writable,
                     permission_mode,
                     ask_tool,
+                    identity,
+                    mirror,
                 } => {
                     if writable && let Some((_, why)) = refused.iter().find(|(r, _)| *r == id) {
                         // Fail closed (ADR 0012): an editable turn never starts without its
@@ -976,20 +985,74 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     } else {
                         None
                     };
+                    // Every CLI agent but the writer runs in its own mirror (ADR 0016),
+                    // inside git only; the sync runs in the turn's task, off this loop.
+                    let mirror = (mirror && rt.lock.is_some()).then(|| {
+                        let root = worktree::checkout_dir(&rt.data_root, &rt.checkout).join(&id);
+                        let sub = rt.cwd.canonicalize().ok().and_then(|cwd| {
+                            let base = rt.checkout.canonicalize().ok()?;
+                            cwd.strip_prefix(base).ok().map(Path::to_path_buf)
+                        });
+                        (root.clone(), root.join(sub.unwrap_or_default()))
+                    });
+                    let cwd = mirror
+                        .as_ref()
+                        .map_or_else(|| rt.cwd.clone(), |m| m.1.clone());
+                    // The app's session says whether to resume at all (it drops one the CLI
+                    // lost); which one is bound to the folder.
+                    let found = rt.sessions.get(&session_key(&id, &identity, &cwd)).cloned();
+                    if session.is_some() && found.is_none() {
+                        local.push_back(Event::Notice(format!(
+                            "{id}: new session, it now runs in {}",
+                            cwd.display()
+                        )));
+                    }
+                    let session = session.and(found);
+                    let prompt = match &mirror {
+                        Some((root, _)) => format!(
+                            "[roundtable: you are in a read-only mirror of `{}` at `{}`; give \
+                             paths relative to the repo root]\n\n{prompt}",
+                            rt.checkout.display(),
+                            root.display()
+                        ),
+                        None => prompt,
+                    };
+                    rt.turn_cwd.insert(id.clone(), cwd.clone());
                     let token = CancellationToken::new();
                     rt.turns.insert(id.clone(), token.clone());
                     let turn = Turn {
                         cmd,
                         prompt,
                         session,
-                        cwd: rt.cwd.clone(),
+                        cwd,
                         outside_repo: rt.outside_repo,
                         model,
                         writable,
                         permission_mode,
                         ask,
                     };
-                    tokio::spawn(agent::run(id, kind, turn, tx.clone(), token));
+                    let tx = tx.clone();
+                    let (data, checkout) = (rt.data_root.clone(), rt.checkout.clone());
+                    tokio::spawn(async move {
+                        if mirror.is_some() {
+                            let who = id.clone();
+                            let synced = tokio::task::spawn_blocking(move || {
+                                worktree::sync(&data, &checkout, &who)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()));
+                            // Fail closed: never fall back to running in the checkout.
+                            if let Err(why) = synced {
+                                let why = format!("mirror sync failed: {why}");
+                                let _ = tx.send(Event::Agent(id.clone(), PEvent::Error(why))).await;
+                                let _ = tx
+                                    .send(Event::Agent(id, PEvent::Done(Outcome::Failed)))
+                                    .await;
+                                return;
+                            }
+                        }
+                        agent::run(id, kind, turn, tx, token).await;
+                    });
                 }
                 Effect::StartChat {
                     id,
@@ -1038,6 +1101,44 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     rt.thread = None;
                     rt.viewing = None;
                     rt.sessions.clear();
+                }
+                Effect::Worktrees { clean, id } => {
+                    let found = worktree::list(&rt.data_root, &rt.checkout);
+                    let found: Vec<_> = found
+                        .into_iter()
+                        .filter(|(who, _)| id.as_ref().is_none_or(|id| id == who))
+                        .collect();
+                    let busy: Vec<String> = found
+                        .iter()
+                        .filter(|(who, _)| clean && rt.turns.contains_key(who))
+                        .map(|(who, _)| who.clone())
+                        .collect();
+                    let (tx, data, checkout) =
+                        (tx.clone(), rt.data_root.clone(), rt.checkout.clone());
+                    // Sizes and removals walk whole trees: off the loop.
+                    tokio::task::spawn_blocking(move || {
+                        let mut lines = vec![];
+                        for (who, record) in &found {
+                            if busy.contains(who) {
+                                lines.push(format!("{who}: kept, its turn is running"));
+                            } else if clean {
+                                lines.push(match worktree::remove(&data, &checkout, who, record) {
+                                    Ok(()) => format!("{who}: removed"),
+                                    Err(err) => format!("{who}: {err}"),
+                                });
+                            } else {
+                                let mb = worktree::size(&record.mirror) as f64 / 1e6;
+                                lines.push(format!(
+                                    "{who}: {mb:.1} MB  {}",
+                                    record.mirror.display()
+                                ));
+                            }
+                        }
+                        if lines.is_empty() {
+                            lines.push("no mirrors for this checkout".into());
+                        }
+                        let _ = tx.blocking_send(Event::Report(lines.join("\n")));
+                    });
                 }
                 Effect::Usage(scope) => {
                     let agents = app.cli_agents();
@@ -1186,6 +1287,12 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             return Ok(());
         }
     }
+}
+
+/// Native sessions are bound to the folder the CLI ran in (ADR 0016): Claude Code only
+/// resumes a session from the folder it was started in.
+fn session_key(id: &str, identity: &str, cwd: &Path) -> String {
+    format!("{id}/{identity}/{}", cwd.display())
 }
 
 /// Where the `ask` socket lives: the owner-only data folder, unless that path is too long
@@ -1403,6 +1510,7 @@ mod tests {
             keys: HashMap::new(),
             viewing: None,
             sessions: BTreeMap::new(),
+            turn_cwd: HashMap::new(),
             turns: HashMap::new(),
             cwd: root.into(),
             checkout: root.into(),

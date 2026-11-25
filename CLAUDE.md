@@ -20,6 +20,7 @@ Rust TUI console that runs Claude Code, Codex and OpenAI-compatible models in on
 - `src/limits.rs`: plan limits (ADR 0014): Claude's `rate_limit_event`, Codex's session file (`token_count` lines), the `/usage` block and status warnings; `App::limits`, saved to `<data>/limits.json`.
 - `src/log.rs`: `/log`'s Markdown render of a thread from its transcript (ADR 0024); the loop writes the temp file and hands the terminal to `editor` (`leave_screen`/`enter_screen`).
 - `src/openai.rs`: OpenAI-compatible chat: streaming SSE, history fitting, retries, key resolution (ADR 0005).
+- `src/worktree.rs`: the read-only agents' mirrors (ADR 0016): create, sync (`git diff HEAD --binary` + untracked files), list, remove; git runs with hooks off.
 - `src/writer_lock.rs`: checkout resolution (git root, git dir) and the writer lock and crash marker (ADR 0012).
 - `src/transcript.rs`: transcript files, single-instance lock, atomic writes (ADR 0010).
 - `src/app.rs`: `App` state, `Event`, `Effect` and `App::update`, the only place state changes (ADR 0002).
@@ -39,6 +40,7 @@ Rust TUI console that runs Claude Code, Codex and OpenAI-compatible models in on
 - Each ADR implementation PR marks its row `done` in the README roadmap and the next one `next`.
 - New CLI version: record a fresh two-turn fixture (sanitize: no paths, account or credential fields, no request ids such as `api_message_id`, `msg_…`, `uuid`, thinking `signature`), keep the old one, and update the tested versions in the README.
 - Only the `writer` is ever writable, on any message that reaches it unless it starts with `@all?` or edits are locked (`App::submit`, ADR 0017); every other turn gets the read-only flags in `agent::command`. Never pass a bypass/full-access flag to a CLI; the registry refuses such `permission_mode`s.
+- Mirrors (ADR 0016): `Effect::StartTurn { mirror: true }` runs in `worktree::sync`'s folder, synced inside the turn's task; a sync failure fails the turn, never falls back to the checkout. Native sessions are keyed `id/identity/cwd` (`session_key` in main.rs). Cleanup only touches mirrors with a record; never `git worktree prune`.
 - Writer lock (ADR 0012): `writer_lock::CheckoutLock` in `<git dir>/roundtable/` is the only authority. The loop takes it and writes `writer.json` before recording a writable delivery (`Runtime::begin_writer`) and clears it after the reply (`end_writer`); `/quiet` removes exactly the marker shown. Transcript `writable` lines are history only.
 - The registry lives in `App`; the loop does the file I/O (`Runtime::reload_registry`, `edit_registry`). Own writes are skipped by fingerprint, so never reload on every watcher event without the hash check.
 - Transcript lines are append-only: never rewrite `events.jsonl`; a status change is a new `settle`/`delivery` line. Small JSON files go through `transcript::write_atomic`.

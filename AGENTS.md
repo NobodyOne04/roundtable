@@ -35,6 +35,9 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
   `f522785`): the ninth review was skipped (usage limit).
 - Review the ADR 0017 PR (`feature/adr-0017-writer-edits`), skipped (Codex down, owner asked
   Claude to go ahead): the per-target `writable` in `App::submit`, `@all?` in `route`.
+- Review the ADR 0016 PR (`feature/adr-0016-worktrees`), skipped (Codex at its usage limit):
+  `worktree::sync` (diff/apply, untracked copy, hooks off), cleanup scope, folder-bound
+  sessions in `main.rs`. Also try one real Codex turn in its mirror: it was never run live.
 - Record a real two-turn Codex fixture (first turn plus `exec resume`) for 0.172.0, the
   installed version (your review of the fixes asked for it; Claude 2.1.332's is in):
   `tests/fixtures/codex-0.171.0-turn1.jsonl` was cut from one turn, and resume was never

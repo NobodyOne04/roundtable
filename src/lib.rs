@@ -10,4 +10,5 @@ pub mod mcp;
 pub mod openai;
 pub mod registry;
 pub mod transcript;
+pub mod worktree;
 pub mod writer_lock;
