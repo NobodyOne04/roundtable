@@ -20,20 +20,20 @@ Implementation order: see the note under the table.
 | [0013](0013-log-command.adr) | `/log`: read the thread in your editor | Rejected |
 | [0014](0014-usage-plan-limits.adr) | `/usage` shows each CLI's plan limits | Accepted |
 | [0015](0015-vim-keys.adr) | Vim keys for moving around (amends 0008) | Accepted |
-| [0016](0016-worktree-per-agent.adr) | A git worktree per read-only agent | Proposed |
-| [0017](0017-writer-edits-from-any-message.adr) | The writer may edit from any message (amends 0004) | Proposed |
-| [0018](0018-approvals-in-the-chat.adr) | Tool approvals in the chat | Proposed |
-| [0019](0019-fork.adr) | `/fork`: branch the current thread | Proposed |
-| [0020](0020-handoff.adr) | `/handoff`: pass the thread to another model | Proposed |
-| [0021](0021-compact.adr) | `/compact`: summarize a free model's history | Proposed |
-| [0022](0022-model-add.adr) | `/model add`: add a free model from the chat | Proposed |
-| [0023](0023-acp-adapter.adr) | An ACP adapter for other coding agents | Proposed |
+| [0016](0016-worktree-per-agent.adr) | A git worktree per read-only agent | Accepted |
+| [0017](0017-writer-edits-from-any-message.adr) | The writer may edit from any message (amends 0004) | Accepted |
+| [0018](0018-approvals-in-the-chat.adr) | Tool approvals in the chat | Accepted |
+| [0019](0019-fork.adr) | `/fork`: branch the current thread | Accepted |
+| [0020](0020-handoff.adr) | `/handoff`: pass the thread to another model | Accepted |
+| [0021](0021-compact.adr) | `/compact`: summarize a free model's history | Accepted |
+| [0022](0022-model-add.adr) | `/model add`: add a free model from the chat | Accepted |
+| [0023](0023-acp-adapter.adr) | An ACP adapter for other coding agents | Accepted |
 | [0024](0024-log-command.adr) | `/log`: the whole thread as Markdown in the configured editor (replaces 0013) | Accepted |
 
 Implementation order follows dependencies, not numbers: 0001, 0002, 0010, 0004, 0011,
 0005, 0007, 0008, 0009; 0012 lands with the writer fixes (0010 and 0011 replace earlier numbers that others depend on).
 
-Proposed 0014-0024, suggested order if accepted: 0017, 0018 (the owner can't edit from rt
-without them), 0014, 0024, 0015, 0016, 0019, 0020, 0021, 0022, 0023. Each stands alone
-except: 0019 and 0020 need events to carry `turn`/`parent` (a 0010 fix, no ADR), and 0018's
-card keys follow 0015 when both land.
+0014, 0015 and 0024 are built. 0016-0023 were accepted after Codex's critique, which
+changed each of them; build order: 0017, 0018 (together they let the writer work from
+roundtable: edits from any message, approvals in the chat), 0016, 0019 (after 0018: forks
+start without grants), 0020, 0021, 0022, then 0023 (needs 0016's worktrees).

@@ -1,11 +1,14 @@
 # 0016. A git worktree per read-only agent
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-25; revised after Codex's critique the same day)
 - Date: 2026-11-25
 
 [0004](0004-cli-agent-adapters.adr) decided (owner, 2026-11-24) that non-writers get their
 own git worktree, so whatever escapes their read-only flags (a project hook, a detached
-process) writes there and never into the writer's files. This ADR fixes the layout, how a
+process) and writes relative to its working folder lands in the mirror, not in the
+writer's files. This is protection against accidental writes, not confinement: a process
+that writes to an absolute path, or into the shared `.git`, still can (OS confinement was
+rejected in 0004). This ADR fixes the layout, how a
 worktree is kept in step with the writer's checkout, and cleanup.
 
 ## Technical details
@@ -21,18 +24,28 @@ worktree is kept in step with the writer's checkout, and cleanup.
   family as identities, [0011](0011-hot-model-registry.adr)). Outside the checkout, so the
   writer's `git status`, file watchers and build tools never see it. Folder 0700.
   Created with `git -C <checkout> worktree add --detach <path> HEAD`.
-- **A stable path per agent** matters: Claude Code files its sessions by working
-  directory, so `--resume` only finds a session started in the same folder. One fixed path
-  per (checkout, agent) keeps resume working. Sessions started in the checkout before this
-  ADR cannot resume in the worktree: the first read-only turn after the upgrade starts a
-  new CLI session and the chat says so once.
+- **A stable path per agent, and sessions bound to it**: Claude Code files its sessions
+  by working directory, so `--resume` only finds a session started in the same folder.
+  One fixed path per (checkout, agent) keeps resume working. Native sessions are keyed by
+  `id/identity/cwd` (today `id/identity`), where `cwd` is the folder the CLI actually ran
+  in, the checkout subfolder included. A turn only resumes a session of its own `cwd`;
+  otherwise it starts a new one and the chat says so once. This covers the upgrade, every
+  `writer` change in the hot registry (the promoted agent moves into the checkout, the
+  demoted one into its mirror), `/resume` and `/fork` alike.
 - **Sync before every read-only turn** (the agent must review the writer's current,
   uncommitted work, not just `HEAD`):
   1. `git -C <wt> checkout --detach --force <HEAD of checkout>` and
      `git -C <wt> clean -fd` (ignored files are left alone, so `target/` or
      `node_modules/` built there survive);
-  2. `git -C <checkout> diff HEAD --binary` applied with `git -C <wt> apply --binary`;
-  3. untracked, not-ignored files (`git ls-files -o --exclude-standard`) copied over.
+  2. `git -C <checkout> diff HEAD --binary`, applied with `git -C <wt> apply --binary` only
+     when it is not empty (`git apply` refuses empty input);
+  3. untracked, not-ignored files from `git ls-files -z -o --exclude-standard`
+     (NUL-separated: any file name works) copied over, symlinks kept as symlinks.
+  An unborn `HEAD` (a repository with no commit yet) has nothing to check out: the mirror
+  is created empty with `git worktree add --orphan` (git ≥ 2.42; older git: refused with
+  that reason) and gets the untracked files only.
+  Each reviewer sees the state at the moment its own turn starts (see
+  [0017](0017-writer-edits-from-any-message.adr) for broadcasts).
   Done by the loop as one effect before the turn's spawn; a sync failure fails that turn
   with the git error (fail closed: no silent fallback to the checkout). Typical cost is
   tens of milliseconds; a large untracked tree is the slow case.
@@ -42,11 +55,15 @@ worktree is kept in step with the writer's checkout, and cleanup.
 - **What the agent is told**: the turn's preamble says "you are in a read-only mirror of
   `<checkout>` at `<wt>`; give paths relative to the repo root", so replies don't point
   the user at worktree paths.
-- **Cleanup**: worktrees are reused across turns and runs. `/model disable <id>` keeps it
-  (history and sessions stay too, as 0011 says). Startup runs `git worktree prune` for
-  each checkout seen, and removes `<data_root>/worktrees/<checkout-id>/` whose checkout no
-  longer exists. A new `/worktrees` command lists them with sizes and
-  `/worktrees clean [id]` removes them (`git worktree remove --force`).
+- **Cleanup, only of what roundtable made**: each mirror has a `roundtable.json` next to
+  it (`<data_root>/worktrees/<checkout-id>/<participant-id>.json`) recording the canonical
+  source checkout and the mirror's path. Cleanup acts only on mirrors listed there: never
+  `git worktree prune` (it would touch the owner's own worktree registrations), but
+  `git -C <source> worktree remove --force <mirror>` per recorded mirror, and when the
+  recorded source no longer exists, removal of the folder plus its record. Worktrees are
+  reused across turns and runs; `/model disable <id>` keeps its mirror (history and
+  sessions stay too, as 0011 says). `/worktrees` lists them with sizes; `/worktrees clean
+  [id]` removes them, refused while that agent's sync or turn is running.
 - **The writer lock is unchanged** ([0012](0012-checkout-writer-lock.adr)): it guards the
   checkout; worktrees need no lock because only their own agent uses them, one turn at a
   time.

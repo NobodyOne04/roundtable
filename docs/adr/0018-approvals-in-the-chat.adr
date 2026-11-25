@@ -1,6 +1,7 @@
 # 0018. Tool approvals in the chat
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-25; revised after Codex's critique the same day)
+- Amends: [0004](0004-cli-agent-adapters.adr) (the writer's default permission mode)
 - Date: 2026-11-25
 
 Even a writable turn can't do much today: the writer runs headless (`claude -p`), so a
@@ -11,45 +12,60 @@ asked, so the owner approves in the chat as they would in Claude Code. Together 
 work properly from rt", without bypass flags.
 
 ## Technical details
-- **Claude** (writer turns only): add `--permission-prompts host`. roundtable already
-  drives Claude over `--input-format stream-json`, so it is the SDK host: Claude sends
-  `{"type":"control_request","request_id":…,"request":{"subtype":"can_use_tool",
-  "tool_name":"Bash","input":{…}}}` on stdout and waits for a `control_response` on
-  stdin (`{"behavior":"allow"}` or `{"behavior":"deny","message":…}`).
+- **Claude** (writer turns only): add `--permission-prompts host` (present in 2.1.332's
+  help). roundtable already drives Claude over `--input-format stream-json`, so it is the
+  SDK host: Claude asks on stdout with a control request (`can_use_tool`, tool name,
+  input, a request id) and waits for the matching control response on stdin (allow, or
+  deny with a message).
+  - The help text does not define the envelopes. The first step of the implementation is
+    a recorded, sanitized, bidirectional fixture for the installed version: a correlated
+    allow, a deny, a request cancelled mid-wait, and the final `result` with stdin held
+    open. Message shapes in the code come from that fixture, never from this ADR.
   - stdin stays open for the whole writable turn (today it is closed after the prompt);
     it closes when the `result` arrives or the turn is cancelled.
-  - The exact message shapes are pinned by a recorded fixture per CLI version, like the
-    stream formats ([0004](0004-cli-agent-adapters.adr)).
-- **In the chat**: a request becomes an approval card, and the turn's line shows
-  `waiting for you`:
+- **In the chat**: a request becomes an approval card in the chat, and the turn's line and
+  the status line show `approval waiting (A)`:
   ```
   claude wants to run  Bash: cargo test --locked
     [y] allow once   [a] allow `Bash(cargo test:*)` for this thread   [n] deny   [e] deny with a note
   ```
-  The card takes the keys while it is the oldest pending one; typing elsewhere is not
-  blocked (focus moves back to the input with `i`, [0015](0015-vim-keys.adr)). Several
-  pending requests queue in order. A turn cancelled with `Esc` denies its pending ones.
-- **"Allow for this thread"** rules live in memory per thread and are written as
-  `approval` events ([0010](0010-filesystem-event-log.adr) already lists the kind), so
-  `/resume` restores them. They are passed on the next turn as `--allowedTools`, so
-  Claude stops asking. Nothing is written to the owner's Claude settings.
+  - The card answers only when it has the focus: `A` in Normal mode
+    ([0015](0015-vim-keys.adr)) focuses the oldest waiting card, visibly (bordered,
+    scrolled into view). Until then `y`, `a`, `n` keep their usual meaning, so nothing is
+    granted by keys typed for something else. `Esc` leaves the card unanswered.
+  - Each answer is bound to its turn and request id. An answer to a request whose turn was
+    cancelled, whose process exited, or whose participant changed identity in the
+    registry is dropped, and the card closes as `expired`.
+  - Several waiting requests queue in order; cancelling a turn (`Esc`/`x`) denies its
+    waiting ones.
+- **"Allow for this thread" grants are matched by roundtable**, not passed to Claude as
+  `--allowedTools`: every request still reaches roundtable, which answers a matching one
+  itself, so every decision is logged. A grant is bound to (thread, participant
+  identity, tool pattern); a writer or identity change makes it inactive. Grants are
+  `approval` events ([0010](0010-filesystem-event-log.adr) lists the kind), so `/resume`
+  restores them; a fork ([0019](0019-fork.adr)) starts with none.
 - **Every decision is logged** as an `approval` event: tool, input (redacted like any
-  event), decision, who decided (`you` or `rule`).
+  event), decision, who decided (`you`, `rule <grant seq>`, `expired`, `cancelled`).
 - **Default `permission_mode` for the writer** becomes `acceptEdits` (edits go through,
-  shown as tool calls; commands ask). `default` and `manual` remain choosable in
-  `models.toml`; `plan` there would make the writer never edit.
+  shown as tool calls; commands ask). This amends 0004's "unset means `default`" for
+  existing configurations: an unset writer mode changes behaviour on upgrade, and the
+  CHANGELOG says so. `default` and `manual` remain choosable in `models.toml`; `plan`
+  there would make the writer never edit.
 - **Codex** (`codex exec`) has no host approvals: it runs `workspace-write` and refuses
-  escalations. Opt-in in `models.toml`: `permission_mode = "approve-for-me"` passes
-  `--approve-for-me` (Codex's own automatic reviewer decides; still sandboxed to the
-  workspace). The registry accepts it for the writer only.
+  escalations. Opt-in, for the writer only, a separate key from the sandbox:
+  `auto_review = true` in its `models.toml` entry passes `--approve-for-me`, placed before
+  the subcommand (`codex exec --approve-for-me resume …`; 0.172.0 rejects it after
+  `resume`). Codex's own reviewer may then approve escalations beyond the workspace
+  sandbox (network, writes outside the checkout), so this widens what Codex can do; the
+  registry comment says so. `permission_mode` keeps mapping to the sandbox only.
 - **Never** `bypassPermissions` or `--dangerously-bypass-approvals-and-sandbox`: the
   registry keeps refusing them (unchanged).
 - Read-only turns keep `--permission-prompts none`-equivalent behaviour: plan mode and the
   read-only sandbox, nothing to approve.
-- Consequences: the writer can edit and run commands with the owner watching each new
-  kind of command once, as in Claude Code. Costs: a turn can sit waiting on the owner;
-  the status line shows `1 approval waiting` so it is not missed; and a second hand-parsed
-  protocol (control messages) to keep up with CLI versions.
+- Consequences: the writer can edit and run commands with the owner approving each new
+  kind of command once, as in Claude Code. Costs: a turn can sit waiting on the owner
+  (the status line shows it); a second hand-parsed protocol (control messages) to keep up
+  with CLI versions; and the upgrade changes the unset writer mode.
 
 ## Technologies and alternatives
 - Involved: claude CLI `--permission-prompts host` with stream-json input (2.1.332), codex `--approve-for-me` (0.172.0)

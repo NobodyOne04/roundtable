@@ -1,6 +1,6 @@
 # 0021. `/compact`: summarize a free model's history
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-25; revised after Codex's critique the same day)
 - Date: 2026-11-25
 
 [0008](0008-slash-commands-and-mentions.adr) lists `/compact [id]`: "summarize history
@@ -11,22 +11,37 @@ their beginning. CLI agents compact on their own and are out of scope.
 
 ## Technical details
 - **`/compact [id]`** (default: every enabled free model in the thread):
-  1. roundtable asks the model itself, with its current history, for a summary that keeps
-     goals, decisions, facts and open questions, at most a quarter of its window.
-  2. The summary is stored as a `status` event of subkind `compact` with `for: <id>` and
-     `upto: <seq>`.
-  3. From then on, that model's history builder starts with the summary (as a system
-     message) and adds only events after `upto`. Older events stay in the transcript and
-     in `/log`; only what the model is sent changes.
+  1. The source is that model's history as roundtable would build it, **before** any
+     trimming: every exchange delivered to its current identity since the last checkpoint
+     (or the thread start). Ordinary window fitting drops the oldest exchanges first, so a
+     single request could never see them; instead the history is summarized in
+     chronological chunks that each fit the window, each chunk's prompt carrying the
+     previous chunk's summary, until one summary covers it all.
+  2. The summary has a hard output budget (a quarter of the window, sent as
+     `max_tokens`); a summary that comes back cut off or empty fails the compaction and
+     changes nothing.
+  3. The finished summary is a checkpoint: a `status` event of subkind `compact` with
+     `for: <id>`, the model's identity, and `upto: (thread_id, seq)` of the last event it
+     covers, synced to disk. Only then does the checkpoint take effect.
+  4. From then on that model's history starts with the summary, then events after `upto`.
+     The summary is replayed as attributed conversation data, a user message
+     `summary of the conversation so far (by <id>): …`, never as a system message:
+     roundtable's own system message stays the only instruction. The compaction request
+     and its replies are never part of ordinary history, live or on `/resume`.
+- **Bound to the destination**: a checkpoint applies only while the participant's
+  identity matches ([0011](0011-hot-model-registry.adr)); after a repoint the new
+  destination starts from the full history again, as for any new identity.
 - **Automatic**: when a free model's history would be trimmed by more than 25% of its
   window, the chat suggests `/compact <id>` once per thread. No automatic compaction:
-  summaries cost a turn and lose detail, so the owner decides.
+  summaries cost turns and lose detail, so the owner decides.
 - **`/compact` on a CLI agent** answers "claude and codex compact on their own".
-- **Several compactions** stack: the next summary is made from the previous summary plus
-  newer events.
+- **Several compactions** stack: the next one starts from the latest checkpoint's summary
+  plus newer events. Forks ([0019](0019-fork.adr)) inherit checkpoints with the conversation,
+  since they are part of it.
 - **`/context <id>`** shows `compacted at #<seq>` and the summary's size.
 - Consequences: long threads with free models keep their start in summarized form instead
-  of losing it. Costs: one model turn per compaction; quality depends on that model.
+  of losing it. Costs: one model turn per chunk; quality depends on that model; the
+  chunked path is more code than a single request.
 
 ## Technologies and alternatives
 - Alternatives:

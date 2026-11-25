@@ -1,6 +1,6 @@
 # 0017. The writer may edit from any message
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-25; revised after Codex's critique the same day)
 - Date: 2026-11-25
 - Amends: [0004](0004-cli-agent-adapters.adr) (who is writable)
 
@@ -16,22 +16,32 @@ whenever a message reaches it; everyone else stays read-only.
   [0016](0016-worktree-per-agent.adr) lands). Still never writable: `ask` turns
   ([0007](0007-model-to-model-communication.adr)), handoffs, and any turn while `/talk`
   or a policy routes it from another model.
-- **Order inside a broadcast**: the read-only recipients start at once, as today. The
-  writer's turn takes the writer lock ([0012](0012-checkout-writer-lock.adr)) as any
-  writable turn does, so a second writable turn still queues.
+- **Order inside a broadcast**: the read-only recipients start at once, as today, and
+  each sees the files as they are when its own turn starts (a queued reviewer may see
+  the writer's edits so far). No pre-edit snapshot is promised: a shared snapshot taken
+  before the writer spawns would need one frozen mirror per broadcast, kept for queued
+  recipients; not worth it until a reviewer's view of a half-done edit proves a problem.
+- **Every existing writable check stays**: the edit lock (outside git, unknown checkout,
+  crash marker, [0012](0012-checkout-writer-lock.adr)), the queued-turn recheck when a
+  held writable turn finally starts, and the lock itself. Contention in this roundtable
+  queues the writer's turn, as today; a writer running in another roundtable on the same
+  checkout refuses it with that reason (0012), it does not wait.
 - **Opt out per message**: start the message with `@all?` for "just discuss, nobody
-  touches anything": everyone read-only, as today's broadcasts. The echo line says which
-  it is: `you → all (claude may edit)` or `you → all (read-only)`.
+  touches anything": everyone read-only, as today's broadcasts. The echo line shows the
+  effective permission, after the checks above: `you → all (claude may edit)`,
+  `you → all (read-only)`, or `you → all (read-only: edits locked …)`.
 - **Registry**: no new key; `writer` unset still means nobody edits (today's behaviour).
 - **Code**: `App::submit` decides `writable` per target instead of per message:
-  `writable = target == writer && !read_only_marker`; the `mentions > 1` read-only rule
-  goes. Tests: broadcast with writer (writer writable, others not), `@all?` (none),
-  `default = "all"` (writer writable), writer disabled (none).
+  `writable = target == writer && !read_only_marker && !self.locked()`; the
+  `mentions > 1` read-only rule goes, nothing else. Tests: broadcast with writer (writer
+  writable, others not), `@all?` (none), `default = "all"` (writer writable), writer
+  disabled (none), edits locked (none, echo says why), writer busy (queued, still
+  writable when it starts unless locked by then).
 - Consequences: the owner's `default = "all"` setup can work without `@claude` every time.
-  Costs: a broadcast now may change files while others read them mid-change (their
-  answers can describe a half-edited tree; with 0016 they read a synced mirror taken
-  before the edit, which is consistent but stale), and the "every broadcast is read-only"
-  rule, easy to explain, is gone.
+  Costs: a broadcast now may change files while others read them, so a reviewer's answer
+  can describe a half-edited tree (with 0016 it reads a mirror synced when its turn
+  starts, consistent within that turn but not pre-edit), and the "every broadcast is
+  read-only" rule, easy to explain, is gone.
 
 ## Technologies and alternatives
 - Alternatives:

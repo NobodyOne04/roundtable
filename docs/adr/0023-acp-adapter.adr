@@ -1,6 +1,7 @@
 # 0023. An ACP adapter for other coding agents
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-25; revised after Codex's critique the same day)
+- Amends: [0011](0011-hot-model-registry.adr) (a third adapter kind)
 - Date: 2026-11-25
 
 [0004](0004-cli-agent-adapters.adr) planned an `acp` adapter "once ACP v2 settles". This
@@ -9,35 +10,50 @@ natively, and both already have direct adapters, so ACP's value is adding **othe
 (Gemini CLI, and any agent with an ACP mode) without code per agent.
 
 ## Technical details
-- **Registry**: a new `kind = "acp"` entry:
+- **Registry** (amends 0011): a third `kind = "acp"`, dispatched explicitly (today every
+  non-CLI participant goes down the OpenAI path in `App::start`):
   ```toml
   [[model]]
   id = "gemini"
   kind = "acp"
   cmd = "gemini"
   args = ["--experimental-acp"]
+  read_only_args = ["--sandbox"]   # required: how this agent is started read-only
   ```
-  `cmd` + `args` launch the agent; roundtable talks ACP (JSON-RPC over stdio) to it.
-- **Mapping** to the `Participant` trait: `session/new` and `session/load` for the
-  per-thread native session; `session/prompt` per turn; `session/update` notifications to
-  `PEvent` (text chunks, tool calls, plans); `session/cancel` on `Esc`.
-- **Permissions**: ACP agents ask the client through `session/request_permission`; this
-  maps onto [0018](0018-approvals-in-the-chat.adr)'s approval card for the writer, and is
-  answered `deny` automatically on read-only turns. An ACP agent is read-only unless it is
-  the `writer`.
-- **Files**: ACP lets the client serve `fs/read_text_file` / `fs/write_text_file`.
-  roundtable serves reads from the agent's working folder and refuses writes on
-  read-only turns, which is a stronger guard than flags. Terminal (`terminal/*`) methods
-  are refused in v1.
-- **`ask`** ([0007](0007-model-to-model-communication.adr)): passed as an MCP server in
-  `session/new`'s `mcpServers`, the same `roundtable mcp` Claude gets.
-- **Versioning**: the crate is pinned, and each supported agent gets a recorded fixture,
-  as for the CLIs.
-- **Not in scope**: switching Claude or Codex to ACP (through the Zed adapters). Their
-  JSON adapters stay, per 0004.
-- Consequences: one adapter covers a family of agents. Costs: a large protocol surface to
-  map and test, and each agent implements ACP differently; real use needs at least one
-  agent the owner wants at the table.
+  The identity fingerprint covers `cmd`, `args` and `read_only_args`, so changing how the
+  agent is launched counts as a new destination (history and sessions don't carry over).
+- **Wire version: ACP v2 only** (what 0004 waited for). `initialize` negotiates the
+  protocol version and capabilities; an agent that only speaks v1 is refused with that
+  reason. Sessions: `session/new`, and `session/resume` only when the agent advertises it
+  (otherwise each roundtable restart starts a new agent session, said once in the chat).
+- **A turn's end**: in v2 the `session/prompt` request is acknowledged before the turn
+  finishes, so the acknowledgement is never treated as the end. The turn ends on v2's
+  end-of-turn signal (the exact message is pinned by the recorded fixture), after which
+  the process is reaped as for the CLIs ([0004](0004-cli-agent-adapters.adr)); `Esc` sends
+  `session/cancel`, then kills the process group after the grace period.
+- **Read-only, and only as a reviewer** (v1 of this adapter): an ACP agent is never the
+  `writer` and never writable. A client cannot stop an arbitrary executable from doing
+  its own file or shell work, so admission needs both: the entry's `read_only_args`
+  (the agent's own verified read-only mode; an entry without it is refused) and its own
+  worktree ([0016](0016-worktree-per-agent.adr)) as working folder. Outside git, ACP
+  agents are refused.
+- **Permission requests** (`session/request_permission`) are answered with one of the
+  rejection options the agent offered, or the protocol's `cancelled` outcome, never a
+  free-form "deny"; every one is logged as an `approval` event (0018) with `who:
+  read-only`.
+- **Client methods**: v2 has no client `fs/*` or terminal methods; anything the agent
+  sends that roundtable does not implement gets a JSON-RPC method-not-found error.
+- **`ask`** ([0007](0007-model-to-model-communication.adr)): ACP agents can be asked, but in
+  this version get no `ask` tool themselves (the MCP server needs a fresh token per turn
+  and resumed sessions keep their old server list; a later change).
+- **`/fork`** ([0019](0019-fork.adr)): ACP has no native fork; in a fork an ACP agent
+  starts a new session on its first turn and gets the inherited conversation as context.
+- **Versioning**: the crate is pinned, and each supported agent gets a recorded,
+  sanitized fixture of a full turn and a cancel, as for the CLIs.
+- **Not in scope**: switching Claude or Codex to ACP. Their JSON adapters stay, per 0004.
+- Consequences: one adapter brings other agents in as reviewers. Costs: a large protocol
+  surface to map and test, each agent implements ACP its own way, and it needs 0016
+  first; real use needs at least one agent the owner wants at the table.
 
 ## Technologies and alternatives
 - Involved: `agent-client-protocol` crate (5.6.1 at writing), JSON-RPC over stdio
