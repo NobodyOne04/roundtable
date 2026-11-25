@@ -33,8 +33,9 @@ here") as later; [0010](0010-filesystem-event-log.adr) already reserves `parent_
     deliveries, settles and `/compact` checkpoints ([0021](0021-compact.adr)) are needed to
     rebuild a model's history exactly as the parent had it (0010: history uses only `sent`
     deliveries), so they are inherited. What a consumer takes from inherited events is its
-    own rule: the chat and `/log` show the conversation; `/usage` counts only the fork's
-    own events; approval grants ([0018](0018-approvals-in-the-chat.adr)) are never restored
+    own rule: the chat and `/log` show the conversation; `/usage thread` on a fork counts
+    only the fork's own events, and `/usage today|all` count every event once, in the
+    thread that recorded it; approval grants ([0018](0018-approvals-in-the-chat.adr)) are never restored
     from inherited events, so a fork starts with none.
   - **Native sessions are pinned at the fork point**, because the parent's session keeps
     moving if the parent is resumed and used before the child's first turn:

@@ -68,9 +68,9 @@ worktree is kept in step with the writer's checkout, and cleanup.
 - **The writer lock is unchanged** ([0012](0012-checkout-writer-lock.adr)): it guards the
   checkout; worktrees need no lock because only their own agent uses them, one turn at a
   time.
-- Consequences: what escapes a non-writer's flags and writes relative to its folder no
-  longer reaches the writer's files (absolute paths and the shared `.git` still can, see
-  the top); it is also the base for giving agents writable turns in their own worktree later
+- Consequences: what escapes a non-writer's flags and writes to a path that resolves
+  inside its mirror no longer reaches the writer's files (absolute paths, symlinks copied
+  into the mirror that point out of it, and the shared `.git` still can, see the top); it is also the base for giving agents writable turns in their own worktree later
   ([0017](0017-writer-edits-from-any-message.adr)). Costs: disk (one checkout copy per agent, plus its build
   output), a sync step before each turn, and agents can't use ignored local files.
 

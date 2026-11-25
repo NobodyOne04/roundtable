@@ -18,9 +18,12 @@ decides who writes the summary, what it contains and what changes after.
      summarizer's window, with the instruction: summarize for a colleague who takes over
      (goal, decisions, state of the work, open questions, files touched, next step), plus
      `note`. The summarizer may never have received parts of that log (other models'
-     exchanges), so before anything is sent the chat names both sides and what is new to
-     the summarizer, and asks: `claude summarizes for codex; claude has not seen 12
-     messages (llama, codex) — send them to claude? y/n`. No unseen messages: no question.
+     exchanges, their tool lines, errors), so before anything is sent the chat names both
+     sides and what is new to the summarizer, and asks: `claude summarizes for codex;
+     claude has not seen 12 entries (llama, codex) — send them to claude? y/n`. "Unseen" is
+     checked against the exact rendered text being sent, entry by entry (message, tool
+     line, error): any entry that did not come from or go to the summarizer counts. No
+     unseen entry: no question.
   2. **Dispatch.** The summary goes to `<id>` as `handoff from <summarizer>: <summary>`
      plus the note; `<id>` replies with what it understood and its first step. Only the
      summary crosses to `<id>`'s provider, never other participants' raw replies.
