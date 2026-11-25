@@ -22,7 +22,9 @@ const CONTEXT_WIDTH: u16 = 30;
 /// The input box's most rows of text; a longer input shows its last rows.
 const INPUT_MAX_ROWS: usize = 8;
 
-pub fn draw(frame: &mut Frame, app: &App) {
+/// Draws the screen; returns how many lines the chat is shown scrolled up from its newest
+/// line, after clamping and following the selection, so paging can start from there.
+pub fn draw(frame: &mut Frame, app: &App) -> u16 {
     // The input wraps to the box and grows with its rows, up to a few; past that it shows
     // the last ones, where the cursor is. The box spans the whole width, inside its border.
     let input_lines = input_lines(&app.input, frame.area().width.saturating_sub(2) as usize);
@@ -58,7 +60,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if threads_w > 0 {
         draw_threads(frame, app, threads_area);
     }
-    draw_chat(frame, app, chat_area);
+    let shown_scroll = draw_chat(frame, app, chat_area);
     if context_w > 0 {
         draw_context(frame, app, context_area);
     }
@@ -138,6 +140,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             input_area.y + 1 + row,
         ));
     }
+    shown_scroll
 }
 
 /// `"> " + input`, hard-wrapped to `width` columns by display width, so the cursor lands
@@ -176,7 +179,7 @@ fn focused(block: Block<'static>, focus: bool) -> Block<'static> {
     }
 }
 
-fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_chat(frame: &mut Frame, app: &App, area: Rect) -> u16 {
     let text = if app.lines.is_empty() {
         let hint = if app.default_is_everyone() {
             "Nothing at the table yet. Type to everyone, start with @<id> for one, or /help."
@@ -238,6 +241,7 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
         app.focus == Focus::Chat,
     ));
     frame.render_widget(chat, area);
+    bottom - top
 }
 
 fn draw_threads(frame: &mut Frame, app: &App, area: Rect) {
@@ -290,16 +294,19 @@ fn draw_context(frame: &mut Frame, app: &App, area: Rect) {
             .and_then(|l| roundtable::limits::blocked_until(l, now))
             .map(|until| {
                 let local = |s: i64| (s + crate::utc_offset_s()).max(0) as u64 * 1000;
+                // Its own row: the pane is 28 columns inside, too narrow beside the state.
                 format!(
-                    " limited until {}",
+                    "  limited until {}",
                     roundtable::limits::when(local(until), local(now as i64 / 1000))
                 )
             });
         rows.push(Line::from(vec![
             Span::styled(r.id.clone(), name),
             Span::styled(format!(" {}", r.state), state),
-            Span::styled(limited.unwrap_or_default(), Style::new().fg(Color::Yellow)),
         ]));
+        if let Some(limited) = limited {
+            rows.push(Line::styled(limited, Style::new().fg(Color::Yellow)));
+        }
         // A bar only when the fill is knowable (ADR 0009); `?` for CLI agents.
         let fill = match r.fill {
             Some(f) => format!("{} ~{:.0}%", bar(f, 8), f * 100.0),

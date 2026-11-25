@@ -15,14 +15,16 @@ pub struct Window {
     pub used_percent: f64,
     /// Unix seconds.
     pub resets_at: i64,
+    /// The CLI says this window blocks it now, whatever the percentage (Claude's
+    /// `status: rejected`). Full windows block too: see `blocked_until`.
+    #[serde(default)]
+    pub blocked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Limits {
     pub five_hour: Option<Window>,
     pub weekly: Option<Window>,
-    /// The CLI says it is blocked now (not just near the limit).
-    pub limited: bool,
     /// Unix milliseconds when the CLI reported these.
     pub seen_at: u64,
     /// The destination that reported them (the participant's identity, ADR 0011): a
@@ -39,13 +41,11 @@ pub fn from_claude(event: &Value, seen_at: u64) -> Option<Limits> {
         Some(Window {
             used_percent: w.get("utilization")?.as_f64()? * 100.0,
             resets_at: w.get("resetsAt")?.as_i64()?,
+            blocked: w
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.starts_with("allowed")),
         })
-    };
-    let blocked = |name: &str| {
-        windows
-            .pointer(&format!("/{name}/status"))
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.starts_with("allowed"))
     };
     let (five_hour, weekly) = (window("five_hour"), window("seven_day"));
     // An event without usable windows says nothing: keep the last good reading.
@@ -55,7 +55,6 @@ pub fn from_claude(event: &Value, seen_at: u64) -> Option<Limits> {
     Some(Limits {
         five_hour,
         weekly,
-        limited: blocked("five_hour") || blocked("seven_day"),
         seen_at,
         identity: None,
     })
@@ -75,10 +74,10 @@ pub fn from_codex_session(text: &str) -> Option<Limits> {
         let mut out = Limits {
             five_hour: None,
             weekly: None,
-            limited: !limits["rate_limit_reached_type"].is_null(),
             seen_at,
             identity: None,
         };
+        let reached = !limits["rate_limit_reached_type"].is_null();
         for key in ["primary", "secondary"] {
             let w = &limits[key];
             let (Some(used), Some(resets), Some(minutes)) = (
@@ -88,9 +87,12 @@ pub fn from_codex_session(text: &str) -> Option<Limits> {
             ) else {
                 continue;
             };
+            // Codex leaves `rate_limit_reached_type` empty even at 100% (0.172.0), and when
+            // set it doesn't say which window: then a full window is the blocking one.
             let window = Some(Window {
                 used_percent: used,
                 resets_at: resets,
+                blocked: reached && used >= 100.0,
             });
             match minutes {
                 300 => out.five_hour = window,
@@ -98,11 +100,6 @@ pub fn from_codex_session(text: &str) -> Option<Limits> {
                 _ => {}
             }
         }
-        // Codex leaves `rate_limit_reached_type` empty even at 100% (seen with 0.172.0).
-        out.limited |= [out.five_hour, out.weekly]
-            .iter()
-            .flatten()
-            .any(|w| w.used_percent >= 100.0);
         (out.five_hour.is_some() || out.weekly.is_some()).then_some(out)
     })
 }
@@ -139,7 +136,7 @@ pub fn blocked_until(l: &Limits, now_ms: u64) -> Option<i64> {
     [l.five_hour, l.weekly]
         .into_iter()
         .flatten()
-        .filter(|w| w.used_percent >= 100.0 && w.resets_at * 1000 > now_ms as i64)
+        .filter(|w| (w.blocked || w.used_percent >= 100.0) && w.resets_at * 1000 > now_ms as i64)
         .map(|w| w.resets_at)
         .max()
 }
@@ -207,16 +204,8 @@ pub fn report(
             .into_iter()
             .flatten()
             .collect();
-        // Only while it still holds: a full window that hasn't reset, or the CLI's own
-        // flag with no window reset since it was seen.
-        let active: Vec<Window> = [l.five_hour, l.weekly]
-            .into_iter()
-            .flatten()
-            .filter(|w| w.resets_at * 1000 > now_ms as i64)
-            .collect();
-        let all_active = active.len() == [l.five_hour, l.weekly].iter().flatten().count();
-        let limited = if active.iter().any(|w| w.used_percent >= 100.0) || (l.limited && all_active)
-        {
+        // Only while it still holds: one rule with the context pane (`blocked_until`).
+        let limited = if blocked_until(l, now_ms).is_some() {
             "  LIMITED"
         } else {
             ""
@@ -279,9 +268,15 @@ mod tests {
         assert_eq!(l.five_hour.unwrap().resets_at, 1795644000);
         assert!((l.five_hour.unwrap().used_percent - 82.0).abs() < 1e-9);
         assert!((l.weekly.unwrap().used_percent - 32.0).abs() < 1e-9);
-        assert!(!l.limited);
-        let blocked = json!({"rate_limit_info":{"unifiedWindows":{"five_hour":{"utilization":1.0,"resetsAt":1,"status":"rejected"}}}});
-        assert!(from_claude(&blocked, NOW).unwrap().limited);
+        assert_eq!(blocked_until(&l, NOW), None);
+        // Rejected below 100%: blocked all the same, until that window resets.
+        let blocked = json!({"rate_limit_info":{"unifiedWindows":{"five_hour":{"utilization":0.9,"resetsAt":1795641000,"status":"rejected"}}}});
+        let l = from_claude(&blocked, NOW).unwrap();
+        assert_eq!(blocked_until(&l, NOW), Some(1795641000));
+        assert!(
+            report(&["claude"], &BTreeMap::from([("claude".into(), l)]), NOW, 0)
+                .contains("LIMITED")
+        );
         assert_eq!(from_claude(&json!({"type":"rate_limit_event"}), NOW), None);
         let empty = json!({"rate_limit_info":{"unifiedWindows":{}}});
         assert_eq!(
@@ -318,14 +313,15 @@ mod tests {
             l.five_hour,
             Some(Window {
                 used_percent: 86.0,
-                resets_at: 1795640349
+                resets_at: 1795640349,
+                blocked: false,
             })
         );
         assert_eq!(l.weekly.unwrap().used_percent, 66.0);
-        assert!(!l.limited);
+        assert_eq!(blocked_until(&l, NOW), None);
         let full = line(json!({"used_percent":100.0,"window_minutes":300,"resets_at":1}));
         assert!(
-            from_codex_session(&full).unwrap().limited,
+            blocked_until(&from_codex_session(&full).unwrap(), 0).is_some(),
             "100% is limited"
         );
         assert_eq!(from_codex_session("{}\nnot json"), None);
@@ -341,7 +337,7 @@ mod tests {
         let l = from_claude(&claude, NOW).unwrap();
         assert!((l.five_hour.unwrap().used_percent - 33.0).abs() < 1e-9);
         assert_eq!(l.weekly.unwrap().resets_at, 1_796_137_200);
-        assert!(!l.limited);
+        assert_eq!(blocked_until(&l, NOW), None);
         let l = from_codex_session(include_str!(
             "../tests/fixtures/codex-0.172.0-session-tail.jsonl"
         ))
@@ -372,9 +368,9 @@ mod tests {
             five_hour: Some(Window {
                 used_percent: 100.0,
                 resets_at,
+                blocked: false,
             }),
             weekly: None,
-            limited: true,
             seen_at: 0,
             identity: None,
         };
@@ -407,12 +403,13 @@ mod tests {
                 five_hour: Some(Window {
                     used_percent: 82.0,
                     resets_at: 1_795_644_000,
+                    blocked: false,
                 }),
                 weekly: Some(Window {
                     used_percent: 32.0,
                     resets_at: 1_796_029_200,
+                    blocked: false,
                 }),
-                limited: false,
                 seen_at: NOW - 60_000,
                 identity: None,
             },
@@ -423,9 +420,9 @@ mod tests {
                 five_hour: Some(Window {
                     used_percent: 100.0,
                     resets_at: 1_795_630_000, // already past
+                    blocked: false,
                 }),
                 weekly: None,
-                limited: true,
                 seen_at: NOW - 3_600_000,
                 identity: None,
             },
@@ -441,6 +438,7 @@ mod tests {
         limits.get_mut("codex").unwrap().five_hour = Some(Window {
             used_percent: 100.0,
             resets_at: 1_795_641_000,
+            blocked: false,
         });
         let report = report(&["codex"], &limits, NOW, 0);
         assert!(

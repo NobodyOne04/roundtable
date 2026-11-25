@@ -22,6 +22,8 @@ pub enum Event {
     Paste(String),
     /// The terminal's new width: below `WIDE` the side panes are hidden.
     Resize(u16),
+    /// The chat's scroll as last drawn (clamped, following the selection), from the loop.
+    Viewport(u16),
     /// Redraw throttle: at most one draw per tick.
     Tick,
     /// The terminal input stream ended or failed; nothing more can be typed.
@@ -490,11 +492,17 @@ impl App {
             self.dirty = false;
             return vec![Effect::Redraw];
         }
+        // Where the chat was actually shown: paging starts from there. Not a change to draw.
+        if let Event::Viewport(shown) = event {
+            self.scroll = shown;
+            return vec![];
+        }
         self.dirty = true;
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.key(key),
             Event::Resize(width) => {
                 self.width = width;
+                self.leave_hidden_pane();
                 vec![]
             }
             Event::Paste(text) => {
@@ -507,6 +515,7 @@ impl App {
             | Event::Tick
             | Event::RegistryFileChanged
             | Event::EditorClosed(_)
+            | Event::Viewport(_)
             | Event::KeyResolved { .. }
             | Event::AskIncoming { .. } => vec![],
             Event::InputClosed(reason) => {
@@ -582,6 +591,7 @@ impl App {
         match key.code {
             KeyCode::Char('b') if ctrl => {
                 self.show_threads = !self.show_threads;
+                self.leave_hidden_pane();
                 return vec![];
             }
             KeyCode::Char('k') if ctrl => {
@@ -612,6 +622,12 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.input.pop();
+                // Erasing the command's `/` abandons it: the draft put aside comes back.
+                if self.input.is_empty()
+                    && let Some(draft) = self.stashed_draft.take()
+                {
+                    self.input = draft;
+                }
                 vec![]
             }
             // Alt-Enter everywhere, Shift-Enter where the terminal reports it: a new line.
@@ -626,6 +642,12 @@ impl App {
             KeyCode::Enter => self.submit(),
             // To Normal mode; running replies are cancelled as `Esc` always did.
             KeyCode::Esc => {
+                // Leaving an untouched command line abandons it: the draft comes back.
+                if self.input == "/"
+                    && let Some(draft) = self.stashed_draft.take()
+                {
+                    self.input = draft;
+                }
                 self.focus = Focus::Chat;
                 self.select_last();
                 self.cancel_all()
@@ -663,6 +685,13 @@ impl App {
         };
         if self.focus == Focus::Chat && self.selected_line.is_none() {
             self.select_last();
+        }
+    }
+
+    /// Focus never stays on a pane that is not on screen: keys would act on it unseen.
+    fn leave_hidden_pane(&mut self) {
+        if self.focus == Focus::Threads && !self.threads_visible() {
+            self.focus = Focus::Chat;
         }
     }
 
@@ -709,9 +738,7 @@ impl App {
             (_, KeyCode::Char('q')) => {
                 self.show_threads = false;
                 self.show_context = false;
-                if self.focus == Focus::Threads {
-                    self.focus = Focus::Chat;
-                }
+                self.leave_hidden_pane();
                 self.quit_armed = true;
                 self.push("roundtable", "q again to quit".into(), LineKind::Info);
             }
@@ -1594,7 +1621,9 @@ impl App {
         if prompt.is_empty() {
             return Err("nothing to send".into());
         }
-        if targets.is_empty() {
+        // The default only for a message without mentions: an `@all` that reaches nobody
+        // must not fall back to it.
+        if mentions == 0 {
             match self.registry.default() {
                 // Everyone by default: the same broadcast as `@all`, read-only for all.
                 Some("all") => {
@@ -3602,8 +3631,8 @@ mod tests {
             weekly: Some(crate::limits::Window {
                 used_percent: 66.0,
                 resets_at: 1,
+                blocked: false,
             }),
-            limited: false,
             seen_at,
             identity: None,
         };
@@ -3722,6 +3751,20 @@ mod tests {
         );
         assert_eq!(app.input, "hello");
         assert!(last_text(&app).contains("nobody at the table"));
+        // `@all` with a named default: still nobody, never the default.
+        let mut app = App::default();
+        for id in ["claude", "codex"] {
+            app.checks.insert(id.into(), Err("not installed".into()));
+        }
+        for c in "@all hi".chars() {
+            app.update(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let effects = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Record { .. })),
+            "{effects:?}"
+        );
+        assert_eq!(app.input, "@all hi");
     }
 
     #[test]
@@ -3743,6 +3786,9 @@ mod tests {
         app.update(key(KeyCode::Esc, KeyModifiers::NONE));
         app.update(key(KeyCode::Char('h'), KeyModifiers::NONE));
         assert_eq!(app.focus, Focus::Threads);
+        // Shrinking while the pane has the focus moves it to the chat.
+        app.update(Event::Resize(80));
+        assert_eq!(app.focus, Focus::Chat);
     }
 
     #[test]
@@ -3765,6 +3811,16 @@ mod tests {
             "ran /help, sent nothing"
         );
         assert_eq!(app.input, "half a thought", "the draft is back");
+        // Abandoned by erasing the `/`: back at once, and never overwritten by a second `:`.
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        app.update(key(KeyCode::Char(':'), KeyModifiers::NONE));
+        app.update(key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.input, "half a thought");
+        // Abandoned with Esc on the bare `/`.
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        app.update(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.input, "half a thought");
     }
 
     #[test]

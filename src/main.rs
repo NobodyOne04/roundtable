@@ -234,10 +234,13 @@ fn log_dir(root: &Path) -> PathBuf {
     std::env::temp_dir().join(format!("roundtable-log-{id}"))
 }
 
-/// The `/log` files of data folder `root`.
+/// The `/log` files of data folder `root`; none unless the folder is verified ours.
 fn log_files(root: &Path) -> impl Iterator<Item = PathBuf> {
-    fs::read_dir(log_dir(root))
+    let dir = log_dir(root);
+    let ours = transcript::owned_private_dir(&dir).is_ok();
+    ours.then(|| fs::read_dir(dir))
         .into_iter()
+        .flatten()
         .flatten()
         .flatten()
         .map(|entry| entry.path())
@@ -680,8 +683,7 @@ impl Runtime {
         }
         let text = roundtable::log::render(&thread.meta.title, &events, utc_offset_s());
         let dir = log_dir(&self.data_root);
-        // private_dir sets 0700, which fails on a folder another user owns: never shared.
-        transcript::private_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        transcript::owned_private_dir(&dir).with_context(|| format!("using {}", dir.display()))?;
         let path = dir.join(format!("{}.md", ulid::Ulid::generate()));
         let mut file = OpenOptions::new()
             .write(true)
@@ -843,7 +845,11 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             match effect {
                 Effect::Redraw if editing.is_some() => {}
                 Effect::Redraw => {
-                    terminal.draw(|frame| ui::draw(frame, &app))?;
+                    let mut shown = app.scroll;
+                    terminal.draw(|frame| shown = ui::draw(frame, &app))?;
+                    if shown != app.scroll {
+                        local.push_back(Event::Viewport(shown));
+                    }
                 }
                 Effect::Copy(text) => {
                     use crossterm::clipboard::CopyToClipboard;
@@ -1136,8 +1142,7 @@ fn ask_socket_path(root: &Path) -> Result<PathBuf> {
     // SAFETY: getuid has no preconditions and cannot fail.
     let uid = unsafe { libc::getuid() };
     let dir = std::env::temp_dir().join(format!("roundtable-{uid}"));
-    // private_dir sets 0700, which fails on a folder another user owns: never shared.
-    transcript::private_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    transcript::owned_private_dir(&dir).with_context(|| format!("using {}", dir.display()))?;
     let path = dir.join("ask.sock");
     anyhow::ensure!(
         path.as_os_str().len() < MAX,
@@ -1398,33 +1403,48 @@ mod tests {
             app.note(format!("line {n}"), false);
         }
         let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
-        app.update(key(KeyCode::Esc));
-        let title = |app: &App| {
-            let screen = render(app, 60, 16);
-            screen.buffer().content[..60]
+        // Draws as the loop does, feeding back where the chat was shown; returns the title.
+        let draw = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+            let mut shown = 0;
+            terminal.draw(|frame| shown = ui::draw(frame, app)).unwrap();
+            app.update(Event::Viewport(shown));
+            terminal.backend().buffer().content[..60]
                 .iter()
                 .map(|c| c.symbol())
                 .collect::<String>()
         };
-        assert!(!title(&app).contains("scrolled up"), "{}", title(&app));
+        app.update(key(KeyCode::Esc));
+        assert!(!draw(&mut app).contains("scrolled up"));
         app.update(key(KeyCode::PageUp));
-        assert!(
-            title(&app).contains("scrolled up 10 lines"),
-            "{}",
-            title(&app)
-        );
+        assert!(draw(&mut app).contains("scrolled up 10 lines"));
         app.update(Event::Key(KeyEvent::new(
             KeyCode::Char('u'),
             KeyModifiers::CONTROL,
         )));
-        assert!(
-            title(&app).contains("scrolled up 20 lines"),
-            "{}",
-            title(&app)
-        );
+        assert!(draw(&mut app).contains("scrolled up 20 lines"));
         // Moving the selection brings it back into view.
         app.update(key(KeyCode::Char('G')));
-        assert!(!title(&app).contains("scrolled up"), "{}", title(&app));
+        assert!(!draw(&mut app).contains("scrolled up"));
+        // The selection above the view, then PgUp: further up, never back down.
+        for _ in 0..25 {
+            app.update(key(KeyCode::Char('k')));
+        }
+        let before = draw(&mut app);
+        let up = |t: &str| {
+            t.split("scrolled up ")
+                .nth(1)
+                .and_then(|r| r.split(' ').next()?.parse::<u16>().ok())
+                .unwrap_or(0)
+        };
+        app.update(key(KeyCode::PageUp));
+        assert!(up(&draw(&mut app)) > up(&before), "{before}");
+        // At the top after gg, PgDn comes down at once.
+        app.update(key(KeyCode::Char('g')));
+        app.update(key(KeyCode::Char('g')));
+        let top = up(&draw(&mut app));
+        app.update(key(KeyCode::PageDown));
+        assert_eq!(up(&draw(&mut app)), top - 10);
     }
 
     #[test]
@@ -1528,7 +1548,11 @@ mod tests {
 
     fn render(app: &App, width: u16, height: u16) -> TestBackend {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, app);
+            })
+            .unwrap();
         terminal.backend().clone()
     }
 
@@ -1688,7 +1712,11 @@ mod tests {
     /// The screen and where the cursor ended up.
     fn render_with_cursor(app: &App, width: u16, height: u16) -> (TestBackend, (u16, u16)) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, app);
+            })
+            .unwrap();
         let cursor = terminal.get_cursor_position().unwrap();
         (terminal.backend().clone(), (cursor.x, cursor.y))
     }
