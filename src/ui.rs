@@ -9,19 +9,22 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use roundtable::agent::Outcome;
 use roundtable::app::{App, ChatLine, Focus, LineKind};
 
 /// Side panes only where the chat keeps at least 60 columns (ADR 0009).
-const WIDE: u16 = 100;
+use roundtable::app::WIDE;
 const THREADS_WIDTH: u16 = 26;
 const CONTEXT_WIDTH: u16 = 30;
 /// The input box's most rows of text; a longer input shows its last rows.
 const INPUT_MAX_ROWS: usize = 8;
 
-pub fn draw(frame: &mut Frame, app: &App) {
+/// Draws the screen; returns how many lines the chat is shown scrolled up from its newest
+/// line, after clamping and following the selection, so paging can start from there.
+pub fn draw(frame: &mut Frame, app: &App) -> usize {
     // The input wraps to the box and grows with its rows, up to a few; past that it shows
     // the last ones, where the cursor is. The box spans the whole width, inside its border.
     let input_lines = input_lines(&app.input, frame.area().width.saturating_sub(2) as usize);
@@ -57,7 +60,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if threads_w > 0 {
         draw_threads(frame, app, threads_area);
     }
-    draw_chat(frame, app, chat_area);
+    let shown_scroll = draw_chat(frame, app, chat_area);
     if context_w > 0 {
         draw_context(frame, app, context_area);
     }
@@ -116,7 +119,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         // Plan windows at 80% or more (ADR 0014); the clock is read here, not in `App`.
         Span::styled(
             roundtable::limits::warnings(
-                &app.limits,
+                &app.shown_limits(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis() as u64),
@@ -137,6 +140,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             input_area.y + 1 + row,
         ));
     }
+    shown_scroll
 }
 
 /// `"> " + input`, hard-wrapped to `width` columns by display width, so the cursor lands
@@ -148,13 +152,14 @@ fn input_lines(input: &str, width: usize) -> Vec<String> {
     for line in format!("> {input}").split('\n') {
         let mut row = String::new();
         let mut used = 0;
-        for c in line.chars() {
-            let w = c.width().unwrap_or(0);
+        // By grapheme, as the terminal draws them: `👩‍💻` is one two-column cell pair.
+        for g in line.graphemes(true) {
+            let w = g.width();
             if used + w > width && !row.is_empty() {
                 rows.push(std::mem::take(&mut row));
                 used = 0;
             }
-            row.push(c);
+            row.push_str(g);
             used += w;
         }
         rows.push(row);
@@ -174,7 +179,64 @@ fn focused(block: Block<'static>, focus: bool) -> Block<'static> {
     }
 }
 
-fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_chat(frame: &mut Frame, app: &App, area: Rect) -> usize {
+    let width = area.width.saturating_sub(2);
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let selected = (app.focus == Focus::Chat)
+        .then_some(app.selected_line)
+        .flatten();
+    // Every rendered line with its wrapped row count, measured once; `entry_start[i]` is the
+    // index of entry `i`'s first line. Rows are `usize`: a long thread, or one huge entry,
+    // can pass `u16::MAX` wrapped rows, more than the widget's own offset can address.
+    let mut lines: Vec<(Line, usize)> = Vec::new();
+    let mut entry_start = Vec::with_capacity(app.lines.len() + 1);
+    for (i, line) in app.lines.iter().enumerate() {
+        entry_start.push(lines.len());
+        for l in chat_lines(line, selected == Some(i))
+            .into_iter()
+            .flat_map(|l| split_tall(l, width))
+        {
+            let rows = Paragraph::new(l.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(width);
+            lines.push((l, rows));
+        }
+    }
+    entry_start.push(lines.len());
+    // `row_start[k]`: the row line `k` begins at; the last item is the total.
+    let mut row_start = Vec::with_capacity(lines.len() + 1);
+    row_start.push(0usize);
+    for (_, rows) in &lines {
+        row_start.push(row_start.last().unwrap() + rows);
+    }
+    let total = *row_start.last().unwrap();
+    // Keep the newest lines in view unless scrolled back (PgUp).
+    let bottom = total.saturating_sub(inner_height);
+    let mut top = bottom.saturating_sub(app.scroll);
+    // In Normal mode the selected line stays in view (j/k move it, ADR 0015).
+    if let Some(i) = (app.focus == Focus::Chat && app.follow_selection)
+        .then_some(app.selected_line)
+        .flatten()
+        .filter(|&i| i < app.lines.len())
+    {
+        let (start, end) = (row_start[entry_start[i]], row_start[entry_start[i + 1]]);
+        if start < top {
+            top = start;
+        } else if end > top + inner_height {
+            top = end.saturating_sub(inner_height).min(start);
+        }
+    }
+    let top = top.min(bottom);
+    let scrolled = bottom - top;
+    let title = if scrolled > 0 {
+        format!(" roundtable · scrolled up {scrolled} lines (PgDn) ")
+    } else {
+        " roundtable ".to_string()
+    };
+    // The widget gets the rendered lines from the one holding row `top` on, and an offset
+    // into that line only: under `u16::MAX` unless a single line wraps that far.
+    let first = row_start.partition_point(|&r| r <= top).saturating_sub(1);
+    let offset = u16::try_from(top - row_start[first.min(lines.len())]).unwrap_or(u16::MAX);
     let text = if app.lines.is_empty() {
         let hint = if app.default_is_everyone() {
             "Nothing at the table yet. Type to everyone, start with @<id> for one, or /help."
@@ -183,59 +245,48 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
         };
         Text::styled(hint, Style::new().add_modifier(Modifier::DIM))
     } else {
-        let selected = (app.focus == Focus::Chat)
-            .then_some(app.selected_line)
-            .flatten();
         Text::from(
-            app.lines
-                .iter()
-                .enumerate()
-                .flat_map(|(i, line)| chat_lines(line, selected == Some(i)))
+            lines
+                .into_iter()
+                .skip(first)
+                .map(|(l, _)| l)
                 .collect::<Vec<_>>(),
         )
     };
-    // Keep the newest lines in view unless scrolled back (PgUp). Measured before the
-    // border is added: `line_count` counts border rows too.
-    let chat = Paragraph::new(text).wrap(Wrap { trim: false });
-    let inner_height = area.height.saturating_sub(2);
-    let total = chat.line_count(area.width.saturating_sub(2)) as u16;
-    let bottom = total.saturating_sub(inner_height);
-    let mut top = bottom.saturating_sub(app.scroll);
-    // In Normal mode the selected line stays in view (j/k move it, ADR 0015).
-    if let Some(i) = (app.focus == Focus::Chat)
-        .then_some(app.selected_line)
-        .flatten()
-        .filter(|&i| i < app.lines.len())
-    {
-        let width = area.width.saturating_sub(2);
-        let rows = |lines: &[roundtable::app::ChatLine]| {
-            let text: Vec<Line> = lines
-                .iter()
-                .enumerate()
-                .flat_map(|(j, l)| chat_lines(l, j == i))
-                .collect();
-            Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .line_count(width) as u16
-        };
-        let start = rows(&app.lines[..i]);
-        let end = rows(&app.lines[..=i]);
-        if start < top {
-            top = start;
-        } else if end > top + inner_height {
-            top = end.saturating_sub(inner_height).min(start);
-        }
-    }
-    let title = if top < bottom {
-        format!(" roundtable · scrolled up {} lines (PgDn) ", bottom - top)
-    } else {
-        " roundtable ".to_string()
-    };
-    let chat = chat.scroll((top, 0)).block(focused(
-        Block::bordered().title(title),
-        app.focus == Focus::Chat,
-    ));
+    let chat = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .scroll((offset, 0))
+        .block(focused(
+            Block::bordered().title(title),
+            app.focus == Focus::Chat,
+        ));
     frame.render_widget(chat, area);
+    scrolled
+}
+
+/// A line that would wrap to more than `TALL` rows, cut into lines of at most `TALL` rows'
+/// worth of text, so the widget's `u16` offset never has to reach into one line further
+/// than that. Wrapping at the cuts may differ slightly from the uncut line, and the pieces
+/// keep the line's style, not each span's: only for text this long.
+fn split_tall(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    const TALL: usize = 1024;
+    let per_piece = (width.max(1) as usize) * TALL;
+    if line.width() <= per_piece {
+        return vec![line];
+    }
+    let (style, text) = (line.style, line.to_string());
+    let mut pieces = vec![];
+    let (mut piece, mut used) = (String::new(), 0);
+    for g in text.graphemes(true) {
+        if used + g.width() > per_piece {
+            pieces.push(Line::styled(std::mem::take(&mut piece), style));
+            used = 0;
+        }
+        piece.push_str(g);
+        used += g.width();
+    }
+    pieces.push(Line::styled(piece, style));
+    pieces
 }
 
 fn draw_threads(frame: &mut Frame, app: &App, area: Rect) {
@@ -262,12 +313,22 @@ fn draw_threads(frame: &mut Frame, app: &App, area: Rect) {
             })
             .collect()
     };
+    // The picked thread stays in view (`G` in a long list): rows before it are skipped as
+    // `usize`, never squeezed into the widget's `u16` offset.
+    let inner = area.height.saturating_sub(2) as usize;
+    let top = (app.thread_pick + 1).saturating_sub(inner);
+    let rows: Vec<Line> = rows.into_iter().skip(top).collect();
     let block = focused(Block::bordered().title(" threads "), focus);
     frame.render_widget(Paragraph::new(rows).block(block), area);
 }
 
 fn draw_context(frame: &mut Frame, app: &App, area: Rect) {
     let mut rows = vec![];
+    // Once per draw, not per row.
+    let limits = app.shown_limits();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
     for r in app.context_rows() {
         let name = Style::new().fg(colour(&r.id)).add_modifier(Modifier::BOLD);
         let state = Style::new().add_modifier(if r.state == "streaming" {
@@ -275,10 +336,29 @@ fn draw_context(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             Modifier::DIM
         });
+        // A full plan window blocks the CLI until it resets (ADR 0014).
+        let limited = limits
+            .get(&r.id)
+            .and_then(|l| roundtable::limits::blocked_until(l, now))
+            .map(|until| {
+                let local = |s: i64| roundtable::limits::local_ms(s, crate::utc_offset_at);
+                roundtable::limits::when(local(until), local(now as i64 / 1000))
+            });
         rows.push(Line::from(vec![
             Span::styled(r.id.clone(), name),
             Span::styled(format!(" {}", r.state), state),
         ]));
+        // Own rows: the pane is 28 columns inside. A date (a week away) doesn't fit beside
+        // the label, so it goes on the next row.
+        if let Some(when) = limited {
+            let yellow = Style::new().fg(Color::Yellow);
+            if when.len() <= 9 {
+                rows.push(Line::styled(format!("  limited until {when}"), yellow));
+            } else {
+                rows.push(Line::styled("  limited until", yellow));
+                rows.push(Line::styled(format!("    {when}"), yellow));
+            }
+        }
         // A bar only when the fill is knowable (ADR 0009); `?` for CLI agents.
         let fill = match r.fill {
             Some(f) => format!("{} ~{:.0}%", bar(f, 8), f * 100.0),
@@ -507,6 +587,8 @@ mod tests {
         assert_eq!(input_lines("ab\n", 10), ["> ab", ""]);
         // Wide characters take two columns and never split across rows.
         assert_eq!(input_lines("日本語です", 7), ["> 日本", "語です"]);
+        // A joined emoji is one grapheme: it moves to the next row whole.
+        assert_eq!(input_lines("abc👩‍💻", 6), ["> abc", "👩‍💻"]);
         // A width of zero still makes progress.
         assert_eq!(input_lines("ab", 0).len(), 5);
     }

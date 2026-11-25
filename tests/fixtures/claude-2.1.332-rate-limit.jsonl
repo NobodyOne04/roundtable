@@ -1,0 +1,1 @@
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1796137200,"rateLimitType":"seven_day","utilization":0.38,"unifiedWindows":{"five_hour":{"utilization":0.33,"resetsAt":1795638000,"status":"allowed"},"seven_day":{"utilization":0.38,"resetsAt":1796137200,"status":"allowed"}}}}

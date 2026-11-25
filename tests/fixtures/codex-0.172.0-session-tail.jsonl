@@ -1,0 +1,2 @@
+{"timestamp":"2026-11-25T15:44:09.100Z","ordinal":75,"type":"event_msg","payload":{"type":"agent_message","message":"[redacted]"}}
+{"timestamp":"2026-11-25T15:44:10.509Z","ordinal":76,"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":15.0,"window_minutes":300,"resets_at":1795639330},"secondary":{"used_percent":70.0,"window_minutes":10080,"resets_at":1795965214},"rate_limit_reached_type":null}}}

@@ -24,7 +24,7 @@ use tracing_subscriber::EnvFilter;
 use notify_debouncer_mini::notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, DebouncedEventBatch, new_debouncer};
 use roundtable::agent::{self, AskBridge, Outcome, PEvent, Turn};
-use roundtable::app::{App, Checks, EditLock, Effect, Event, FileEdit, Link, TestTarget};
+use roundtable::app::{App, Checks, EditLock, Effect, Event, FileEdit, Link, TestTarget, WIDE};
 use roundtable::mcp::{self, AskAnswer};
 use roundtable::openai;
 use roundtable::registry::{self, Adapter, Registry};
@@ -77,6 +77,11 @@ async fn start() -> Result<()> {
     init_logging(&root)?;
     // Before the terminal is taken over, so "already running" prints plainly.
     let store = Store::open(&root)?;
+    // `/log` files left by a crash (ADR 0024): only this data folder's own, and only now
+    // that its instance lock is held, so no running roundtable still has one open.
+    for file in log_files(&root) {
+        let _ = fs::remove_file(file);
+    }
     let cwd = std::env::current_dir().context("reading the current directory")?;
 
     let models_path = config_root()?.join("models.toml");
@@ -94,6 +99,7 @@ async fn start() -> Result<()> {
         store,
         thread: None,
         keys: HashMap::new(),
+        viewing: None,
         sessions: BTreeMap::new(),
         turns: HashMap::new(),
         checkout,
@@ -147,11 +153,6 @@ async fn start() -> Result<()> {
         );
     }
 
-    // A `/log` file left by a crash (ADR 0024). shortcut: a second roundtable with another
-    // data folder would lose its open log file too; scope the name if that happens.
-    for file in log_files() {
-        let _ = fs::remove_file(file);
-    }
     // Enters raw mode and the alternate screen, and installs a panic hook that restores the
     // terminal first, so a crash never leaves the user's shell broken.
     let terminal = ratatui::init();
@@ -192,31 +193,98 @@ fn enter_screen() -> Result<()> {
     Ok(())
 }
 
-/// Runs `/log`'s editor on `file` and waits (ADR 0024). `Err` says why it failed.
+/// While held, roundtable ignores SIGINT and SIGQUIT, as `system(3)` does: out of raw mode
+/// Ctrl-C reaches the whole foreground group, and an interrupt meant for the editor (e.g.
+/// `code --wait`) must not kill roundtable. Held from before leaving the screen until after
+/// taking it back, so no moment of the hand-over is exposed.
+struct InterruptGuard {
+    int: libc::sighandler_t,
+    quit: libc::sighandler_t,
+}
+
+impl InterruptGuard {
+    fn hold() -> Self {
+        // SAFETY: `signal` only swaps dispositions; `Drop` puts the old ones back.
+        unsafe {
+            InterruptGuard {
+                int: libc::signal(libc::SIGINT, libc::SIG_IGN),
+                quit: libc::signal(libc::SIGQUIT, libc::SIG_IGN),
+            }
+        }
+    }
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        // SAFETY: as in `hold`.
+        unsafe {
+            libc::signal(libc::SIGINT, self.int);
+            libc::signal(libc::SIGQUIT, self.quit);
+        }
+    }
+}
+
+/// Runs `/log`'s editor on `file` and waits (ADR 0024). `Err` says why it failed. Call it
+/// with an `InterruptGuard` held.
 fn run_editor(editor: &[String], file: &Path) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
     let (program, args) = editor.split_first().ok_or("no editor set")?;
-    match std::process::Command::new(program)
-        .args(args)
-        .arg(file)
-        .status()
-    {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args).arg(file);
+    // The caller ignores interrupts (`InterruptGuard`); the editor gets the defaults back.
+    // SAFETY: between fork and exec `signal` is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    match cmd.status() {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(format!("/log: editor `{program}` exited with {status}")),
         Err(err) => Err(format!("/log: editor `{program}`: {err}")),
     }
 }
 
-/// `/log` temp files: `roundtable-<ulid>.md` in the system temp folder.
-fn log_files() -> impl Iterator<Item = PathBuf> {
-    fs::read_dir(std::env::temp_dir())
+/// The owner-only folder in the system temp dir that holds `/log` files of the data folder
+/// `root` (ADR 0024): one per data folder, so instances never touch each other's files.
+fn log_dir(root: &Path) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    // The data folder itself, as the instance lock sees it (device and inode), so any
+    // spelling of its path (a symlink, `XDG_DATA_HOME`) names the same log folder. A path
+    // that doesn't exist yet falls back to its raw bytes (`display()` would be lossy).
+    let key = match fs::metadata(root) {
+        Ok(meta) => format!("dev{}ino{}", meta.dev(), meta.ino()),
+        Err(_) => root
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    };
+    let id = roundtable::registry::fingerprint(&key);
+    std::env::temp_dir().join(format!("roundtable-log-{id}"))
+}
+
+/// The `/log` files of data folder `root`; none unless the folder is verified ours.
+fn log_files(root: &Path) -> impl Iterator<Item = PathBuf> {
+    let dir = log_dir(root);
+    let ours = transcript::owned_private_dir(&dir).is_ok();
+    ours.then(|| fs::read_dir(dir))
         .into_iter()
         .flatten()
         .flatten()
+        .flatten()
         .map(|entry| entry.path())
+        // Only names roundtable makes, `<ULID>.md`: a copy the owner saved there stays.
         .filter(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("roundtable-") && n.ends_with(".md"))
+            path.extension().is_some_and(|e| e == "md")
+                && path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.len() == 26 && ulid::Ulid::from_string(s).is_ok())
         })
 }
 
@@ -226,13 +294,14 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// The local time zone's offset from UTC now, in seconds.
-fn utc_offset_s() -> i64 {
+/// The local time zone's offset from UTC at Unix second `at`, in seconds: its own, so a
+/// time after a daylight-saving change is shown right.
+pub fn utc_offset_at(at: i64) -> i64 {
     // SAFETY: `localtime_r` only writes into the `tm` we pass; a null result leaves it zeroed.
     unsafe {
-        let now = libc::time(std::ptr::null_mut());
+        let at = at as libc::time_t;
         let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&now, &mut tm);
+        libc::localtime_r(&at, &mut tm);
         tm.tm_gmtoff
     }
 }
@@ -255,6 +324,8 @@ struct Runtime {
     store: Store,
     /// Opened on the first message, so starting and quitting leaves no empty thread.
     thread: Option<Thread>,
+    /// A thread resumed from another checkout: shown and readable (`/log`), never written.
+    viewing: Option<Thread>,
     /// `App`'s `Link` keys to the `seq` they were written at, for the open thread only.
     keys: HashMap<u64, u64>,
     /// Native sessions by `id/identity`, so a new destination never resumes an old session.
@@ -318,6 +389,7 @@ impl Runtime {
                 let thread = self.store.create_thread(&title, &self.checkout)?;
                 self.threads_changed = true;
                 tracing::info!(thread = %thread.meta.id, "thread opened");
+                self.viewing = None;
                 self.thread.insert(thread)
             }
         };
@@ -609,7 +681,13 @@ impl Runtime {
         self.sessions = sessions.clone();
         // Further messages go into this thread (ADR 0010); nothing is sent into one from
         // another checkout, so it is not opened for writing then.
-        self.thread = elsewhere.is_none().then_some(thread);
+        if elsewhere.is_none() {
+            self.thread = Some(thread);
+            self.viewing = None;
+        } else {
+            self.thread = None;
+            self.viewing = Some(thread);
+        }
         self.keys.clear();
         Event::Resumed {
             title: meta.title.clone(),
@@ -637,18 +715,18 @@ impl Runtime {
 
     /// `/log` (ADR 0024): the open thread as Markdown in a new owner-only temp file;
     /// `None` when there is no message to log yet.
-    // shortcut: a thread resumed from another checkout is not open here, so it logs as
-    // empty; keep its id for `/log` if that gets used.
     fn write_log(&self) -> Result<Option<PathBuf>> {
-        let Some(thread) = &self.thread else {
+        let Some(thread) = self.thread.as_ref().or(self.viewing.as_ref()) else {
             return Ok(None);
         };
         let events = thread.events()?;
         if !events.iter().any(|e| e.kind == transcript::Kind::Msg) {
             return Ok(None);
         }
-        let text = roundtable::log::render(&thread.meta.title, &events, utc_offset_s());
-        let path = std::env::temp_dir().join(format!("roundtable-{}.md", ulid::Ulid::generate()));
+        let text = roundtable::log::render(&thread.meta.title, &events, utc_offset_at);
+        let dir = log_dir(&self.data_root);
+        transcript::owned_private_dir(&dir).with_context(|| format!("using {}", dir.display()))?;
+        let path = dir.join(format!("{}.md", ulid::Ulid::generate()));
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -715,18 +793,23 @@ impl Runtime {
 
 async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+    // Events the loop raises itself: handled before the channel, never dropped (a full
+    // channel must not lose, say, the `Done` of a turn that never started). The first is
+    // the start width: the pane layout and `h`/`Tab` depend on it.
+    let mut local: VecDeque<Event> = VecDeque::new();
+    local.push_back(Event::Resize(terminal.size().map_or(WIDE, |s| s.width)));
     let mut input = tokio::spawn(read_terminal(tx.clone()));
-    // `/log`'s temp file while its editor has the terminal (ADR 0024): no drawing then.
-    let mut editing: Option<PathBuf> = None;
+    // `/log`'s temp file while its editor has the terminal (ADR 0024): no drawing then. The
+    // guard keeps interrupts away from roundtable for the whole hand-over.
+    let mut editing: Option<(PathBuf, InterruptGuard)> = None;
     tokio::spawn(tick(tx.clone()));
     // Held for the whole run: dropping it stops the watch.
     let _watcher = watch_registry(&rt.models_path, tx.clone())?;
     listen_for_asks(&rt.ask_socket, tx.clone())?;
 
     let mut quit_by: Option<tokio::time::Instant> = None;
-    // Events the loop raises itself: handled before the channel, never dropped (a full
-    // channel must not lose, say, the `Done` of a turn that never started).
-    let mut local: VecDeque<Event> = VecDeque::new();
+    // The last tick's time: a plan window resetting since then needs a redraw (ADR 0014).
+    let mut last_tick = now_ms();
     loop {
         let deadline = quit_by.unwrap_or_else(tokio::time::Instant::now);
         let event = if let Some(event) = local.pop_front() {
@@ -743,18 +826,29 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             }
             }
         };
+        if let Event::Tick = event {
+            let now = now_ms();
+            // Through the local queue, as every event the loop raises; drawn next tick.
+            if roundtable::limits::resets_between(&app.shown_limits(), last_tick, now) {
+                local.push_back(Event::Clock);
+            }
+            last_tick = now;
+        }
         let event = match event {
             Event::EditorClosed(failure) => {
-                if let Some(path) = editing.take() {
+                let guard = editing.take().map(|(path, guard)| {
                     let _ = fs::remove_file(path);
-                }
+                    guard
+                });
                 enter_screen()?;
                 terminal.clear()?;
+                drop(guard);
                 input = tokio::spawn(read_terminal(tx.clone()));
-                match failure {
-                    Some(why) => Event::Notice(why),
-                    None => Event::Resize,
+                // The terminal may have been resized meanwhile: refresh the width either way.
+                if let Some(why) = failure {
+                    local.push_back(Event::Notice(why));
                 }
+                Event::Resize(terminal.size().map_or(WIDE, |s| s.width))
             }
             Event::RegistryFileChanged => match rt.reload_registry() {
                 Some(result) => Event::Registry(result),
@@ -807,7 +901,11 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
             match effect {
                 Effect::Redraw if editing.is_some() => {}
                 Effect::Redraw => {
-                    terminal.draw(|frame| ui::draw(frame, &app))?;
+                    let mut shown = app.scroll;
+                    terminal.draw(|frame| shown = ui::draw(frame, &app))?;
+                    if shown != app.scroll {
+                        local.push_back(Event::Viewport(shown));
+                    }
                 }
                 Effect::Copy(text) => {
                     use crossterm::clipboard::CopyToClipboard;
@@ -828,6 +926,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     Err(err) => local.push_back(Event::Notice(format!("/log: {err:#}"))),
                     Ok(Some(path)) => {
                         // The editor gets the keyboard: stop reading it, then leave the screen.
+                        let guard = InterruptGuard::hold();
                         input.abort();
                         let _ = (&mut input).await;
                         leave_screen()?;
@@ -836,7 +935,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                             let failure = run_editor(&editor, &file).err();
                             let _ = tx.blocking_send(Event::EditorClosed(failure));
                         });
-                        editing = Some(path);
+                        editing = Some((path, guard));
                     }
                 },
                 Effect::Quit => {
@@ -937,13 +1036,18 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                 Effect::NewThread => {
                     // The next message opens a new thread; native sessions start over.
                     rt.thread = None;
+                    rt.viewing = None;
                     rt.sessions.clear();
                 }
                 Effect::Usage(scope) => {
                     let agents = app.cli_agents();
                     let agents: Vec<&str> = agents.iter().map(String::as_str).collect();
-                    let limits =
-                        roundtable::limits::report(&agents, &app.limits, now_ms(), utc_offset_s());
+                    let limits = roundtable::limits::report(
+                        &agents,
+                        &app.shown_limits(),
+                        now_ms(),
+                        utc_offset_at,
+                    );
                     let usage = rt.usage_report(&scope);
                     local.push_back(Event::Report(format!("{limits}\n{usage}")));
                 }
@@ -1095,8 +1199,7 @@ fn ask_socket_path(root: &Path) -> Result<PathBuf> {
     // SAFETY: getuid has no preconditions and cannot fail.
     let uid = unsafe { libc::getuid() };
     let dir = std::env::temp_dir().join(format!("roundtable-{uid}"));
-    // private_dir sets 0700, which fails on a folder another user owns: never shared.
-    transcript::private_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    transcript::owned_private_dir(&dir).with_context(|| format!("using {}", dir.display()))?;
     let path = dir.join("ask.sock");
     anyhow::ensure!(
         path.as_os_str().len() < MAX,
@@ -1198,7 +1301,7 @@ async fn read_terminal(tx: mpsc::Sender<Event>) {
         let event = match input.next().await {
             Some(Ok(TermEvent::Key(key))) => Event::Key(key),
             Some(Ok(TermEvent::Paste(text))) => Event::Paste(text),
-            Some(Ok(TermEvent::Resize(..))) => Event::Resize,
+            Some(Ok(TermEvent::Resize(width, _))) => Event::Resize(width),
             Some(Ok(_)) => continue,
             Some(Err(err)) => break err.to_string(),
             None => break "end of input".to_string(),
@@ -1298,6 +1401,7 @@ mod tests {
             store: Store::open(root).unwrap(),
             thread: None,
             keys: HashMap::new(),
+            viewing: None,
             sessions: BTreeMap::new(),
             turns: HashMap::new(),
             cwd: root.into(),
@@ -1318,6 +1422,219 @@ mod tests {
             models_hash: None,
             checked: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn log_reads_a_thread_resumed_from_another_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let mut rt = runtime(dir.path());
+        let mut thread = rt.store.create_thread("elsewhere", other.path()).unwrap();
+        let mut app = App::default();
+        for code in [KeyCode::Char('h'), KeyCode::Char('i'), KeyCode::Enter] {
+            for effect in app.update(Event::Key(KeyEvent::new(code, KeyModifiers::NONE))) {
+                if let Effect::Record { event, durable, .. } = effect {
+                    thread.append(event, durable).unwrap();
+                }
+            }
+        }
+        drop(thread);
+        assert!(matches!(
+            rt.resume(Some("1")),
+            Event::Resumed {
+                elsewhere: Some(_),
+                ..
+            }
+        ));
+        assert!(rt.thread.is_none(), "never opened for writing");
+        let path = rt.write_log().unwrap().expect("the shown thread is logged");
+        let text = fs::read_to_string(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(text.starts_with("# elsewhere · "), "{text}");
+    }
+
+    #[test]
+    fn paging_moves_the_view_even_with_a_line_selected() {
+        let mut app = App::default();
+        for n in 0..40 {
+            app.note(format!("line {n}"), false);
+        }
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        // Draws as the loop does, feeding back where the chat was shown; returns the title.
+        let draw = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+            let mut shown = 0;
+            terminal.draw(|frame| shown = ui::draw(frame, app)).unwrap();
+            app.update(Event::Viewport(shown));
+            terminal.backend().buffer().content[..60]
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+        app.update(key(KeyCode::Esc));
+        assert!(!draw(&mut app).contains("scrolled up"));
+        app.update(key(KeyCode::PageUp));
+        assert!(draw(&mut app).contains("scrolled up 10 lines"));
+        app.update(Event::Key(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(draw(&mut app).contains("scrolled up 20 lines"));
+        // Moving the selection brings it back into view.
+        app.update(key(KeyCode::Char('G')));
+        assert!(!draw(&mut app).contains("scrolled up"));
+        // The selection above the view, then PgUp: further up, never back down.
+        for _ in 0..25 {
+            app.update(key(KeyCode::Char('k')));
+        }
+        let before = draw(&mut app);
+        let up = |t: &str| {
+            t.split("scrolled up ")
+                .nth(1)
+                .and_then(|r| r.split(' ').next()?.parse::<u16>().ok())
+                .unwrap_or(0)
+        };
+        app.update(key(KeyCode::PageUp));
+        assert!(up(&draw(&mut app)) > up(&before), "{before}");
+        // gg then PgDn before any redraw: the PgDn is not lost.
+        app.update(key(KeyCode::Char('g')));
+        app.update(key(KeyCode::Char('g')));
+        app.update(key(KeyCode::PageDown));
+        let top = up(&draw(&mut app));
+        assert!(top > 0, "drawn once: at the top");
+        assert_eq!(
+            up(&draw(&mut app)),
+            top - 10,
+            "the PgDn is applied once the top is known"
+        );
+        app.update(key(KeyCode::Char('G')));
+        draw(&mut app);
+        // At the top after gg, PgDn comes down at once.
+        app.update(key(KeyCode::Char('g')));
+        app.update(key(KeyCode::Char('g')));
+        let top = up(&draw(&mut app));
+        app.update(key(KeyCode::PageDown));
+        assert_eq!(up(&draw(&mut app)), top - 10);
+    }
+
+    #[test]
+    fn log_folders_differ_for_paths_that_differ_only_in_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let a = Path::new(std::ffi::OsStr::from_bytes(b"/data/\xff"));
+        let b = Path::new(std::ffi::OsStr::from_bytes(b"/data/\xfe"));
+        assert_eq!(
+            a.display().to_string(),
+            b.display().to_string(),
+            "lossy alike"
+        );
+        assert_ne!(log_dir(a), log_dir(b));
+    }
+
+    #[test]
+    fn a_chat_longer_than_u16_rows_still_shows_its_newest_line() {
+        let mut app = App::default();
+        for n in 0..70_000 {
+            app.note(format!("line {n}"), false);
+        }
+        app.update(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        app.update(Event::Key(KeyEvent::new(
+            KeyCode::Char('G'),
+            KeyModifiers::NONE,
+        )));
+        let screen = render(&app, 60, 12);
+        let text: String = screen.buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("line 69999"), "the newest line is on screen");
+        assert!(!text.contains("scrolled up"));
+        // From the very top, PgDn moves ten rows, not thousands.
+        let mut shown = 0;
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        app.update(key(KeyCode::Char('g')));
+        app.update(key(KeyCode::Char('g')));
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|frame| shown = ui::draw(frame, &app))
+            .unwrap();
+        app.update(Event::Viewport(shown));
+        app.update(key(KeyCode::PageDown));
+        terminal
+            .draw(|frame| shown = ui::draw(frame, &app))
+            .unwrap();
+        let top_row: String = terminal.backend().buffer().content[60..120]
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(top_row.contains("line 10 "), "{top_row}");
+        // One entry alone past u16::MAX rows: its last line still shows at the bottom.
+        let mut app = App::default();
+        let huge: Vec<String> = (0..70_000).map(|n| format!("row {n}")).collect();
+        app.note(huge.join("\n"), false);
+        let screen = render(&app, 60, 12);
+        let text: String = screen.buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(
+            text.contains("row 69999"),
+            "the end of the huge entry is on screen"
+        );
+    }
+
+    #[test]
+    fn g_shows_the_end_of_a_last_reply_taller_than_the_pane() {
+        let mut app = App::default();
+        app.note("first".into(), false);
+        let tall: Vec<String> = (0..50).map(|n| format!("row {n}")).collect();
+        app.note(tall.join("\n"), false);
+        let key = |c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        app.update(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        app.update(key('k'));
+        app.update(key('G'));
+        let screen = render(&app, 60, 12);
+        let text: String = screen.buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("row 49"), "the reply's end, not its start");
+        assert!(!text.contains("scrolled up"));
+    }
+
+    #[test]
+    fn one_unbroken_line_past_u16_rows_shows_its_end() {
+        let mut app = App::default();
+        app.note(format!("{}END", "a".repeat(58 * 70_000)), false);
+        let screen = render(&app, 60, 12);
+        let text: String = screen.buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("END"));
+    }
+
+    #[test]
+    fn g_in_a_huge_thread_list_shows_the_picked_thread() {
+        let mut app = App::default();
+        app.update(Event::Threads(
+            (0..70_000)
+                .map(|n| roundtable::app::ThreadRow {
+                    id: format!("{n}"),
+                    title: format!("thread {n}"),
+                    day: "2026-11-25".into(),
+                    elsewhere: false,
+                })
+                .collect(),
+        ));
+        app.update(Event::Resize(130));
+        let key = |c| Event::Key(KeyEvent::new(c, KeyModifiers::NONE));
+        app.update(key(KeyCode::Esc));
+        app.update(key(KeyCode::Char('h')));
+        app.update(key(KeyCode::Char('G')));
+        let screen = render(&app, 130, 14);
+        let text: String = screen.buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("thread 69999"));
+    }
+
+    #[test]
+    fn an_interrupt_meant_for_the_editor_does_not_kill_roundtable() {
+        let file = Path::new("/dev/null");
+        let sh = |script: &str| vec!["sh".to_string(), "-c".into(), script.into()];
+        // The "editor" interrupts roundtable (its parent): ignored while the guard is held.
+        let guard = InterruptGuard::hold();
+        assert_eq!(run_editor(&sh("kill -INT $PPID; exit 0"), file), Ok(()));
+        // The editor itself still gets the default action.
+        let err = run_editor(&sh("kill -INT $$; sleep 5"), file).unwrap_err();
+        assert!(err.contains("exited with"), "{err}");
+        drop(guard);
     }
 
     #[test]
@@ -1346,7 +1663,22 @@ mod tests {
         assert!(text.starts_with("# hi · "), "{text}");
         assert!(text.contains("\n\nhi\n"), "{text}");
         assert_eq!(mode, 0o600);
-        assert!(log_files().all(|f| f != path));
+        assert!(path.starts_with(log_dir(dir.path())));
+        // Something the owner saved beside it is never treated as a snapshot.
+        let notes = log_dir(dir.path()).join("notes.md");
+        fs::write(&notes, "mine").unwrap();
+        assert!(log_files(dir.path()).all(|f| f != notes));
+        fs::remove_file(&notes).unwrap();
+        // Another spelling of the same data folder (a symlink) names the same log folder.
+        let link = tempfile::tempdir().unwrap();
+        let alias = link.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+        assert_eq!(log_dir(&alias), log_dir(dir.path()));
+        assert!(log_files(dir.path()).all(|f| f != path));
+        assert!(
+            log_files(Path::new("/elsewhere")).all(|f| !f.starts_with(log_dir(dir.path()))),
+            "another data folder's files are never listed"
+        );
     }
 
     #[test]
@@ -1405,7 +1737,11 @@ mod tests {
 
     fn render(app: &App, width: u16, height: u16) -> TestBackend {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, app);
+            })
+            .unwrap();
         terminal.backend().clone()
     }
 
@@ -1565,7 +1901,11 @@ mod tests {
     /// The screen and where the cursor ended up.
     fn render_with_cursor(app: &App, width: u16, height: u16) -> (TestBackend, (u16, u16)) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, app);
+            })
+            .unwrap();
         let cursor = terminal.get_cursor_position().unwrap();
         (terminal.backend().clone(), (cursor.x, cursor.y))
     }

@@ -31,23 +31,15 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
 - Review the ADR 0005 PR (`feature/adr-0005-free-models`): its last commits (loop-wide key
   redaction in `Runtime::redact_output`, `StreamRedactor`, SSE event assembly, unknown
   usage) landed after your two reviews; the third was skipped (usage limit).
-- Review the input/default PR (`minor/input-wrap-default-all`), skipped (owner asked to go on
-  without Codex): input wrapping and bracketed paste in `src/ui.rs`/`src/main.rs`, and
-  `default = "all"` routing in `src/app.rs`/`src/registry.rs` (must stay read-only).
-- Review the `turn`/`parent` fix (`bug/event-turn-parent`, your deferred finding), skipped
-  (Codex paused by the owner): `Link` keys in `App`, resolved to `seq` in `Runtime::record`.
-- Critique the proposed ADRs 0014-0024 (0013 rejected) (`docs/proposed-adrs-0013-0023`), skipped (Codex paused
-  by the owner); before each is implemented at the latest.
-- Review the `/log` PR (`feature/adr-0024-log`), skipped (Codex paused by the owner):
-  especially the terminal hand-over in `run` (input task aborted, `leave_screen`/`enter_screen`).
-- Review the vim keys PR (`feature/adr-0015-vim-keys`), skipped (Codex paused by the owner):
-  `App::normal_key`, the selection-follows-scroll in `ui::draw_chat`, OSC 52 copy.
-- Review the plan limits PR (`feature/adr-0014-usage-limits`), skipped (Codex paused by the
-  owner); also confirm `~/.codex/sessions` rollout `token_count.rate_limits` is the right source
-  and whether `exec --json` will ever carry limits.
-- Record a real two-turn Codex fixture (first turn plus `exec resume`):
+- Review `bug/codex-review-fixes` once more from `07a7ec4` (your eighth review's two fixes,
+  `f522785`): the ninth review was skipped (usage limit).
+- Record a real two-turn Codex fixture (first turn plus `exec resume`) for 0.172.0, the
+  installed version (your review of the fixes asked for it; Claude 2.1.332's is in):
   `tests/fixtures/codex-0.171.0-turn1.jsonl` was cut from one turn, and resume was never
   recorded. Sanitize as CLAUDE.md says, and hand it to Claude to commit.
+
+Done 2026-11-25 (later): your review of everything merged in PRs #21-#26 (`09c50da..eac3c13`)
+and your critique of ADRs 0016-0023; the fixes are in `bug/codex-review-fixes`.
 
 Done 2026-11-25: a full-codebase review (every file in `src/`, against the ADRs) replaced the
 per-PR reviews that were skipped during the usage limit; its fixes are in PR #15. The

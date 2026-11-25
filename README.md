@@ -184,8 +184,9 @@ to the new writer waits until the old one is done instead of editing alongside i
 ## Requirements
 
 - macOS or Linux.
-- The agent CLIs, installed and logged in. Tested with Claude Code 2.1.331 and
-  codex-cli 0.171.0; their JSON output changes between versions, so others may misbehave.
+- The agent CLIs, installed and logged in. Tested with Claude Code 2.1.331 and 2.1.332, and
+  codex-cli 0.171.0 (0.172.0 for the plan-limit reader; its two-turn recording is pending).
+  Their JSON output changes between versions, so others may misbehave.
 - Start it inside a git repo; outside one, Codex is unavailable unless you pass
   `--outside-repo`. Codex is also unavailable in a project that has its own
   `.codex/config.toml` (here or in a parent folder): such a config can start MCP servers

@@ -30,6 +30,7 @@ toml_edit = "0.25.20"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "3.0.0"
+unicode-segmentation = "1"
 unicode-width = "0.2"
 
 [dev-dependencies]

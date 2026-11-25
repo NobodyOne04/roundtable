@@ -557,6 +557,30 @@ pub fn private_dir(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, Permissions::from_mode(0o700))
 }
 
+/// A folder in a shared place (the temp dir) that only we can use: created 0700 if missing,
+/// and otherwise accepted only if it is a real directory (not a symlink), ours, and 0700.
+/// In a sticky temp dir nobody else can swap it afterwards.
+pub fn owned_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::symlink_metadata(path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::DirBuilder::new().mode(0o700).create(path)?;
+        }
+        Err(err) => return Err(err),
+        Ok(_) => {}
+    }
+    let meta = fs::symlink_metadata(path)?;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if !meta.file_type().is_dir() || meta.uid() != uid || meta.mode() & 0o777 != 0o700 {
+        return Err(io::Error::other(format!(
+            "{} is not a private folder of this user (a symlink, someone else's, or open to others)",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Writes a small file so readers see either the old or the new content, never a mix.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     // A temp name of its own, created fresh: two writers (e.g. two roundtables sharing
@@ -585,6 +609,33 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_private_dir_refuses_links_and_open_folders() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let fresh = tmp.path().join("fresh");
+        owned_private_dir(&fresh).unwrap();
+        owned_private_dir(&fresh).unwrap();
+        let target = tmp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, Permissions::from_mode(0o700)).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(
+            owned_private_dir(&link).is_err(),
+            "a symlink, even to our folder"
+        );
+        let open = tmp.path().join("open");
+        fs::create_dir(&open).unwrap();
+        fs::set_permissions(&open, Permissions::from_mode(0o755)).unwrap();
+        assert!(owned_private_dir(&open).is_err(), "readable by others");
+        assert_eq!(
+            fs::metadata(&open).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "untouched"
+        );
+    }
     use serde_json::json;
 
     fn user_msg(text: &str) -> NewEvent {

@@ -23,6 +23,9 @@
 - Proposed ADR 0010 (JSONL files as the transcript) and 0011 (hot in-memory model registry)
 
 ### Fixed
+- After Codex's review: `/log` files live in a temp folder of their own per data folder, and only that folder is cleaned at start (before, any `roundtable-*.md` in the temp dir was deleted); Ctrl-C meant for the editor no longer kills roundtable; `/log` works on a thread resumed from another checkout
+- After Codex's review: paging (`PgUp`, `Ctrl-U`) moves the view even with a line selected; `h`/`Tab` skip a threads pane the narrow layout hides; the picked thread stays in view; `/` or `:` in Normal mode puts a half-typed message aside instead of sending it with the command; input wraps by grapheme (joined emoji stay whole); a broadcast nobody can answer keeps the prompt and says so
+- After Codex's review: plan limits belong to the destination that reported them (a repointed, disabled or removed model shows none), use Codex's own sample time, read only the end of Codex's session file, keep the last reading when Claude reports no windows, and show `limited until` in the context pane; parsers tested against recorded CLI lines
 - Transcript events carry `turn` (the user message they descend from) and `parent` (the event that caused them), as ADR 0010 says; they were always empty
 - Long prompts wrap in the input box (up to 8 rows, then the last ones) and the cursor stays in view; a pasted multi-line block goes into the input whole instead of sending at its first line break
 - The `ask` socket falls back to a short owner-only temp folder when the data folder path is too long for a Unix socket (startup failed)
