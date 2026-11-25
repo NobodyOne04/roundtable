@@ -394,10 +394,22 @@ fn approval_request(v: &Value) -> Option<ApprovalRequest> {
     let req = v.get("request")?;
     let tool = req.get("tool_name")?.as_str()?.to_string();
     let input = req.get("input").cloned().unwrap_or(Value::Null);
-    let summary = ["command", "file_path", "path", "url", "pattern"]
+    // The card's text. Shortened commands say so: the owner must know they don't see all
+    // of it (grants match the full input, never this).
+    let full = ["command", "file_path", "path", "url", "pattern"]
         .iter()
         .find_map(|k| input.get(k).and_then(Value::as_str))
-        .map_or_else(|| truncate(&input.to_string(), 200), |s| truncate(s, 200));
+        .map_or_else(|| input.to_string(), str::to_string);
+    let shown = full.chars().count();
+    let summary = if shown > 500 {
+        format!(
+            "{} [truncated: {} more characters; deny unless you know what it is]",
+            truncate(&full, 500),
+            shown - 500
+        )
+    } else {
+        full
+    };
     // Only a rule Claude itself suggests for this very tool.
     let rule = req
         .get("permission_suggestions")
@@ -1132,6 +1144,19 @@ mod tests {
         };
         assert_eq!(request.tool, "Bash");
         assert_eq!(request.summary, "echo done > b.txt");
+        // A long command is marked as shortened on the card.
+        let long = format!(
+            r#"{{"type":"control_request","request_id":"L","request":{{"subtype":"can_use_tool","tool_name":"Bash","input":{{"command":"{}"}}}}}}"#,
+            "x".repeat(600)
+        );
+        let [PEvent::Approval(r)] = &parse(Kind::Claude, &long)[..] else {
+            panic!()
+        };
+        assert!(
+            r.summary.contains("[truncated: 100 more characters"),
+            "{}",
+            r.summary
+        );
         assert_eq!(request.rule.as_deref(), Some("echo done *"));
         // Our answer is exactly what Claude accepted in the recording.
         let ours: Value = serde_json::from_str(&approval_response(
