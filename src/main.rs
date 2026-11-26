@@ -513,8 +513,21 @@ impl Runtime {
             FileEdit::Allow { from, targets } => registry::set_allow(&text, from, targets),
             FileEdit::Budget(n) => registry::set_talk_number(&text, "budget_tokens", *n as i64),
             FileEdit::Turns(n) => registry::set_talk_number(&text, "max_turns", i64::from(*n)),
+            // The whole candidate is validated as any reload is; nothing is written if it
+            // fails (ADR 0022).
+            FileEdit::Add(new) => {
+                return registry::add_model(&text, new)
+                    .and_then(|text| Registry::parse(&text).map(|_| text))
+                    .map_err(|e| format!("{} not added, nothing written: {e}", new.id))
+                    .and_then(|text| self.write_models(text));
+            }
         }
         .map_err(|e| format!("{e} (fix models.toml; the change applies in this session only)"))?;
+        self.write_models(text)
+    }
+
+    /// Writes `models.toml` and remembers its fingerprint, so the watcher skips our write.
+    fn write_models(&mut self, text: String) -> Result<String, String> {
         transcript::write_atomic(&self.models_path, text.as_bytes()).map_err(|e| e.to_string())?;
         self.models_hash = Some(registry::fingerprint(&text));
         Ok(text)
@@ -1217,6 +1230,17 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     };
                     tokio::spawn(openai::run(id, chat, tx.clone(), token));
                 }
+                Effect::ListModels {
+                    wizard,
+                    base_url,
+                    key_ref,
+                } => {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let result = openai::list_models(&base_url, key_ref).await;
+                        let _ = tx.send(Event::ModelList { wizard, result }).await;
+                    });
+                }
                 Effect::Compact {
                     id,
                     base_url,
@@ -1418,7 +1442,11 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         local.push_back(Event::Registry(Registry::parse(&text).map(|registry| {
                             let checks = rt.checks(&registry);
                             (registry, checks)
-                        })))
+                        })));
+                        // After the registry, so the test runs on the new entry.
+                        if let FileEdit::Add(new) = edit {
+                            local.push_back(Event::ModelAdded(new.id));
+                        }
                     }
                     Err(err) => {
                         tracing::error!(%err, "editing models.toml failed");

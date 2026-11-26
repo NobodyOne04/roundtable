@@ -43,6 +43,8 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
   (Codex down, then usage limit): grant matching against shell control syntax, stdin lifecycle.
 - Review the ADR 0021 PR (`feature/adr-0021-compact`), skipped (usage limit): the checkpoint's
   identity binding, `Seat::compaction.at` parallel to `history`, `upto` resolution, chunk budgets.
+- Review the ADR 0022 PR (`feature/adr-0022-model-add`), skipped (usage limit): URL checks
+  before any key, whole-file validation before the write, late `/models` answers after Esc.
 - ADR 0019 (`/fork`) waits for a recorded `codex exec fork` fixture where the parent
   advances after the fork (the owner records Codex fixtures).
 - Review the ADR 0018 PR (`feature/adr-0018-approvals`), skipped (Codex down, owner asked Claude

@@ -66,6 +66,13 @@ pub enum Event {
     Report(String),
     /// `/handoff` (ADR 0020): the open thread as `/log` entries, or why there are none.
     HandoffEntries(Result<Vec<crate::log::Entry>, String>),
+    /// `/model add`'s `GET /models` answered (ADR 0022); `wizard` names the wizard it was for.
+    ModelList {
+        wizard: u64,
+        result: Result<Vec<(String, Option<u64>)>, String>,
+    },
+    /// `/model add` wrote `id` to `models.toml` (the registry was applied just before).
+    ModelAdded(String),
     /// A `/compact` of `id` ended (ADR 0021): the summary, or why it failed. `upto` is the
     /// thread and seq of the last event it covers, as the loop resolved them.
     Compacted {
@@ -157,6 +164,8 @@ pub enum FileEdit {
     },
     Budget(u64),
     Turns(u32),
+    /// `/model add` (ADR 0022): validated with the whole file before it is written.
+    Add(crate::registry::NewModel),
 }
 
 /// What `update` asks the loop to do. The loop executes these; results come back as `Event`s.
@@ -179,6 +188,12 @@ pub enum Effect {
         max_output: u64,
         connect_timeout_s: u64,
         idle_timeout_s: u64,
+    },
+    /// `/model add` (ADR 0022): list the endpoint's models; answered by `ModelList`.
+    ListModels {
+        wizard: u64,
+        base_url: String,
+        key_ref: Option<String>,
     },
     /// `/compact` of an OpenAI-compatible model (ADR 0021): summarize `exchanges` in
     /// chunks, on top of `previous`; answered by `Event::Compacted`.
@@ -529,6 +544,40 @@ enum Stage {
     Dispatch,
 }
 
+/// `/model add` presets (ADR 0022): name, base URL, whether it takes a key.
+const PROVIDERS: [(&str, &str, bool); 3] = [
+    ("ollama", "http://localhost:11434/v1", false),
+    ("lmstudio", "http://localhost:1234/v1", false),
+    ("openrouter", "https://openrouter.ai/api/v1", true),
+];
+
+/// `/model add` in progress (ADR 0022): one question per step in the input box.
+#[derive(Debug, Clone, PartialEq)]
+struct Adding {
+    /// A `/models` answer for another wizard or provider is dropped.
+    wizard: u64,
+    step: AddStep,
+    base_url: String,
+    key: Option<String>,
+    models: Vec<(String, Option<u64>)>,
+    model: String,
+    window: Option<u64>,
+    id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AddStep {
+    Provider,
+    Url,
+    NeedsKey,
+    Key,
+    /// Waiting for `GET /models`.
+    Listing,
+    Model,
+    Id,
+    Window,
+}
+
 /// A CLI agent's window when the registry gives none: what Claude and Codex have today.
 const CLI_WINDOW: u64 = 200_000;
 
@@ -549,6 +598,8 @@ pub struct App {
     read_only: Option<std::path::PathBuf>,
     /// The `/handoff` in progress, if any (ADR 0020): one at a time.
     handoff: Option<Handoff>,
+    /// `/model add` in progress, if any (ADR 0022).
+    adding: Option<Adding>,
     pub focus: Focus,
     /// The terminal width, from `Event::Resize`: the side panes show only from `WIDE` up.
     pub width: u16,
@@ -617,6 +668,7 @@ impl App {
             scroll: 0,
             read_only: None,
             handoff: None,
+            adding: None,
             focus: Focus::Input,
             selected_line: None,
             width: WIDE,
@@ -778,6 +830,15 @@ impl App {
                 vec![]
             }
             Event::HandoffEntries(entries) => self.handoff_entries(entries),
+            Event::ModelList { wizard, result } => self.add_listed(wizard, result),
+            Event::ModelAdded(id) => {
+                self.push(
+                    "roundtable",
+                    format!("added {id} to models.toml"),
+                    LineKind::Info,
+                );
+                self.test_model(&id)
+            }
             Event::Compacted { id, upto, result } => self.compacted(&id, upto, result),
             Event::Report(text) | Event::WorktreesDone { report: text, .. } => {
                 self.push("roundtable", text, LineKind::Info);
@@ -1182,6 +1243,10 @@ impl App {
     fn submit(&mut self) -> Vec<Effect> {
         let mut input = std::mem::take(&mut self.input);
         self.scroll = 0;
+        // A `/model add` question is open: this line answers it (ADR 0022).
+        if self.adding.is_some() {
+            return self.add_answer(input.trim());
+        }
         // A handoff question is open: this line answers it (ADR 0020).
         if matches!(
             self.handoff.as_ref().map(|h| &h.stage),
@@ -1329,28 +1394,8 @@ impl App {
             ["/compact", id] => self.compact(Some(id.trim_start_matches('@'))),
             ["/context"] => self.context(None),
             ["/context", id] => self.context(Some(id)),
-            ["/model", "test", id] => {
-                let Some(p) = self.registry.get(id).cloned() else {
-                    self.push("roundtable", format!("no model `{id}`"), LineKind::Error);
-                    return vec![];
-                };
-                let target = match p.adapter {
-                    Adapter::Cli(kind) => TestTarget::Cli {
-                        kind,
-                        cmd: p.cmd.clone().unwrap_or_else(|| kind.cmd().into()),
-                    },
-                    Adapter::OpenAi => TestTarget::Http {
-                        base_url: p.base_url.clone().unwrap_or_default(),
-                        model: p.model.clone().unwrap_or_default(),
-                        key_ref: p.key.clone(),
-                    },
-                };
-                self.push("roundtable", format!("testing {id}…"), LineKind::Info);
-                vec![Effect::TestModel {
-                    id: id.to_string(),
-                    target,
-                }]
-            }
+            ["/model", "add"] => self.add_start(),
+            ["/model", "test", id] => self.test_model(id),
             ["/talk", "show"] => {
                 let text = self.talk_text();
                 self.push("roundtable", text, LineKind::Info);
@@ -1829,6 +1874,274 @@ impl App {
             status(note),
             Effect::EditRegistry(FileEdit::Default(id.into())),
         ]
+    }
+
+    /// `/model test <id>`: a preflight of a CLI, one tiny request to a free model.
+    fn test_model(&mut self, id: &str) -> Vec<Effect> {
+        let Some(p) = self.registry.get(id).cloned() else {
+            self.push("roundtable", format!("no model `{id}`"), LineKind::Error);
+            return vec![];
+        };
+        let target = match p.adapter {
+            Adapter::Cli(kind) => TestTarget::Cli {
+                kind,
+                cmd: p.cmd.clone().unwrap_or_else(|| kind.cmd().into()),
+            },
+            Adapter::OpenAi => TestTarget::Http {
+                base_url: p.base_url.clone().unwrap_or_default(),
+                model: p.model.clone().unwrap_or_default(),
+                key_ref: p.key.clone(),
+            },
+        };
+        self.push("roundtable", format!("testing {id}…"), LineKind::Info);
+        vec![Effect::TestModel {
+            id: id.to_string(),
+            target,
+        }]
+    }
+
+    /// `/model add` (ADR 0022): a free model, one question at a time; `Esc` aborts.
+    fn add_start(&mut self) -> Vec<Effect> {
+        if self.handoff.is_some() {
+            self.push(
+                "roundtable",
+                "a handoff is under way (Esc cancels it)".into(),
+                LineKind::Error,
+            );
+            return vec![];
+        }
+        let wizard = self.next_key();
+        self.adding = Some(Adding {
+            wizard,
+            step: AddStep::Provider,
+            base_url: String::new(),
+            key: None,
+            models: vec![],
+            model: String::new(),
+            window: None,
+            id: String::new(),
+        });
+        self.add_ask()
+    }
+
+    /// Shows the open step's question (or, for `Listing`, starts the lookup).
+    fn add_ask(&mut self) -> Vec<Effect> {
+        let Some(a) = self.adding.clone() else {
+            return vec![];
+        };
+        let question = match a.step {
+            AddStep::Provider => {
+                "add a model: provider? ollama · lmstudio · openrouter · other (Esc cancels)".into()
+            }
+            AddStep::Url => "base URL? (http(s)://…/v1)".into(),
+            AddStep::NeedsKey => "does it need a key? y/n".into(),
+            AddStep::Key => {
+                "key reference? env:VAR or keyring:<name> (never the key itself)".into()
+            }
+            AddStep::Listing => {
+                self.push(
+                    "roundtable",
+                    format!("asking {}/models…", a.base_url),
+                    LineKind::Info,
+                );
+                return vec![Effect::ListModels {
+                    wizard: a.wizard,
+                    base_url: a.base_url,
+                    key_ref: a.key,
+                }];
+            }
+            AddStep::Model if a.models.is_empty() => "model name?".into(),
+            AddStep::Model => {
+                const SHOWN: usize = 40;
+                let mut rows: Vec<String> = a
+                    .models
+                    .iter()
+                    .take(SHOWN)
+                    .enumerate()
+                    .map(|(n, (name, _))| format!("{}. {name}", n + 1))
+                    .collect();
+                if a.models.len() > SHOWN {
+                    rows.push(format!("…{} more: type the name", a.models.len() - SHOWN));
+                }
+                format!("model? a number or a name\n{}", rows.join("\n"))
+            }
+            AddStep::Id => format!("id? Enter for `{}`", suggest_id(&a.model)),
+            AddStep::Window => "context window in tokens? Enter for 8192".into(),
+        };
+        self.push("roundtable", question, LineKind::Info);
+        vec![]
+    }
+
+    /// One answer to the open `/model add` question.
+    fn add_answer(&mut self, answer: &str) -> Vec<Effect> {
+        let Some(mut a) = self.adding.clone() else {
+            return vec![];
+        };
+        let retry = |app: &mut Self, why: String| {
+            app.push("roundtable", why, LineKind::Error);
+            app.add_ask()
+        };
+        match a.step {
+            AddStep::Provider => match PROVIDERS.iter().find(|(name, ..)| *name == answer) {
+                Some((_, url, keyed)) => {
+                    a.base_url = url.to_string();
+                    a.step = if *keyed {
+                        AddStep::Key
+                    } else {
+                        AddStep::Listing
+                    };
+                }
+                None if answer == "other" => a.step = AddStep::Url,
+                None => return retry(self, format!("`{answer}` is not one of the providers")),
+            },
+            AddStep::Url => {
+                if let Err(why) = crate::registry::check_url(answer, false) {
+                    return retry(self, why);
+                }
+                a.base_url = answer.trim_end_matches('/').to_string();
+                a.step = AddStep::NeedsKey;
+            }
+            AddStep::NeedsKey => match answer {
+                "y" | "yes" => {
+                    // Checked before any key goes near it (ADR 0022 step 2).
+                    if let Err(why) = crate::registry::check_url(&a.base_url, true) {
+                        a.step = AddStep::Url;
+                        self.adding = Some(a);
+                        return retry(self, why);
+                    }
+                    a.step = AddStep::Key;
+                }
+                "n" | "no" => a.step = AddStep::Listing,
+                _ => return retry(self, "y or n".into()),
+            },
+            AddStep::Key => {
+                if let Some(name) = answer.strip_prefix("keyring:").filter(|n| !n.is_empty()) {
+                    let store = if cfg!(target_os = "macos") {
+                        format!("security add-generic-password -s roundtable -a {name} -w")
+                    } else {
+                        format!(
+                            "secret-tool store --label=\"roundtable {name}\" service roundtable username {name} target default"
+                        )
+                    };
+                    self.push(
+                        "roundtable",
+                        format!("store the key outside roundtable, if you haven't: {store}"),
+                        LineKind::Info,
+                    );
+                } else if answer.strip_prefix("env:").is_none_or(str::is_empty) {
+                    return retry(self, "a reference: env:VAR or keyring:<name>".into());
+                }
+                a.key = Some(answer.to_string());
+                a.step = AddStep::Listing;
+            }
+            AddStep::Listing => {
+                self.push(
+                    "roundtable",
+                    "waiting for the model list (Esc cancels)".into(),
+                    LineKind::Error,
+                );
+                return vec![];
+            }
+            AddStep::Model => {
+                let picked = answer
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|n| a.models.get(n))
+                    .cloned();
+                let (name, window) = match picked {
+                    Some(entry) => entry,
+                    None if !answer.is_empty() && !answer.contains(char::is_whitespace) => {
+                        let window = a.models.iter().find(|(n, _)| n == answer).and_then(|e| e.1);
+                        (answer.to_string(), window)
+                    }
+                    None => return retry(self, "a number from the list or a model name".into()),
+                };
+                a.model = name;
+                a.window = window;
+                a.step = AddStep::Id;
+            }
+            AddStep::Id => {
+                let id = match answer {
+                    "" => suggest_id(&a.model),
+                    id => id.to_string(),
+                };
+                if self.registry.get(&id).is_some() {
+                    return retry(self, format!("`{id}` exists already"));
+                }
+                if id.is_empty()
+                    || !id
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                {
+                    return retry(self, "an id is lowercase letters, digits and -".into());
+                }
+                a.id = id;
+                a.step = AddStep::Window;
+                if a.window.is_some() {
+                    return self.add_finish(a);
+                }
+            }
+            AddStep::Window => {
+                let window = match answer {
+                    "" => 8_192,
+                    n => match n.parse::<u64>() {
+                        Ok(n) if n > 0 => n,
+                        _ => return retry(self, "a number of tokens".into()),
+                    },
+                };
+                a.window = Some(window);
+                return self.add_finish(a);
+            }
+        }
+        self.adding = Some(a);
+        self.add_ask()
+    }
+
+    /// `GET /models` answered: the list to pick from, or a typed name if it failed.
+    fn add_listed(
+        &mut self,
+        wizard: u64,
+        result: Result<Vec<(String, Option<u64>)>, String>,
+    ) -> Vec<Effect> {
+        let Some(a) = self
+            .adding
+            .as_mut()
+            .filter(|a| a.wizard == wizard && a.step == AddStep::Listing)
+        else {
+            return vec![]; // cancelled, or a provider since
+        };
+        a.step = AddStep::Model;
+        match result {
+            Ok(models) if !models.is_empty() => a.models = models,
+            Ok(_) => self.push(
+                "roundtable",
+                "the endpoint lists no models".into(),
+                LineKind::Info,
+            ),
+            Err(why) => self.push(
+                "roundtable",
+                format!("couldn't list models: {why}"),
+                LineKind::Error,
+            ),
+        }
+        self.add_ask()
+    }
+
+    /// The last answer: the loop validates the whole file with the entry, writes it, and
+    /// reports `ModelAdded`, which runs `/model test`.
+    fn add_finish(&mut self, a: Adding) -> Vec<Effect> {
+        self.adding = None;
+        self.push("roundtable", format!("adding {}…", a.id), LineKind::Info);
+        vec![Effect::EditRegistry(FileEdit::Add(
+            crate::registry::NewModel {
+                id: a.id,
+                base_url: a.base_url,
+                model: a.model,
+                key: a.key,
+                context_window: a.window,
+            },
+        ))]
     }
 
     /// `/compact [id]` (ADR 0021): summarize a free model's history into a checkpoint;
@@ -2732,6 +3045,13 @@ impl App {
     }
 
     fn cancel_all(&mut self) -> Vec<Effect> {
+        if self.adding.take().is_some() {
+            self.push(
+                "roundtable",
+                "model add cancelled, nothing written".into(),
+                LineKind::Info,
+            );
+        }
         // A handoff not started yet just goes; a running one settles `interrupted` when its
         // turn reports back.
         if self
@@ -3424,6 +3744,21 @@ fn user() -> Party {
         id: "user".into(),
         identity: None,
     }
+}
+
+/// `/model add`'s suggested id (ADR 0022): the model's last path part, lowercase, runs of
+/// anything else as one `-` (`meta/Llama3:8b` → `llama3-8b`).
+fn suggest_id(model: &str) -> String {
+    let base = model.rsplit('/').next().unwrap_or(model).to_lowercase();
+    let mut id = String::new();
+    for c in base.chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            id.push(c);
+        } else if !id.ends_with('-') && !id.is_empty() {
+            id.push('-');
+        }
+    }
+    id.trim_end_matches('-').to_string()
 }
 
 fn router() -> Party {
@@ -4389,6 +4724,163 @@ mod tests {
         assert_eq!(started(&effects), ["claude", "codex"]);
         assert_eq!(chats(&effects).len(), 1);
         assert_eq!(chats(&effects)[0].1.len(), 1, "only the completed exchange");
+    }
+
+    fn listed(app: &mut App, effects: &[Effect], models: Result<Vec<(&str, Option<u64>)>, &str>) {
+        let wizard = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::ListModels { wizard, .. } => Some(*wizard),
+                _ => None,
+            })
+            .expect("a model list request");
+        let result = models
+            .map(|m| m.into_iter().map(|(n, w)| (n.to_string(), w)).collect())
+            .map_err(str::to_string);
+        app.update(Event::ModelList { wizard, result });
+    }
+
+    fn added(effects: &[Effect]) -> crate::registry::NewModel {
+        match effects {
+            [Effect::EditRegistry(FileEdit::Add(new))] => new.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_add_walks_a_local_provider_to_a_validated_write() {
+        let mut app = App::default();
+        reload(&mut app, DEFAULT_FILE);
+        type_line(&mut app, "/model add");
+        assert!(last_text(&app).starts_with("add a model: provider?"));
+        type_line(&mut app, "nope");
+        assert!(
+            last_text(&app).starts_with("add a model: provider?"),
+            "asked again"
+        );
+        let effects = type_line(&mut app, "ollama");
+        assert!(matches!(
+            &effects[..],
+            [Effect::ListModels { base_url, key_ref: None, .. }] if base_url == "http://localhost:11434/v1"
+        ));
+        listed(
+            &mut app,
+            &effects,
+            Ok(vec![("meta/Llama3:8b", None), ("qwen", None)]),
+        );
+        assert!(last_text(&app).contains("1. meta/Llama3:8b\n2. qwen"));
+        type_line(&mut app, "1");
+        assert_eq!(last_text(&app), "id? Enter for `llama3-8b`");
+        type_line(&mut app, "claude");
+        assert_eq!(last_text(&app), "id? Enter for `llama3-8b`");
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| l.text == "`claude` exists already")
+        );
+        type_line(&mut app, "");
+        type_line(&mut app, "x");
+        assert!(
+            last_text(&app).starts_with("context window"),
+            "a number, asked again"
+        );
+        let new = added(&type_line(&mut app, ""));
+        assert_eq!(
+            (
+                new.id.as_str(),
+                new.model.as_str(),
+                new.key.as_deref(),
+                new.context_window
+            ),
+            ("llama3-8b", "meta/Llama3:8b", None, Some(8_192))
+        );
+
+        // Written and applied (the loop sends the registry first): the new entry is tested.
+        reload(
+            &mut app,
+            &crate::registry::add_model(DEFAULT_FILE, &new).unwrap(),
+        );
+        let effects = app.update(Event::ModelAdded("llama3-8b".into()));
+        assert!(matches!(&effects[..], [Effect::TestModel { id, .. }] if id == "llama3-8b"));
+    }
+
+    #[test]
+    fn model_add_takes_key_references_only_and_checks_the_url_first() {
+        let mut app = App::default();
+        reload(&mut app, DEFAULT_FILE);
+        type_line(&mut app, "/model add");
+        type_line(&mut app, "openrouter");
+        type_line(&mut app, "sk-or-v1-secret");
+        assert!(
+            last_text(&app).starts_with("key reference?"),
+            "never the key itself"
+        );
+        let effects = type_line(&mut app, "keyring:openrouter");
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| l.text.contains("-a openrouter -w")
+                    || l.text.contains("username openrouter"))
+        );
+        assert!(matches!(
+            &effects[..],
+            [Effect::ListModels { key_ref: Some(k), .. }] if k == "keyring:openrouter"
+        ));
+        // The provider's window is used; no question for it.
+        listed(
+            &mut app,
+            &effects,
+            Ok(vec![("qwen/qwen3.8-27b", Some(262_144))]),
+        );
+        type_line(&mut app, "qwen/qwen3.8-27b");
+        let new = added(&type_line(&mut app, ""));
+        assert_eq!(
+            (new.id.as_str(), new.context_window),
+            ("qwen3-8-27b", Some(262_144))
+        );
+
+        // `other`: a key over plain http to a remote host is refused before it is asked.
+        type_line(&mut app, "/model add");
+        type_line(&mut app, "other");
+        type_line(&mut app, "ftp://x");
+        assert_eq!(last_text(&app), "base URL? (http(s)://…/v1)");
+        type_line(&mut app, "http://example.com/v1");
+        type_line(&mut app, "y");
+        assert_eq!(last_text(&app), "base URL? (http(s)://…/v1)");
+        assert!(app.lines.iter().any(|l| l.text.contains("cleartext")));
+        type_line(&mut app, "https://example.com/v1/");
+        type_line(&mut app, "y");
+        assert!(last_text(&app).starts_with("key reference?"));
+        let effects = type_line(&mut app, "env:EXAMPLE_KEY");
+        listed(&mut app, &effects, Err("401 Unauthorized"));
+        assert_eq!(last_text(&app), "model name?", "typed when the list fails");
+    }
+
+    #[test]
+    fn esc_aborts_model_add_and_a_late_list_is_dropped() {
+        let mut app = App::default();
+        reload(&mut app, DEFAULT_FILE);
+        type_line(&mut app, "/model add");
+        let effects = type_line(&mut app, "lmstudio");
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(last_text(&app), "model add cancelled, nothing written");
+        let shown = app.lines.len();
+        listed(&mut app, &effects, Ok(vec![("m", None)]));
+        assert_eq!(app.lines.len(), shown, "dropped");
+        app.focus = Focus::Input;
+        assert!(
+            type_line(&mut app, "hello")
+                .iter()
+                .any(|e| matches!(e, Effect::StartTurn { .. }))
+        );
+    }
+
+    #[test]
+    fn ids_are_suggested_from_the_model_name() {
+        assert_eq!(suggest_id("meta/Llama3:8b"), "llama3-8b");
+        assert_eq!(suggest_id("gpt-4o-mini"), "gpt-4o-mini");
+        assert_eq!(suggest_id("qwen/Qwen3.8-27B"), "qwen3-8-27b");
+        assert_eq!(suggest_id("--x__"), "x");
     }
 
     /// The summary a chat start replays (ADR 0021).

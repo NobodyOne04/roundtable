@@ -70,8 +70,8 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/model",
-        args: "enable|disable|use|test <id>",
-        help: "switch a model on or off, make it the default, or ping it",
+        args: "add | enable|disable|use|test <id>",
+        help: "add a free model step by step; switch one on or off, make it the default, or ping it",
     },
     Command {
         name: "/talk",

@@ -33,7 +33,7 @@ Implementation order: see the note under the table.
 Implementation order follows dependencies, not numbers: 0001, 0002, 0010, 0004, 0011,
 0005, 0007, 0008, 0009; 0012 lands with the writer fixes (0010 and 0011 replace earlier numbers that others depend on).
 
-0014, 0015, 0016, 0017, 0018, 0020, 0021 and 0024 are built (0019 waits for a recorded
+0014, 0015, 0016, 0017, 0018, 0020, 0021, 0022 and 0024 are built (0019 waits for a recorded
 Codex `exec fork` fixture). 0016 differs from its text in
 how, not what (found over Codex's reviews): the sync reads the writer's index as a tree
 (`write-tree`/`read-tree`) and copies changed and untracked files instead of applying
