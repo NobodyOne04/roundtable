@@ -516,13 +516,18 @@ impl Runtime {
             // The whole candidate is validated as any reload is; nothing is written if it
             // fails (ADR 0022).
             FileEdit::Add(new) => {
-                let text = registry::add_model(&text, new)
+                return registry::add_model(&text, new)
                     .and_then(|text| Registry::parse(&text).map(|_| text))
-                    .map_err(|e| format!("{} not added: {e}", new.id))?;
-                Ok(text)
+                    .map_err(|e| format!("{} not added, nothing written: {e}", new.id))
+                    .and_then(|text| self.write_models(text));
             }
         }
         .map_err(|e| format!("{e} (fix models.toml; the change applies in this session only)"))?;
+        self.write_models(text)
+    }
+
+    /// Writes `models.toml` and remembers its fingerprint, so the watcher skips our write.
+    fn write_models(&mut self, text: String) -> Result<String, String> {
         transcript::write_atomic(&self.models_path, text.as_bytes()).map_err(|e| e.to_string())?;
         self.models_hash = Some(registry::fingerprint(&text));
         Ok(text)
