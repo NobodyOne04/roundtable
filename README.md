@@ -163,9 +163,14 @@ between input, chat and threads. Under 100 columns the side panes hide.
 reaches it, alone or in a broadcast ([ADR 0017](docs/adr/0017-writer-edits-from-any-message.adr)):
 the chat shows `you → claude (may edit)` or `you → claude, codex (claude may edit)`. Start a
 message with `@all?` and nobody edits. It runs with your own
-setup and the `permission_mode` you give it (`acceptEdits` lets Claude edit without asking;
-unset means a safe explicit default, never what your own CLI config says: Claude
-`default`, which refuses edits it can't ask about, and Codex `workspace-write`). Everyone else
+setup and the `permission_mode` you give it; unset means `acceptEdits` for Claude and
+`workspace-write` for Codex, never what your own CLI config says. Whatever else Claude wants
+to do that needs approval (most shell commands) comes to you as a yellow card in the chat
+([ADR 0018](docs/adr/0018-approvals-in-the-chat.adr)): `Ctrl-A` gives it the keys, then `y`
+allows once, `a` allows Claude's suggested rule (e.g. `Bash(cargo test:*)`) for the rest of
+the thread, `n` denies, `Esc` leaves it waiting. The status line counts waiting cards; every
+decision is logged. Codex has no such channel: `auto_review = true` lets its own reviewer
+approve the writer's escalations (wider than its sandbox, so off by default). Everyone else
 is read-only: plan mode for Claude, the read-only sandbox for Codex, both without your own
 MCP servers, hooks and plugins, and each in its own mirror of the checkout
 (`<data>/worktrees/`): synced before each of its turns (HEAD, uncommitted changes and
@@ -240,7 +245,7 @@ Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
 | 11 | [0015](docs/adr/0015-vim-keys.adr) | Vim keys: Insert and Normal modes | done |
 | 12 | [0014](docs/adr/0014-usage-plan-limits.adr) | `/usage` shows Claude's and Codex's 5-hour and weekly limits; 80%+ in the status line | done |
 | 13 | [0017](docs/adr/0017-writer-edits-from-any-message.adr) | The writer edits from any message; `@all?` keeps everyone read-only | done |
-| 14 | [0018](docs/adr/0018-approvals-in-the-chat.adr) | Tool approvals in the chat | next |
+| 14 | [0018](docs/adr/0018-approvals-in-the-chat.adr) | Tool approvals in the chat; the writer's unset mode is `acceptEdits` | done |
 | 15 | [0016](docs/adr/0016-worktree-per-agent.adr) | A git worktree per read-only agent | done |
 | 16 | [0020](docs/adr/0020-handoff.adr) | `/handoff`: pass the thread to another model | done |
 | 17 | [0019](docs/adr/0019-fork.adr) | `/fork`: branch the thread (waits for a recorded Codex `exec fork` fixture) | |

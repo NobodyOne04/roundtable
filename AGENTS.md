@@ -41,6 +41,8 @@ Codex's `CLAUDE.md` fallback, so it only adds what Codex needs. Global rules:
 - Review the ADR 0020 PR (`feature/adr-0020-handoff`) if it was skipped there.
 - ADR 0019 (`/fork`) waits for a recorded `codex exec fork` fixture where the parent
   advances after the fork (the owner records Codex fixtures).
+- Review the ADR 0018 PR (`feature/adr-0018-approvals`), skipped (Codex down, owner asked Claude
+  to go ahead): the open-stdin runner, `rule_covers`, answers bound to identity, `@all?`.
 - Record a real two-turn Codex fixture (first turn plus `exec resume`) for 0.172.0, the
   installed version (your review of the fixes asked for it; Claude 2.1.332's is in):
   `tests/fixtures/codex-0.171.0-turn1.jsonl` was cut from one turn, and resume was never

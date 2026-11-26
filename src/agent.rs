@@ -65,8 +65,37 @@ pub enum PEvent {
     /// The CLI's plan limits (ADR 0014): Claude reports them in its stream, Codex in its
     /// session file, read when the turn ends.
     Limits(crate::limits::Limits),
+    /// Claude asks before using a tool (ADR 0018, writer turns only): it waits until the
+    /// loop answers `request_id` on its stdin.
+    Approval(ApprovalRequest),
     /// Always the last event of a turn, sent after the process and its group are gone.
     Done(Outcome),
+}
+
+/// One `can_use_tool` request from Claude (recorded with 2.1.332).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalRequest {
+    pub request_id: String,
+    pub tool: String,
+    /// The tool's input, sent back unchanged with an allow.
+    pub input: Value,
+    /// One line for the card: the command, the file, or the input as JSON.
+    pub summary: String,
+    /// Claude's own suggested rule for this tool (`ruleContent`, e.g. `cargo test:*`): what
+    /// "allow for this thread" grants. `None`: only once or deny.
+    pub rule: Option<String>,
+}
+
+/// The `control_response` line that answers an approval request on Claude's stdin.
+pub fn approval_response(request_id: &str, allow: bool, input: &Value, message: &str) -> String {
+    let response = if allow {
+        json!({"behavior": "allow", "updatedInput": input})
+    } else {
+        json!({"behavior": "deny", "message": message})
+    };
+    let line = json!({"type": "control_response", "response": {
+        "subtype": "success", "request_id": request_id, "response": response}});
+    format!("{line}\n")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +139,8 @@ pub struct Turn {
     /// Runs in a mirror (ADR 0016): the CLI gets none of roundtable's git repository
     /// overrides, so its git uses the mirror's own index and objects.
     pub mirror: bool,
+    /// Codex only: `auto_review = true` in the registry (ADR 0018).
+    pub auto_review: bool,
 }
 
 /// What a turn needs to reach roundtable's `ask` tool: the CLI launches `exe mcp`, which
@@ -173,9 +204,17 @@ pub fn command(kind: Kind, turn: &Turn) -> (Command, Vec<u8>) {
             );
             if turn.writable {
                 // The writer runs with the user's own setup, but always with an explicit mode,
-                // so a bypass default in the user's settings can't apply.
-                let mode = turn.permission_mode.as_deref().unwrap_or("default");
-                cmd.args(["--permission-mode", mode]);
+                // so a bypass default in the user's settings can't apply. Unset means
+                // `acceptEdits` (ADR 0018, amending 0004): edits go through, and whatever else
+                // needs approval is asked of roundtable (`--permission-prompt-tool stdio`),
+                // which asks the owner.
+                let mode = turn.permission_mode.as_deref().unwrap_or("acceptEdits");
+                cmd.args([
+                    "--permission-mode",
+                    mode,
+                    "--permission-prompt-tool",
+                    "stdio",
+                ]);
                 if turn.ask.is_some() {
                     cmd.args(["--mcp-config", &servers]);
                 }
@@ -209,6 +248,11 @@ pub fn command(kind: Kind, turn: &Turn) -> (Command, Vec<u8>) {
         }
         Kind::Codex => {
             cmd.arg("exec");
+            // Codex's own reviewer approves escalations (ADR 0018), writer only and opt-in.
+            // Before `resume`: 0.172.0 rejects it after the subcommand.
+            if turn.writable && turn.auto_review {
+                cmd.arg("--approve-for-me");
+            }
             if let Some(session) = &turn.session {
                 cmd.args(["resume", session.as_str()]);
             }
@@ -285,6 +329,13 @@ fn parse_claude(v: &Value) -> Vec<PEvent> {
                 PEvent::Tool(format!("{name} {}", truncate(&input, 80)))
             })
             .collect(),
+        (Some("control_request"), _)
+            if str_at(v, &["request", "subtype"]) == Some("can_use_tool") =>
+        {
+            approval_request(v)
+                .map(|r| vec![PEvent::Approval(r)])
+                .unwrap_or_default()
+        }
         (Some("rate_limit_event"), _) => crate::limits::from_claude(v, now_ms())
             .map(|l| vec![PEvent::Limits(l)])
             .unwrap_or_default(),
@@ -337,6 +388,50 @@ fn parse_codex(v: &Value) -> Vec<PEvent> {
         )],
         _ => vec![],
     }
+}
+
+fn approval_request(v: &Value) -> Option<ApprovalRequest> {
+    let req = v.get("request")?;
+    let tool = req.get("tool_name")?.as_str()?.to_string();
+    let input = req.get("input").cloned().unwrap_or(Value::Null);
+    // The card's text. Shortened commands say so: the owner must know they don't see all
+    // of it (grants match the full input, never this).
+    let full = ["command", "file_path", "path", "url", "pattern"]
+        .iter()
+        .find_map(|k| input.get(k).and_then(Value::as_str))
+        .map_or_else(|| input.to_string(), str::to_string);
+    let shown = full.chars().count();
+    let summary = if shown > 500 {
+        format!(
+            "{} [truncated: {} more characters; deny unless you know what it is]",
+            truncate(&full, 500),
+            shown - 500
+        )
+    } else {
+        full
+    };
+    // Only a rule Claude itself suggests for this very tool.
+    let rule = req
+        .get("permission_suggestions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|s| str_at(s, &["type"]) == Some("addRules"))
+        .flat_map(|s| {
+            s.get("rules")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .find(|r| str_at(r, &["toolName"]) == Some(tool.as_str()))
+        .and_then(|r| str_at(&r, &["ruleContent"]).map(str::to_string));
+    Some(ApprovalRequest {
+        request_id: v.get("request_id")?.as_str()?.to_string(),
+        tool,
+        input,
+        summary,
+        rule,
+    })
 }
 
 fn now_ms() -> u64 {
@@ -428,6 +523,7 @@ pub async fn run(
     turn: Turn,
     tx: mpsc::Sender<Event>,
     cancel: CancellationToken,
+    answers: Option<mpsc::UnboundedReceiver<String>>,
 ) {
     // Checked at every launch, not only at startup: a project config added later would
     // otherwise load into a read-only turn.
@@ -445,7 +541,7 @@ pub async fn run(
         return;
     }
     let (cmd, input) = command(kind, &turn);
-    run_command(id, kind, cmd, input, tx, cancel).await;
+    run_command(id, kind, cmd, input, tx, cancel, answers).await;
 }
 
 /// The runner, separate from `command` so tests can drive it with a fake CLI.
@@ -456,6 +552,8 @@ pub async fn run_command(
     input: Vec<u8>,
     tx: mpsc::Sender<Event>,
     cancel: CancellationToken,
+    // Approval answers to write to stdin (ADR 0018); `None` closes stdin after the prompt.
+    mut answers: Option<mpsc::UnboundedReceiver<String>>,
 ) {
     let emit = |event| {
         let tx = tx.clone();
@@ -482,12 +580,34 @@ pub async fn run_command(
     let pgid = child.id();
     // The prompt is written alongside reading the output, not before it: a CLI that fills
     // its output pipe before reading all of a large prompt would otherwise deadlock.
+    // With approvals, stdin stays open for the answers until Claude's `result` (it would
+    // wait for another message otherwise) or the turn ends.
+    let (close_stdin, mut stdin_closed) = tokio::sync::oneshot::channel::<()>();
+    let mut close_stdin = Some(close_stdin);
     if let Some(mut stdin) = child.stdin.take() {
         let agent = kind.id();
+        let mut answers = answers.take();
         tokio::spawn(async move {
-            // Dropping stdin afterwards closes it: the prompt is complete.
             if let Err(err) = stdin.write_all(&input).await {
                 tracing::warn!(agent, %err, "writing the prompt failed");
+                return;
+            }
+            let Some(answers) = answers.as_mut() else {
+                return; // dropping stdin closes it: the prompt is complete
+            };
+            loop {
+                tokio::select! {
+                    _ = &mut stdin_closed => return,
+                    answer = answers.recv() => match answer {
+                        Some(line) => {
+                            if let Err(err) = stdin.write_all(line.as_bytes()).await {
+                                tracing::warn!(agent, %err, "writing an approval failed");
+                                return;
+                            }
+                        }
+                        None => return,
+                    }
+                }
             }
         });
     }
@@ -502,6 +622,13 @@ pub async fn run_command(
             line = lines.next_line() => match line {
                 Ok(Some(line)) => {
                     for event in parse(kind, &line) {
+                        // Claude's `result` (parsed, never by text: its keys come in any
+                        // order) ends the turn: close stdin or Claude waits for more.
+                        if matches!(event, PEvent::Usage { .. })
+                            && let Some(close) = close_stdin.take()
+                        {
+                            let _ = close.send(());
+                        }
                         if let PEvent::Session(thread) = &event {
                             session = Some(thread.clone());
                         }
@@ -832,6 +959,7 @@ mod tests {
             writable: false,
             permission_mode: Some("acceptEdits".into()),
             ask: None,
+            auto_review: false,
         };
         let args = |kind| {
             let (cmd, _) = command(kind, &turn);
@@ -868,6 +996,7 @@ mod tests {
             writable: true,
             permission_mode: Some("acceptEdits".into()),
             ask: None,
+            auto_review: false,
         };
         let args = |kind, turn: &Turn| {
             let (cmd, _) = command(kind, turn);
@@ -878,7 +1007,11 @@ mod tests {
                 .join(" ")
         };
         let claude = args(Kind::Claude, &turn);
-        assert!(claude.ends_with("--verbose --permission-mode acceptEdits"));
+        assert!(
+            claude.ends_with(
+                "--verbose --permission-mode acceptEdits --permission-prompt-tool stdio"
+            )
+        );
         assert!(!claude.contains("plan") && !claude.contains("--setting-sources"));
         turn.permission_mode = Some("workspace-write".into());
         let codex = args(Kind::Codex, &turn);
@@ -889,7 +1022,23 @@ mod tests {
             r#"exec --json -c sandbox_mode="workspace-write" -"#,
             "unset never falls back to the user's own config"
         );
-        assert!(args(Kind::Claude, &turn).ends_with("--permission-mode default"));
+        // ADR 0018: unset means acceptEdits, and other requests come to roundtable.
+        assert!(
+            args(Kind::Claude, &turn)
+                .ends_with("--permission-mode acceptEdits --permission-prompt-tool stdio")
+        );
+        // Codex's own reviewer, opt-in: before `resume`, never after it.
+        turn.auto_review = true;
+        turn.session = Some("T1".into());
+        assert_eq!(
+            args(Kind::Codex, &turn),
+            r#"exec --approve-for-me resume T1 --json -c sandbox_mode="workspace-write" -"#
+        );
+        turn.writable = false;
+        assert!(
+            !args(Kind::Codex, &turn).contains("--approve-for-me"),
+            "writer only"
+        );
     }
 
     #[test]
@@ -911,6 +1060,7 @@ mod tests {
                 token: "T1".into(),
                 config_file: "/data/mcp/turn.json".into(),
             }),
+            auto_review: false,
         };
         let (cmd, _) = command(Kind::Claude, &turn);
         let args: Vec<String> = cmd
@@ -952,6 +1102,7 @@ mod tests {
             b"prompt".to_vec(),
             tx,
             cancel,
+            None,
         ));
         let mut events = vec![];
         while let Some(Event::Agent(_, event)) = rx.recv().await {
@@ -975,6 +1126,104 @@ mod tests {
                 PEvent::Message("got prompt".into()),
                 PEvent::Done(Outcome::Complete)
             ]
+        );
+    }
+
+    #[test]
+    fn recorded_approval_request_and_answer() {
+        let recorded = include_str!("../tests/fixtures/claude-2.1.332-approval.txt");
+        let line = |prefix: &str| {
+            recorded
+                .lines()
+                .find_map(|l| l.strip_prefix(prefix))
+                .unwrap()
+                .to_string()
+        };
+        let [PEvent::Approval(request)] = &parse(Kind::Claude, &line("< "))[..] else {
+            panic!("{:?}", parse(Kind::Claude, &line("< ")))
+        };
+        assert_eq!(request.tool, "Bash");
+        assert_eq!(request.summary, "echo done > b.txt");
+        // A long command is marked as shortened on the card.
+        let long = format!(
+            r#"{{"type":"control_request","request_id":"L","request":{{"subtype":"can_use_tool","tool_name":"Bash","input":{{"command":"{}"}}}}}}"#,
+            "x".repeat(600)
+        );
+        let [PEvent::Approval(r)] = &parse(Kind::Claude, &long)[..] else {
+            panic!()
+        };
+        assert!(
+            r.summary.contains("[truncated: 100 more characters"),
+            "{}",
+            r.summary
+        );
+        assert_eq!(request.rule.as_deref(), Some("echo done *"));
+        // Our answer is exactly what Claude accepted in the recording.
+        let ours: Value = serde_json::from_str(&approval_response(
+            &request.request_id,
+            true,
+            &request.input,
+            "",
+        ))
+        .unwrap();
+        let theirs: Value = serde_json::from_str(&line("> ")).unwrap();
+        assert_eq!(ours, theirs);
+        let deny: Value =
+            serde_json::from_str(&approval_response("r1", false, &Value::Null, "no")).unwrap();
+        assert_eq!(
+            deny["response"]["response"],
+            json!({"behavior": "deny", "message": "no"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_writer_turn_keeps_stdin_open_for_answers_until_the_result() {
+        // A fake Claude: the prompt, a request, the answer it reads back, then the result.
+        // The last `read` only returns once stdin is closed: a runner that kept it open
+        // past the result would hang here.
+        let script = r#"read p
+printf '%s\n' '{"type":"control_request","request_id":"R1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}'
+read answer
+printf '{"type":"assistant","message":{"content":[]},"got":%s}\n' "$answer"
+printf '%s\n' '{"duration_api_ms":1,"type":"result","usage":{"input_tokens":1,"output_tokens":1}}'
+read rest || exit 0
+exit 9"#;
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script]);
+        let (tx, mut rx) = mpsc::channel(64);
+        let (answer_tx, answer_rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_command(
+            "claude".into(),
+            Kind::Claude,
+            cmd,
+            b"prompt\n".to_vec(),
+            tx,
+            CancellationToken::new(),
+            Some(answer_rx),
+        ));
+        let events = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut events = vec![];
+            while let Some(Event::Agent(_, event)) = rx.recv().await {
+                if let PEvent::Approval(r) = &event {
+                    answer_tx
+                        .send(approval_response(&r.request_id, true, &r.input, ""))
+                        .unwrap();
+                }
+                let done = matches!(event, PEvent::Done(_));
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            events
+        })
+        .await
+        .expect("stdin closed after the result");
+        assert!(matches!(&events[0], PEvent::Approval(r) if r.request_id == "R1"));
+        assert_eq!(
+            events.last(),
+            Some(&PEvent::Done(Outcome::Complete)),
+            "{events:?}"
         );
     }
 
@@ -1003,6 +1252,7 @@ mod tests {
             prompt,
             tx,
             CancellationToken::new(),
+            None,
         ));
         let events = tokio::time::timeout(Duration::from_secs(20), async {
             let mut events = vec![];

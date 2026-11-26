@@ -108,6 +108,7 @@ async fn start() -> Result<()> {
         thread: None,
         keys: HashMap::new(),
         viewing: None,
+        approvals: HashMap::new(),
         sessions: BTreeMap::new(),
         turn_cwd: HashMap::new(),
         checkout_error,
@@ -339,6 +340,8 @@ struct Runtime {
     store: Store,
     /// Opened on the first message, so starting and quitting leaves no empty thread.
     thread: Option<Thread>,
+    /// Per running writer turn: where its approval answers go (ADR 0018).
+    approvals: HashMap<String, mpsc::UnboundedSender<String>>,
     /// A thread resumed from another checkout: shown and readable (`/log`), never written.
     viewing: Option<Thread>,
     /// `App`'s `Link` keys to the `seq` they were written at, for the open thread only.
@@ -640,6 +643,11 @@ impl Runtime {
             PEvent::Message(text) => Some(PEvent::Message(clean(text))),
             PEvent::Error(text) => Some(PEvent::Error(clean(text))),
             PEvent::Tool(text) => Some(PEvent::Tool(clean(text))),
+            // What the card shows is cleaned; the input goes back to Claude as it came.
+            PEvent::Approval(mut request) => {
+                request.summary = clean(request.summary);
+                Some(PEvent::Approval(request))
+            }
             PEvent::Done(outcome) => {
                 let rest = redactor.flush();
                 if rest.is_empty() {
@@ -934,6 +942,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
         };
         if let Event::Agent(id, PEvent::Done(_)) = &event {
             rt.turns.remove(id);
+            rt.approvals.remove(id);
             // Its token dies with the turn: a late `ask` from it is refused.
             rt.ask_tokens.retain(|_, caller| caller != id);
             if let Some(file) = rt.ask_files.remove(id) {
@@ -950,6 +959,19 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     terminal.draw(|frame| shown = ui::draw(frame, &app))?;
                     if shown != app.scroll {
                         local.push_back(Event::Viewport(shown));
+                    }
+                }
+                Effect::AnswerApproval {
+                    id,
+                    request_id,
+                    allow,
+                    input,
+                    message,
+                } => {
+                    let line = agent::approval_response(&request_id, allow, &input, &message);
+                    // Gone: the turn ended meanwhile; the app already expired the request.
+                    if let Some(answers) = rt.approvals.get(&id) {
+                        let _ = answers.send(line);
                     }
                 }
                 Effect::Copy(text) => {
@@ -999,6 +1021,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     session,
                     writable,
                     permission_mode,
+                    auto_review,
                     ask_tool,
                     identity,
                     mirror,
@@ -1084,6 +1107,13 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     rt.turn_cwd.insert(id.clone(), cwd.clone());
                     let token = CancellationToken::new();
                     rt.turns.insert(id.clone(), token.clone());
+                    // The writer's Claude turns may ask for approvals (ADR 0018): their answers
+                    // go down this channel to the CLI's stdin.
+                    let answers = (writable && kind == agent::Kind::Claude).then(|| {
+                        let (answer_tx, answer_rx) = mpsc::unbounded_channel();
+                        rt.approvals.insert(id.clone(), answer_tx);
+                        answer_rx
+                    });
                     let turn = Turn {
                         cmd,
                         prompt,
@@ -1093,6 +1123,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         model,
                         writable,
                         permission_mode,
+                        auto_review,
                         ask,
                         mirror: mirror.is_some(),
                     };
@@ -1134,7 +1165,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                                 return;
                             }
                         }
-                        agent::run(id, kind, turn, tx, token).await;
+                        agent::run(id, kind, turn, tx, token, answers).await;
                     });
                 }
                 Effect::StartChat {
@@ -1628,6 +1659,7 @@ mod tests {
             thread: None,
             keys: HashMap::new(),
             viewing: None,
+            approvals: HashMap::new(),
             sessions: BTreeMap::new(),
             turn_cwd: HashMap::new(),
             checkout_error: None,
