@@ -38,6 +38,7 @@
 - Transcript, sessions and logs are readable by the owner only (data folder 0700, files 0600)
 
 ### Changed
+- ADR 0023 (ACP adapter) deferred until there is an ACP agent with a verified read-only mode and a recorded fixture
 - The writer's unset `permission_mode` is now `acceptEdits` for Claude (was `default`, which refused every edit it couldn't ask about): an existing config without the key behaves differently after the upgrade (ADR 0018)
 - The writer may edit from any message that reaches it, `@all` and `default = "all"` included (ADR 0017); `@all?` keeps everyone read-only, and the echo shows who may edit
 - ADRs 0016-0023 accepted, each revised after Codex's critique: worktree per agent, writer edits from any message, approvals in the chat, `/fork`, `/handoff`, `/compact`, `/model add`, ACP adapter
