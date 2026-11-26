@@ -42,11 +42,18 @@ the reply, and the tokens it cost.
   everyone with nobody editing.
 - Slash commands like Claude Code (`/help` lists them, `Tab` completes them and `@` ids):
   `/status`, `/usage [thread|today|all]`, `/context [id]`, `/models`,
-  `/model enable|disable|use|test <id>`, `/talk on|off|show|allow a->b|deny a->b`,
+  `/model add`, `/model enable|disable|use|test <id>`, `/talk on|off|show|allow a->b|deny a->b`,
   `/budget`, `/turns`, `/clear`, `/resume [n|id]`, `/log`, `/handoff`, `/compact [id]`,
   `/exit`, `/quiet`. `Alt-Enter` adds a line, `PgUp`/`PgDn` scroll, `\/` sends a literal
-  slash. `/model add` and `/fork` come later
-  ([ADR 0008](docs/adr/0008-slash-commands-and-mentions.adr)).
+  slash. `/fork` comes later ([ADR 0008](docs/adr/0008-slash-commands-and-mentions.adr)).
+- `/model add` adds a free model one question at a time
+  ([ADR 0022](docs/adr/0022-model-add.adr)): provider (`ollama`, `lmstudio`, `openrouter`
+  or `other` with its URL), a key reference if it needs one (`env:VAR` or
+  `keyring:<name>`; the chat prints the command to store the key, which is never typed into
+  roundtable), the model from the endpoint's list (or typed), an id, the context window.
+  The URL is checked before any key goes to it, the whole file is validated with the new
+  entry before it is written (comments kept), then `/model test` runs on it. `Esc` aborts
+  with nothing written.
 - `/compact [id]` keeps a free model's long thread from losing its start
   ([ADR 0021](docs/adr/0021-compact.adr)): the model summarizes its own history in chunks
   that fit its window, and from then on gets the summary, then the newer messages. Without
@@ -256,10 +263,11 @@ Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
 | 15 | [0016](docs/adr/0016-worktree-per-agent.adr) | A git worktree per read-only agent | done |
 | 16 | [0020](docs/adr/0020-handoff.adr) | `/handoff`: pass the thread to another model | done |
 | 17 | [0021](docs/adr/0021-compact.adr) | `/compact`: summarize a free model's history | done |
-| 18 | [0022](docs/adr/0022-model-add.adr) | `/model add`: add a free model from the chat | next |
-| 19 | [0019](docs/adr/0019-fork.adr) | `/fork`: branch the thread (waits for a recorded Codex `exec fork` fixture) | |
+| 18 | [0022](docs/adr/0022-model-add.adr) | `/model add`: add a free model from the chat | done |
+| 19 | [0023](docs/adr/0023-acp-adapter.adr) | An ACP adapter for other coding agents | next |
+| 20 | [0019](docs/adr/0019-fork.adr) | `/fork`: branch the thread (waits for a recorded Codex `exec fork` fixture) | |
 
-Later, each with its own ADR first: an ACP adapter.
+Later, each with its own ADR first.
 
 ## License
 

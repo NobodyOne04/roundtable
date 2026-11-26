@@ -24,6 +24,8 @@ const MIN_KEY_LEN: usize = 8;
 /// Caps on what a provider may make us hold in memory (ADR 0005 review).
 const MAX_ERROR_BODY: usize = 64 * 1024;
 const MAX_SSE_EVENT: usize = 1024 * 1024;
+/// OpenRouter's `/models` is about 1 MiB today.
+const MAX_MODEL_LIST: usize = 8 * 1024 * 1024;
 
 /// One request: the model's own history (oldest first, as prompt/reply pairs) and the new
 /// prompt. The runner resolves the key and fits the messages to the window.
@@ -412,7 +414,7 @@ where
         return Attempt::Done(Outcome::Failed);
     }
     if !status.is_success() {
-        let text = bounded_body(response).await;
+        let text = bounded_body(response, MAX_ERROR_BODY).await;
         let mut message = provider_message(&text).unwrap_or(text);
         // Redact before truncating: cutting first could leave a piece of a key that no
         // longer matches it, and would leak.
@@ -550,14 +552,14 @@ where
     Attempt::Done(Outcome::Complete)
 }
 
-/// An error body, read up to `MAX_ERROR_BODY`: a huge error page must not fill memory.
-async fn bounded_body(response: reqwest::Response) -> String {
+/// A body, read up to `cap` bytes: a huge page must not fill memory.
+async fn bounded_body(response: reqwest::Response, cap: usize) -> String {
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(Ok(chunk)) = stream.next().await {
-        let room = MAX_ERROR_BODY - body.len();
+        let room = cap - body.len();
         body.extend_from_slice(&chunk[..chunk.len().min(room)]);
-        if body.len() >= MAX_ERROR_BODY {
+        if body.len() >= cap {
             break;
         }
     }
@@ -603,7 +605,7 @@ pub async fn ping(
     if status.is_success() {
         return Ok(started.elapsed());
     }
-    let text = bounded_body(response).await;
+    let text = bounded_body(response, MAX_ERROR_BODY).await;
     let mut message = provider_message(&text).unwrap_or(text);
     if let Some(key) = &key {
         message = message.replace(key.as_str(), "[redacted]");
@@ -612,6 +614,67 @@ pub async fn ping(
         "{status}: {}",
         message.chars().take(300).collect::<String>()
     ))
+}
+
+/// `/model add` (ADR 0022): the endpoint's `GET /models`, as (name, context window when
+/// the provider says), with the client chat turns use (no redirects).
+pub async fn list_models(
+    base_url: &str,
+    key_ref: Option<String>,
+) -> Result<Vec<(String, Option<u64>)>, String> {
+    let key = match key_ref {
+        None => None,
+        Some(reference) => {
+            // Off the loop, like a turn: the keychain may block.
+            let (send, recv) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let _ = send.send(resolve_key(&reference));
+            });
+            Some(recv.await.map_err(|_| "key lookup failed".to_string())??)
+        }
+    };
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_S))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut request = client.get(format!("{}/models", base_url.trim_end_matches('/')));
+    if let Some(key) = &key {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send().await.map_err(|e| without_url(&e))?;
+    let status = response.status();
+    let mut text = bounded_body(response, MAX_MODEL_LIST).await;
+    if let Some(key) = &key {
+        text = text.replace(key.as_str(), "[redacted]");
+    }
+    if !status.is_success() {
+        let message = provider_message(&text).unwrap_or(text);
+        return Err(format!(
+            "{status}: {}",
+            message.chars().take(300).collect::<String>()
+        ));
+    }
+    parse_models(&text)
+}
+
+/// The `data` list of a `/models` answer. OpenRouter calls the window `context_length`.
+fn parse_models(text: &str) -> Result<Vec<(String, Option<u64>)>, String> {
+    let body: Value = serde_json::from_str(text).map_err(|_| "not a /models answer".to_string())?;
+    let list = body["data"].as_array().ok_or("not a /models answer")?;
+    let mut models: Vec<(String, Option<u64>)> = list
+        .iter()
+        .filter_map(|m| {
+            let name = m["id"].as_str()?.to_string();
+            let window = ["context_length", "context_window"]
+                .iter()
+                .find_map(|k| m[k].as_u64());
+            Some((name, window))
+        })
+        .collect();
+    models.sort();
+    Ok(models)
 }
 
 /// A provider's own error message from an OpenAI-style error body.
@@ -745,6 +808,17 @@ mod tests {
             compact_chunks("m", 200, 250, &exchanges).is_err(),
             "no room at all"
         );
+    }
+
+    #[test]
+    fn model_lists_come_with_a_window_when_the_provider_says() {
+        let text =
+            r#"{"data": [{"id": "b/x", "context_length": 32768}, {"id": "a:8b"}, {"no": 1}]}"#;
+        assert_eq!(
+            parse_models(text).unwrap(),
+            [("a:8b".to_string(), None), ("b/x".to_string(), Some(32768))]
+        );
+        assert!(parse_models("<html>").is_err());
     }
 
     #[test]

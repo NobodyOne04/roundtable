@@ -351,18 +351,7 @@ fn participant(e: RawEntry) -> Result<Participant, String> {
             if e.model.is_none() {
                 return Err(at("openai models need `model`"));
             }
-            let remote_http = url.starts_with("http://") && !is_loopback(url);
-            if !(url.starts_with("https://") || url.starts_with("http://")) {
-                return Err(at("`base_url` must be http(s)"));
-            }
-            if authority(url).contains('@') {
-                return Err(at("`base_url` must not contain user info (user@host)"));
-            }
-            if remote_http && e.key.is_some() {
-                return Err(at(
-                    "a key over plain http to a non-local host would travel in cleartext; use https",
-                ));
-            }
+            check_url(url, e.key.is_some()).map_err(|why| at(&why))?;
             Adapter::OpenAi
         }
     };
@@ -394,6 +383,63 @@ fn participant(e: RawEntry) -> Result<Participant, String> {
         auto_review: e.auto_review,
         identity,
     })
+}
+
+/// A free model's `base_url` (ADR 0005, 0022): a parsed http(s) URL without user info, and
+/// plain http with a key only to a loopback host. `/model add` checks with this too, before
+/// any key is touched.
+pub fn check_url(url: &str, with_key: bool) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("`base_url` must be http(s)".into());
+    }
+    if authority(url).contains('@') {
+        return Err("`base_url` must not contain user info (user@host)".into());
+    }
+    if reqwest::Url::parse(url).is_err() {
+        return Err(format!("`{url}` is not a valid URL"));
+    }
+    if with_key && url.starts_with("http://") && !is_loopback(url) {
+        return Err(
+            "a key over plain http to a non-local host would travel in cleartext; use https".into(),
+        );
+    }
+    Ok(())
+}
+
+/// A free model `/model add` writes (ADR 0022).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewModel {
+    pub id: String,
+    pub base_url: String,
+    pub model: String,
+    pub key: Option<String>,
+    pub context_window: Option<u64>,
+}
+
+/// Appends `new` as a `[[model]]` entry, keeping comments and layout. The caller validates
+/// the whole result before writing it.
+pub fn add_model(text: &str, new: &NewModel) -> Result<String, String> {
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
+    if doc.get("model").is_none() {
+        doc["model"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+    }
+    let models = doc["model"]
+        .as_array_of_tables_mut()
+        .ok_or("`model` is not a list of [[model]] tables")?;
+    let mut table = toml_edit::Table::new();
+    table["id"] = toml_edit::value(new.id.as_str());
+    table["kind"] = toml_edit::value("openai");
+    table["base_url"] = toml_edit::value(new.base_url.as_str());
+    table["model"] = toml_edit::value(new.model.as_str());
+    if let Some(key) = &new.key {
+        table["key"] = toml_edit::value(key.as_str());
+    }
+    if let Some(window) = new.context_window {
+        table["context_window"] = toml_edit::value(i64::try_from(window).unwrap_or(i64::MAX));
+    }
+    table["enabled"] = toml_edit::value(true);
+    models.push(table);
+    Ok(doc.to_string())
 }
 
 /// The `host[:port]` part of a URL, user info included if present.
@@ -662,6 +708,56 @@ mod tests {
         assert_eq!(a.participants[0].identity, b.participants[0].identity);
         assert_ne!(a.participants[0].identity, c.participants[0].identity);
         assert_eq!(fingerprint(""), "cbf29ce484222325", "FNV-1a offset basis");
+    }
+
+    #[test]
+    fn urls_are_checked_before_any_key_goes_to_them() {
+        assert!(check_url("http://localhost:11434/v1", true).is_ok());
+        assert!(check_url("http://[::1]:8080/v1", true).is_ok());
+        assert!(check_url("https://openrouter.ai/api/v1", true).is_ok());
+        assert!(
+            check_url("http://example.com/v1", false).is_ok(),
+            "no key, no secret"
+        );
+        assert!(
+            check_url("http://example.com/v1", true)
+                .unwrap_err()
+                .contains("cleartext")
+        );
+        assert!(check_url("ftp://example.com", false).is_err());
+        assert!(
+            check_url("https://user:pw@example.com/v1", false)
+                .unwrap_err()
+                .contains("user info")
+        );
+        assert!(check_url("https://exa mple.com", false).is_err(), "parsed");
+    }
+
+    #[test]
+    fn an_added_model_keeps_comments_and_validates() {
+        let new = NewModel {
+            id: "llama3-8b".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            model: "llama3:8b".into(),
+            key: None,
+            context_window: Some(8192),
+        };
+        let text = add_model(DEFAULT_FILE, &new).unwrap();
+        assert!(
+            text.contains("# roundtable model registry"),
+            "comments kept"
+        );
+        let reg = Registry::parse(&text).unwrap();
+        let p = reg.get("llama3-8b").unwrap();
+        assert_eq!(p.adapter, Adapter::OpenAi);
+        assert_eq!(
+            (p.model.as_deref(), p.context_window, p.enabled),
+            (Some("llama3:8b"), Some(8192), true)
+        );
+        assert!(
+            Registry::parse(&add_model(&text, &new).unwrap()).is_err(),
+            "duplicate id"
+        );
     }
 
     #[test]

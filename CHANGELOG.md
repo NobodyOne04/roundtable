@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- `/model add` (ADR 0022): add a free model step by step: provider preset or URL, a key reference (never the key), the model from the endpoint's `/models` list, id, context window; the URL is checked before any key goes to it, the whole file is validated before the write, then the model is tested; `Esc` aborts with nothing written
 - `/compact [id]` (ADR 0021): a free model summarizes its own history in chunks that fit its window; the summary is a checkpoint in the transcript, replayed before newer messages (also on `/resume`); a failed or cut-off summary changes nothing; suggested once when fitting would drop more than a quarter of the window
 - `/handoff <id>` (ADR 0020): the default (or writer) summarizes the thread read-only, `<id>` takes it over and becomes the default; asks before sending entries the summarizer never saw; `raw [n]` sends the last messages verbatim after asking
 - A git worktree per read-only agent (ADR 0016): every CLI agent but the writer runs in its own mirror, synced with the checkout before each turn; `/worktrees` lists them, `/worktrees clean [id]` removes them; sessions are bound to the folder they ran in
