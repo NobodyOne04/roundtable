@@ -264,7 +264,7 @@ Built in dependency order, one ADR per PR ([index](docs/adr/README.md)):
 | 16 | [0020](docs/adr/0020-handoff.adr) | `/handoff`: pass the thread to another model | done |
 | 17 | [0021](docs/adr/0021-compact.adr) | `/compact`: summarize a free model's history | done |
 | 18 | [0022](docs/adr/0022-model-add.adr) | `/model add`: add a free model from the chat | done |
-| 19 | [0023](docs/adr/0023-acp-adapter.adr) | An ACP adapter for other coding agents | next |
+| 19 | [0023](docs/adr/0023-acp-adapter.adr) | An ACP adapter for other coding agents (waits for an agent you want at the table, with a verified read-only mode and a recorded fixture) | |
 | 20 | [0019](docs/adr/0019-fork.adr) | `/fork`: branch the thread (waits for a recorded Codex `exec fork` fixture) | |
 
 Later, each with its own ADR first.

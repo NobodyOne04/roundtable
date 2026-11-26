@@ -34,7 +34,8 @@ Implementation order follows dependencies, not numbers: 0001, 0002, 0010, 0004, 
 0005, 0007, 0008, 0009; 0012 lands with the writer fixes (0010 and 0011 replace earlier numbers that others depend on).
 
 0014, 0015, 0016, 0017, 0018, 0020, 0021, 0022 and 0024 are built (0019 waits for a recorded
-Codex `exec fork` fixture). 0016 differs from its text in
+Codex `exec fork` fixture; 0023 is deferred by the owner, 2026-11-27, until there is an ACP
+agent to seat, with a verified read-only mode and a recorded fixture of a turn and a cancel). 0016 differs from its text in
 how, not what (found over Codex's reviews): the sync reads the writer's index as a tree
 (`write-tree`/`read-tree`) and copies changed and untracked files instead of applying
 `git diff HEAD --binary`; mirrors are locked worktrees (`--lock --reason`, git 2.35) and
