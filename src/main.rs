@@ -25,7 +25,7 @@ use tracing_subscriber::EnvFilter;
 use notify_debouncer_mini::notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, DebouncedEventBatch, new_debouncer};
 use roundtable::agent::{self, AskBridge, Outcome, PEvent, Turn};
-use roundtable::app::{App, Checks, EditLock, Effect, Event, FileEdit, Link, TestTarget, WIDE};
+use roundtable::app::{App, At, Checks, EditLock, Effect, Event, FileEdit, Link, TestTarget, WIDE};
 use roundtable::mcp::{self, AskAnswer};
 use roundtable::openai;
 use roundtable::registry::{self, Adapter, Registry};
@@ -837,6 +837,11 @@ impl Runtime {
     }
 }
 
+/// A `/compact`'s cancel token in `Runtime::turns`: beside the model's own turn, never it.
+fn compact_key(id: &str) -> String {
+    format!("{id}/compact")
+}
+
 async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
     // Events the loop raises itself: handled before the channel, never dropped (a full
@@ -938,6 +943,17 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                 Some(output) => Event::Agent(id, output),
                 None => continue,
             },
+            // A summary is participant output too: cleaned before the app sees it.
+            Event::Compacted { id, upto, result } => {
+                rt.turns.remove(&compact_key(&id));
+                let clean = |text: String| {
+                    let mut value = serde_json::Value::String(text);
+                    transcript::redact(&mut value, &rt.secrets);
+                    value.as_str().unwrap_or_default().to_string()
+                };
+                let result = result.map(clean).map_err(clean);
+                Event::Compacted { id, upto, result }
+            }
             other => other,
         };
         if let Event::Agent(id, PEvent::Done(_)) = &event {
@@ -1174,6 +1190,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                     model,
                     key_ref,
                     system,
+                    summary,
                     history,
                     prompt,
                     context_window,
@@ -1190,6 +1207,7 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         model,
                         key_ref,
                         system,
+                        summary,
                         history,
                         prompt,
                         context_window,
@@ -1198,6 +1216,62 @@ async fn run(mut terminal: DefaultTerminal, mut app: App, mut rt: Runtime) -> Re
                         idle_timeout: Duration::from_secs(idle_timeout_s),
                     };
                     tokio::spawn(openai::run(id, chat, tx.clone(), token));
+                }
+                Effect::Compact {
+                    id,
+                    base_url,
+                    model,
+                    key_ref,
+                    context_window,
+                    connect_timeout_s,
+                    idle_timeout_s,
+                    previous,
+                    exchanges,
+                    upto,
+                } => {
+                    // The checkpoint names the last covered reply by thread and seq (ADR 0021).
+                    let seq = match upto {
+                        At::Seq(seq) => Some(seq),
+                        At::Key(key) => rt.keys.get(&key).copied(),
+                    };
+                    let thread = rt.thread.as_ref().map(|t| t.meta.id.clone());
+                    let (Some(thread), Some(seq)) = (thread, seq) else {
+                        local.push_back(Event::Compacted {
+                            id,
+                            upto: (String::new(), 0),
+                            result: Err("its history is not in this thread's transcript".into()),
+                        });
+                        continue;
+                    };
+                    let token = CancellationToken::new();
+                    rt.turns.insert(compact_key(&id), token.clone());
+                    let chat = openai::Chat {
+                        base_url,
+                        model,
+                        key_ref,
+                        system: String::new(),
+                        summary: None,
+                        history: Default::default(),
+                        prompt: String::new(),
+                        context_window,
+                        max_output: 0,
+                        connect_timeout: Duration::from_secs(connect_timeout_s),
+                        idle_timeout: Duration::from_secs(idle_timeout_s),
+                    };
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let result = openai::compact(
+                            id.clone(),
+                            chat,
+                            exchanges,
+                            previous,
+                            tx.clone(),
+                            token,
+                        )
+                        .await;
+                        let upto = (thread, seq);
+                        let _ = tx.send(Event::Compacted { id, upto, result }).await;
+                    });
                 }
                 Effect::CancelTurn(id) => {
                     if let Some(token) = rt.turns.get(&id) {

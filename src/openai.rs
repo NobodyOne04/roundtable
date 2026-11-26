@@ -34,6 +34,9 @@ pub struct Chat {
     /// A reference (`env:`/`keyring:`), resolved by the runner off the UI loop.
     pub key_ref: Option<String>,
     pub system: String,
+    /// The latest `/compact` checkpoint's summary, replayed as a user message before the
+    /// history (ADR 0021): conversation data, never an instruction.
+    pub summary: Option<String>,
     /// Shared with the app's copy: starting a turn never deep-copies a long thread.
     pub history: Arc<Vec<(String, String)>>,
     pub prompt: String,
@@ -60,7 +63,7 @@ pub fn fit(chat: &Chat, history: &[(String, String)]) -> Result<(Vec<Value>, usi
     // A few tokens per message for the role and separators.
     let cost = |text: &str| estimate(text) + 4;
     let budget = chat.context_window.saturating_sub(chat.max_output);
-    let fixed = cost(&chat.system) + cost(&chat.prompt);
+    let fixed = cost(&chat.system) + cost(&chat.prompt) + chat.summary.as_deref().map_or(0, cost);
     if fixed > budget {
         return Err(format!(
             "the prompt needs ~{fixed} tokens but only {budget} fit (window {}, {} kept for the reply)",
@@ -79,12 +82,75 @@ pub fn fit(chat: &Chat, history: &[(String, String)]) -> Result<(Vec<Value>, usi
     }
     let turns = kept.len();
     let mut messages = vec![json!({"role": "system", "content": chat.system})];
+    if let Some(summary) = &chat.summary {
+        messages.push(json!({"role": "user", "content": summary}));
+    }
     for (prompt, reply) in kept.into_iter().rev() {
         messages.push(json!({"role": "user", "content": prompt}));
         messages.push(json!({"role": "assistant", "content": reply}));
     }
     messages.push(json!({"role": "user", "content": chat.prompt}));
     Ok((messages, turns))
+}
+
+/// Resolves the key (off the UI loop; it comes back as `KeyResolved` first, for
+/// redaction) and builds the client. `Err` is how the turn ended; errors went to `emit`.
+async fn connect<F, Fut>(
+    chat: &Chat,
+    tx: &mpsc::Sender<Event>,
+    cancel: &CancellationToken,
+    emit: &F,
+) -> Result<(reqwest::Client, Option<String>), Outcome>
+where
+    F: Fn(PEvent) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let key = match chat.key_ref.clone() {
+        None => None,
+        Some(reference) => {
+            // A plain thread, not `spawn_blocking`: a keychain dialog nobody answers must not
+            // hold up cancel, or the runtime's shutdown at quit.
+            let (send, recv) = tokio::sync::oneshot::channel();
+            let lookup = reference.clone();
+            std::thread::spawn(move || {
+                let _ = send.send(resolve_key(&lookup));
+            });
+            let resolved = tokio::select! {
+                _ = cancel.cancelled() => return Err(Outcome::Interrupted),
+                result = recv => result.unwrap_or_else(|_| Err("key lookup failed".into())),
+            };
+            match resolved {
+                Ok(key) => {
+                    // To the loop first, so the transcript redacts it before any reply.
+                    let _ = tx
+                        .send(Event::KeyResolved {
+                            reference,
+                            value: Secret(key.clone()),
+                        })
+                        .await;
+                    Some(key)
+                }
+                Err(why) => {
+                    emit(PEvent::Error(why)).await;
+                    return Err(Outcome::Failed);
+                }
+            }
+        }
+    };
+    let client = reqwest::Client::builder()
+        .connect_timeout(chat.connect_timeout)
+        // Covers waiting for headers and every read of the body, errors included.
+        .read_timeout(chat.idle_timeout)
+        // A redirect would carry the prompt and history to another origin.
+        .redirect(reqwest::redirect::Policy::none())
+        .build();
+    match client {
+        Ok(client) => Ok((client, key)),
+        Err(err) => {
+            emit(PEvent::Error(format!("HTTP client: {err}"))).await;
+            Err(Outcome::Failed)
+        }
+    }
 }
 
 /// What one HTTP attempt ended with.
@@ -106,55 +172,10 @@ pub async fn run(id: String, chat: Chat, tx: mpsc::Sender<Event>, cancel: Cancel
             let _ = tx.send(Event::Agent(id, event)).await;
         }
     };
-    // The OS keychain may block (an unlock prompt): never on the UI loop.
-    let key = match chat.key_ref.clone() {
-        None => None,
-        Some(reference) => {
-            // A plain thread, not `spawn_blocking`: a keychain dialog nobody answers must not
-            // hold up cancel, or the runtime's shutdown at quit.
-            let (send, recv) = tokio::sync::oneshot::channel();
-            let lookup = reference.clone();
-            std::thread::spawn(move || {
-                let _ = send.send(resolve_key(&lookup));
-            });
-            let resolved = tokio::select! {
-                _ = cancel.cancelled() => {
-                    emit(PEvent::Done(Outcome::Interrupted)).await;
-                    return;
-                }
-                result = recv => result.unwrap_or_else(|_| Err("key lookup failed".into())),
-            };
-            match resolved {
-                Ok(key) => {
-                    // To the loop first, so the transcript redacts it before any reply.
-                    let _ = tx
-                        .send(Event::KeyResolved {
-                            reference,
-                            value: Secret(key.clone()),
-                        })
-                        .await;
-                    Some(key)
-                }
-                Err(why) => {
-                    emit(PEvent::Error(why)).await;
-                    emit(PEvent::Done(Outcome::Failed)).await;
-                    return;
-                }
-            }
-        }
-    };
-    let client = match reqwest::Client::builder()
-        .connect_timeout(chat.connect_timeout)
-        // Covers waiting for headers and every read of the body, errors included.
-        .read_timeout(chat.idle_timeout)
-        // A redirect would carry the prompt and history to another origin.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
-        Ok(client) => client,
-        Err(err) => {
-            emit(PEvent::Error(format!("HTTP client: {err}"))).await;
-            emit(PEvent::Done(Outcome::Failed)).await;
+    let (client, key) = match connect(&chat, &tx, &cancel, &emit).await {
+        Ok(connected) => connected,
+        Err(outcome) => {
+            emit(PEvent::Done(outcome)).await;
             return;
         }
     };
@@ -171,9 +192,10 @@ pub async fn run(id: String, chat: Chat, tx: mpsc::Sender<Event>, cancel: Cancel
                 break Outcome::Failed;
             }
         };
+        let mut reason = None;
         let attempt = tokio::select! {
             _ = cancel.cancelled() => Attempt::Done(Outcome::Interrupted),
-            attempt = request(&client, &chat, key.as_deref(), messages, &emit) => attempt,
+            attempt = request(&client, &chat, key.as_deref(), messages, &emit, &mut reason) => attempt,
         };
         match attempt {
             Attempt::Done(outcome) => break outcome,
@@ -210,12 +232,142 @@ pub async fn run(id: String, chat: Chat, tx: mpsc::Sender<Event>, cancel: Cancel
     emit(PEvent::Done(outcome)).await;
 }
 
+/// The instruction of every `/compact` request (ADR 0021).
+fn compact_system(id: &str) -> String {
+    format!(
+        "You are `{id}`, one participant in a roundtable group chat. Summarize the conversation \
+         below so you can carry on from the summary alone: the goals, decisions, facts and \
+         figures, open questions, and what you said you would do. If an earlier summary is \
+         given, fold it in. Answer with the summary only."
+    )
+}
+
+/// `/compact`'s chunks (ADR 0021): the exchanges in order, rendered as text, each chunk
+/// small enough to fit the window next to the instruction, the carried summary (at most
+/// `carried` tokens) and the summary's output budget. `Err` when one exchange alone is
+/// too big, or the window too small to carry a summary.
+pub fn compact_chunks(
+    id: &str,
+    window: u64,
+    carried: u64,
+    exchanges: &[(String, String)],
+) -> Result<Vec<String>, String> {
+    let output = window / 4;
+    let fixed = estimate(&compact_system(id)) + carried + output + 64;
+    let Some(room) = window.checked_sub(fixed).filter(|room| *room > 0) else {
+        return Err(format!(
+            "the window ({window} tokens) is too small to summarize in"
+        ));
+    };
+    let mut chunks: Vec<String> = vec![];
+    let mut current = String::new();
+    for (n, (prompt, reply)) in exchanges.iter().enumerate() {
+        let text = format!("user → {id}: {prompt}\n{id}: {reply}\n\n");
+        let cost = estimate(&text);
+        if cost > room {
+            return Err(format!(
+                "exchange {} alone (~{cost} tokens) doesn't fit the {room} tokens a chunk may use",
+                n + 1
+            ));
+        }
+        if !current.is_empty() && estimate(&current) + cost > room {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push_str(&text);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    Ok(chunks)
+}
+
+/// Runs `/compact` for `id` (ADR 0021): one request per chunk, each carrying the summary so
+/// far, with a hard output budget of a quarter of the window. A summary cut off or empty
+/// fails the whole compaction. Nothing goes to the chat or the history: the result is
+/// returned, and errors are its `Err`.
+pub async fn compact(
+    id: String,
+    mut chat: Chat,
+    exchanges: Vec<(String, String)>,
+    previous: Option<String>,
+    tx: mpsc::Sender<Event>,
+    cancel: CancellationToken,
+) -> Result<String, String> {
+    let errors = std::sync::Mutex::new(Vec::<String>::new());
+    let text = std::sync::Mutex::new(String::new());
+    let collect = |event| {
+        match event {
+            PEvent::TextDelta(delta) => text.lock().expect("text").push_str(&delta),
+            PEvent::Error(why) => errors.lock().expect("errors").push(why),
+            _ => {}
+        }
+        std::future::ready(())
+    };
+    let failed = |outcome| match outcome {
+        Outcome::Interrupted => "cancelled".to_string(),
+        _ => errors.lock().expect("errors").join("; "),
+    };
+    let (client, key) = connect(&chat, &tx, &cancel, &collect)
+        .await
+        .map_err(failed)?;
+    let window = chat.context_window;
+    chat.max_output = window / 4;
+    chat.system = compact_system(&id);
+    chat.summary = None;
+    chat.history = Arc::default();
+    let carried = previous.as_deref().map_or(0, estimate).max(chat.max_output);
+    let mut summary = previous;
+    for chunk in compact_chunks(&id, window, carried, &exchanges)? {
+        chat.prompt = match &summary {
+            Some(earlier) => {
+                format!("Earlier summary:\n{earlier}\n\nThe conversation since:\n{chunk}")
+            }
+            None => format!("The conversation:\n{chunk}"),
+        };
+        let (messages, _) = fit(&chat, &[])?;
+        text.lock().expect("text").clear();
+        let mut reason = None;
+        let mut retried = false;
+        loop {
+            let attempt = tokio::select! {
+                _ = cancel.cancelled() => Attempt::Done(Outcome::Interrupted),
+                attempt = request(&client, &chat, key.as_deref(), messages.clone(), &collect, &mut reason) => attempt,
+            };
+            match attempt {
+                Attempt::Done(Outcome::Complete) => break,
+                Attempt::Done(outcome) => return Err(failed(outcome)),
+                Attempt::ServerError(_) if !retried => {
+                    retried = true;
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err("cancelled".into()),
+                        _ = tokio::time::sleep(RETRY_BACKOFF) => {}
+                    }
+                }
+                Attempt::ServerError(why) | Attempt::TooLong(why) => return Err(why),
+            }
+        }
+        if reason.as_deref() == Some("length") {
+            return Err(format!(
+                "the summary was cut off at its budget of {} tokens",
+                chat.max_output
+            ));
+        }
+        let done = text.lock().expect("text").trim().to_string();
+        if done.is_empty() {
+            return Err("the summary came back empty".into());
+        }
+        summary = Some(done);
+    }
+    summary.ok_or_else(|| "nothing to summarize".into())
+}
+
 async fn request<F, Fut>(
     client: &reqwest::Client,
     chat: &Chat,
     key: Option<&str>,
     messages: Vec<Value>,
     emit: &F,
+    finish_reason: &mut Option<String>,
 ) -> Attempt
 where
     F: Fn(PEvent) -> Fut,
@@ -356,11 +508,12 @@ where
                 reply_chars.push_str(text);
                 emit(PEvent::TextDelta(text.into())).await;
             }
-            if event
+            if let Some(reason) = event
                 .pointer("/choices/0/finish_reason")
-                .is_some_and(|r| !r.is_null())
+                .filter(|r| !r.is_null())
             {
                 completed = true;
+                *finish_reason = Some(reason.as_str().unwrap_or_default().to_string());
             }
             if let Some(u) = event.get("usage").filter(|u| !u.is_null())
                 && let (Some(input), Some(output)) =
@@ -513,6 +666,7 @@ mod tests {
             model: "m".into(),
             key_ref: None,
             system: "sys".into(),
+            summary: None,
             history: Arc::new(
                 history
                     .into_iter()
@@ -555,6 +709,42 @@ mod tests {
         assert_eq!(fit(&roomy, &roomy.history).unwrap().0.len(), 6);
         let tiny = chat(vec![], 12);
         assert!(fit(&tiny, &[]).unwrap_err().contains("only 2 fit"));
+    }
+
+    #[test]
+    fn the_summary_goes_after_the_system_message_and_always_counts() {
+        let mut c = chat(vec![("q", "a")], 1_000);
+        c.summary = Some("summary of the conversation so far (by m): S".into());
+        let (messages, turns) = fit(&c, &c.history).unwrap();
+        assert_eq!(turns, 1);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+        assert!(messages[1]["content"].as_str().unwrap().ends_with(": S"));
+        c.summary = Some("x".repeat(3_000));
+        assert!(fit(&c, &c.history).is_err(), "never dropped to make room");
+    }
+
+    #[test]
+    fn compact_chunks_keep_order_and_refuse_what_cannot_fit() {
+        let ex = |n: usize| (format!("q{n}"), "a".repeat(300));
+        let exchanges: Vec<(String, String)> = (0..6).map(ex).collect();
+        let chunks = compact_chunks("m", 1_000, 250, &exchanges).unwrap();
+        assert!(chunks.len() > 1, "{chunks:?}");
+        let joined: String = chunks.concat();
+        let order: Vec<usize> = (0..6)
+            .map(|n| joined.find(&format!("q{n}")).unwrap())
+            .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "chronological");
+        let huge = vec![("q".to_string(), "a".repeat(3_000))];
+        assert!(
+            compact_chunks("m", 1_000, 250, &huge)
+                .unwrap_err()
+                .contains("exchange 1")
+        );
+        assert!(
+            compact_chunks("m", 200, 250, &exchanges).is_err(),
+            "no room at all"
+        );
     }
 
     #[test]
@@ -657,6 +847,80 @@ mod tests {
             }
         }
         events
+    }
+
+    fn summary(text: &str, reason: &str) -> String {
+        let delta = json!({"choices": [{"delta": {"content": text}}]}).to_string();
+        let end = json!({"choices": [{"delta": {}, "finish_reason": reason}]}).to_string();
+        sse(&[&delta, &end, "[DONE]"])
+    }
+
+    async fn run_compact(
+        responses: Vec<String>,
+        exchanges: Vec<(String, String)>,
+    ) -> (Result<String, String>, Vec<Value>) {
+        let (url, server) = fake(responses).await;
+        let mut c = chat(vec![], 1_000);
+        c.base_url = url;
+        let (tx, _rx) = mpsc::channel(64);
+        let result = compact(
+            "m".into(),
+            c,
+            exchanges,
+            Some("S0".into()),
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+        server.abort();
+        let sent = server
+            .await
+            .map(|got| got.into_iter().map(|g| g.0).collect());
+        (result, sent.unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn compact_carries_each_chunks_summary_into_the_next() {
+        let exchanges: Vec<(String, String)> =
+            (0..4).map(|n| (format!("q{n}"), "a".repeat(400))).collect();
+        let (url, server) = fake(vec![summary("S1", "stop"), summary("S2", "stop")]).await;
+        let mut c = chat(vec![], 1_000);
+        c.base_url = url;
+        let (tx, _rx) = mpsc::channel(64);
+        let result = compact(
+            "m".into(),
+            c,
+            exchanges,
+            Some("S0".into()),
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(result.as_deref(), Ok("S2"));
+        let sent = server.await.unwrap();
+        assert_eq!(sent.len(), 2, "two chunks");
+        let prompt = |n: usize| {
+            sent[n].0["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(prompt(0).starts_with("Earlier summary:\nS0"));
+        assert!(prompt(1).starts_with("Earlier summary:\nS1"));
+        assert!(prompt(0).contains("q0") && prompt(1).contains("q3"));
+        assert_eq!(sent[0].0["max_tokens"], 250, "a quarter of the window");
+        assert_eq!(sent[0].0["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_summary_cut_off_or_empty_fails_the_compaction() {
+        let one = vec![("q".to_string(), "a".to_string())];
+        let (result, _) = run_compact(vec![summary("half", "length")], one.clone()).await;
+        assert!(result.unwrap_err().contains("cut off"));
+        let (result, _) = run_compact(vec![summary("  ", "stop")], one.clone()).await;
+        assert_eq!(result.unwrap_err(), "the summary came back empty");
+        let (result, _) = run_compact(vec![status(429, "slow down")], one).await;
+        assert!(result.unwrap_err().contains("slow down"));
     }
 
     #[tokio::test]

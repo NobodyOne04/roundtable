@@ -66,6 +66,13 @@ pub enum Event {
     Report(String),
     /// `/handoff` (ADR 0020): the open thread as `/log` entries, or why there are none.
     HandoffEntries(Result<Vec<crate::log::Entry>, String>),
+    /// A `/compact` of `id` ended (ADR 0021): the summary, or why it failed. `upto` is the
+    /// thread and seq of the last event it covers, as the loop resolved them.
+    Compacted {
+        id: String,
+        upto: (String, u64),
+        result: Result<String, String>,
+    },
     /// `/worktrees` finished: the loop frees the mirrors it reserved, then shows the report.
     WorktreesDone {
         ids: Vec<String>,
@@ -164,12 +171,29 @@ pub enum Effect {
         model: String,
         key_ref: Option<String>,
         system: String,
+        /// The `/compact` summary replayed before the history (ADR 0021).
+        summary: Option<String>,
         history: std::sync::Arc<Vec<(String, String)>>,
         prompt: String,
         context_window: u64,
         max_output: u64,
         connect_timeout_s: u64,
         idle_timeout_s: u64,
+    },
+    /// `/compact` of an OpenAI-compatible model (ADR 0021): summarize `exchanges` in
+    /// chunks, on top of `previous`; answered by `Event::Compacted`.
+    Compact {
+        id: String,
+        base_url: String,
+        model: String,
+        key_ref: Option<String>,
+        context_window: u64,
+        connect_timeout_s: u64,
+        idle_timeout_s: u64,
+        previous: Option<String>,
+        exchanges: Vec<(String, String)>,
+        /// The last exchange's reply, for the checkpoint's `upto`.
+        upto: At,
     },
     StartTurn {
         id: String,
@@ -395,6 +419,28 @@ pub struct Link {
     pub parent: u64,
 }
 
+/// Where a history exchange's reply is in the transcript: its seq when rebuilt by
+/// `/resume`, its `Link` key when recorded live (the loop knows the seq).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum At {
+    Seq(u64),
+    Key(u64),
+}
+
+/// `/compact` state of one free model (ADR 0021), bound to its destination like `history`.
+#[derive(Debug, Default)]
+struct Compaction {
+    /// Parallel to `Seat::history`: where each exchange's reply was recorded.
+    at: Vec<At>,
+    /// The latest checkpoint: its summary and the seq it covers up to.
+    checkpoint: Option<(String, u64)>,
+    /// A compaction under way: the identity it was started for and how many exchanges
+    /// of `history` it covers.
+    running: Option<(String, usize)>,
+    /// `/compact` was suggested in this thread already.
+    suggested: bool,
+}
+
 /// Runtime state of one participant; survives registry reloads for as long as it runs.
 #[derive(Debug)]
 struct Seat {
@@ -434,6 +480,26 @@ struct Seat {
     turn_identity: Option<String>,
     /// Tokens sent and received in this thread (for `/context`).
     thread_tokens: (u64, u64),
+    compaction: Compaction,
+}
+
+impl Seat {
+    /// Estimated tokens of a free model's memory: the checkpoint's summary and the history.
+    fn used(&self) -> u64 {
+        let summary = self.compaction.checkpoint.as_ref();
+        summary.map_or(0, |(s, _)| crate::openai::estimate(s))
+            + self
+                .history
+                .iter()
+                .map(|(q, a)| crate::openai::estimate(q) + crate::openai::estimate(a))
+                .sum::<u64>()
+    }
+
+    /// A fresh start for a free model's memory: no history, no checkpoint (ADR 0005, 0021).
+    fn forget(&mut self) {
+        self.history = Default::default();
+        self.compaction = Compaction::default();
+    }
 }
 
 /// A `/handoff` (ADR 0020): who summarizes for whom, pinned to both identities.
@@ -712,6 +778,7 @@ impl App {
                 vec![]
             }
             Event::HandoffEntries(entries) => self.handoff_entries(entries),
+            Event::Compacted { id, upto, result } => self.compacted(&id, upto, result),
             Event::Report(text) | Event::WorktreesDone { report: text, .. } => {
                 self.push("roundtable", text, LineKind::Info);
                 vec![]
@@ -1030,12 +1097,7 @@ impl App {
                     let window = p
                         .context_window
                         .unwrap_or(crate::openai::DEFAULT_CONTEXT_WINDOW);
-                    let used: u64 = seat
-                        .history
-                        .iter()
-                        .map(|(q, a)| crate::openai::estimate(q) + crate::openai::estimate(a))
-                        .sum();
-                    (used as f64 / window.max(1) as f64).min(1.0)
+                    (seat.used() as f64 / window.max(1) as f64).min(1.0)
                 });
                 Some(ContextRow {
                     id: p.id.clone(),
@@ -1263,6 +1325,8 @@ impl App {
             ["/log"] => vec![Effect::OpenLog {
                 editor: self.registry.editor.clone(),
             }],
+            ["/compact"] => self.compact(None),
+            ["/compact", id] => self.compact(Some(id.trim_start_matches('@'))),
             ["/context"] => self.context(None),
             ["/context", id] => self.context(Some(id)),
             ["/model", "test", id] => {
@@ -1373,7 +1437,7 @@ impl App {
         self.grants.clear();
         for seat in &mut self.seats {
             seat.session = None;
-            seat.history = Default::default();
+            seat.forget();
             seat.queue.clear();
             seat.thread_tokens = (0, 0);
         }
@@ -1444,7 +1508,27 @@ impl App {
                         && let Some(seat) = self.seat_mut(&e.from.id)
                     {
                         std::sync::Arc::make_mut(&mut seat.history).push((prompt, text("text")));
+                        seat.compaction.at.push(At::Seq(e.seq));
                     }
+                }
+                // A checkpoint of a destination that is still the same (ADR 0021): its
+                // summary replaces the exchanges it covers.
+                transcript::Kind::Status if e.payload["subkind"] == "compact" => {
+                    let upto = e.payload["upto"]["seq"].as_u64().unwrap_or(0);
+                    if let Some(party) = e.to.first().filter(|p| same(p))
+                        && let Some(seat) = self.seat_mut(&party.id)
+                    {
+                        let covered = seat
+                            .compaction
+                            .at
+                            .iter()
+                            .take_while(|at| matches!(at, At::Seq(seq) if *seq <= upto))
+                            .count();
+                        std::sync::Arc::make_mut(&mut seat.history).drain(..covered);
+                        seat.compaction.at.drain(..covered);
+                        seat.compaction.checkpoint = Some((text("summary"), upto));
+                    }
+                    self.push("roundtable", text("text"), LineKind::Info);
                 }
                 transcript::Kind::Delivery if e.payload["status"] == "sent" => {
                     for to in e.to.iter().filter(|p| same(p)) {
@@ -1524,7 +1608,7 @@ impl App {
         self.grants.clear();
         for seat in &mut self.seats {
             seat.session = None;
-            seat.history = Default::default();
+            seat.forget();
             seat.queue.clear();
             seat.thread_tokens = (0, 0);
         }
@@ -1586,14 +1670,17 @@ impl App {
                 ),
                 Adapter::OpenAi => {
                     let window = p.context_window.unwrap_or(crate::openai::DEFAULT_CONTEXT_WINDOW);
-                    let used: u64 = seat
-                        .history
-                        .iter()
-                        .map(|(q, a)| crate::openai::estimate(q) + crate::openai::estimate(a))
-                        .sum();
+                    let compacted = match &seat.compaction.checkpoint {
+                        Some((summary, seq)) => format!(
+                            "; compacted at #{seq}, summary ~{} tokens",
+                            crate::openai::estimate(summary)
+                        ),
+                        None => String::new(),
+                    };
                     format!(
-                        "{}: ~{used} of {window} tokens of history (estimate, {} exchanges); {sent} in, {received} out this thread",
+                        "{}: ~{} of {window} tokens of history (estimate, {} exchanges{compacted}); {sent} in, {received} out this thread",
                         p.id,
+                        seat.used(),
                         seat.history.len()
                     )
                 }
@@ -1742,6 +1829,179 @@ impl App {
             status(note),
             Effect::EditRegistry(FileEdit::Default(id.into())),
         ]
+    }
+
+    /// `/compact [id]` (ADR 0021): summarize a free model's history into a checkpoint;
+    /// without an id, every enabled free model with something to compact.
+    fn compact(&mut self, only: Option<&str>) -> Vec<Effect> {
+        let fail = |app: &mut Self, why: String| {
+            app.push("roundtable", why, LineKind::Error);
+            vec![]
+        };
+        if self.read_only.is_some() {
+            return fail(self, "this thread is read-only here".into());
+        }
+        let targets: Vec<crate::registry::Participant> = match only {
+            Some(id) => match self.registry.get(id) {
+                None => return fail(self, format!("no model `{id}`")),
+                Some(p) if matches!(p.adapter, Adapter::Cli(_)) => {
+                    return fail(self, "claude and codex compact on their own".into());
+                }
+                Some(p) if !p.enabled => return fail(self, format!("`{id}` is not enabled")),
+                Some(p) => vec![p.clone()],
+            },
+            None => self
+                .registry
+                .participants
+                .iter()
+                .filter(|p| p.enabled && p.adapter == Adapter::OpenAi)
+                .filter(|p| {
+                    self.seats
+                        .iter()
+                        .any(|s| s.id == p.id && !s.history.is_empty())
+                })
+                .cloned()
+                .collect(),
+        };
+        if targets.is_empty() {
+            return fail(self, "no free model has history to compact".into());
+        }
+        let mut effects = vec![];
+        for p in targets {
+            let seat = self.seat_mut(&p.id).expect("seat");
+            let why = if seat.compaction.running.is_some() {
+                Some("already compacting")
+            } else if seat.history.is_empty() {
+                Some("nothing to compact")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                self.push("roundtable", format!("{}: {why}", p.id), LineKind::Error);
+                continue;
+            }
+            let covered = seat.history.len();
+            let upto = *seat.compaction.at.last().expect("parallel to history");
+            seat.compaction.running = Some((p.identity.clone(), covered));
+            let previous = seat.compaction.checkpoint.as_ref().map(|(s, _)| s.clone());
+            let exchanges = seat.history.to_vec();
+            self.push(
+                "roundtable",
+                format!("{}: summarizing {covered} exchanges…", p.id),
+                LineKind::Info,
+            );
+            effects.push(Effect::Compact {
+                id: p.id.clone(),
+                base_url: p.base_url.clone().unwrap_or_default(),
+                model: p.model.clone().unwrap_or_default(),
+                key_ref: p.key.clone(),
+                context_window: p
+                    .context_window
+                    .unwrap_or(crate::openai::DEFAULT_CONTEXT_WINDOW),
+                connect_timeout_s: p
+                    .connect_timeout_s
+                    .unwrap_or(crate::openai::DEFAULT_CONNECT_TIMEOUT_S),
+                idle_timeout_s: p
+                    .idle_timeout_s
+                    .unwrap_or(crate::openai::DEFAULT_IDLE_TIMEOUT_S),
+                previous,
+                exchanges,
+                upto,
+            });
+        }
+        effects
+    }
+
+    /// A compaction ended: the checkpoint is recorded (synced) before it takes effect, and
+    /// only for the destination it was started for (ADR 0021). A failure changes nothing.
+    fn compacted(
+        &mut self,
+        id: &str,
+        upto: (String, u64),
+        result: Result<String, String>,
+    ) -> Vec<Effect> {
+        let current = self.registry.get(id).map(|p| p.identity.clone());
+        let Some(seat) = self.seat_mut(id) else {
+            return vec![];
+        };
+        // Gone: `/clear`, `/resume` or a repoint since; the result belongs to nothing now.
+        let Some((identity, covered)) = seat.compaction.running.take() else {
+            return vec![];
+        };
+        if current.as_ref() != Some(&identity) {
+            return vec![];
+        }
+        let summary = match result {
+            Ok(summary) => summary,
+            Err(why) => {
+                self.push(
+                    id,
+                    format!("compaction failed, nothing changed: {why}"),
+                    LineKind::Error,
+                );
+                return vec![];
+            }
+        };
+        let (thread, seq) = upto;
+        let line = format!(
+            "{id} compacted {covered} exchanges up to #{seq} (summary ~{} tokens)",
+            crate::openai::estimate(&summary)
+        );
+        let checkpoint = record(
+            router(),
+            vec![self.party(id)],
+            transcript::Kind::Status,
+            json!({
+                "text": line,
+                "subkind": "compact",
+                "for": id,
+                "identity": identity,
+                "upto": {"thread": thread, "seq": seq},
+                "summary": summary,
+            }),
+        )
+        .durable();
+        let seat = self.seat_mut(id).expect("seat");
+        std::sync::Arc::make_mut(&mut seat.history).drain(..covered);
+        seat.compaction.at.drain(..covered);
+        seat.compaction.checkpoint = Some((summary, seq));
+        self.push("roundtable", line, LineKind::Info);
+        vec![checkpoint]
+    }
+
+    /// Suggests `/compact <id>` once per thread when fitting would drop more than a
+    /// quarter of the window from a free model's history (ADR 0021).
+    fn suggest_compact(
+        &mut self,
+        id: &str,
+        system: &str,
+        summary: Option<&str>,
+        prompt: &str,
+        window: u64,
+        max_output: u64,
+    ) {
+        let cost = |text: &str| crate::openai::estimate(text) + 4;
+        let Some(seat) = self.seat_mut(id) else {
+            return;
+        };
+        if seat.compaction.suggested {
+            return;
+        }
+        let room = window
+            .saturating_sub(max_output)
+            .saturating_sub(cost(system) + cost(prompt) + summary.map_or(0, cost));
+        let history: u64 = seat.history.iter().map(|(q, a)| cost(q) + cost(a)).sum();
+        let dropped = history.saturating_sub(room);
+        if dropped > window / 4 {
+            seat.compaction.suggested = true;
+            self.push(
+                "roundtable",
+                format!(
+                    "{id}'s history no longer fits: ~{dropped} of its oldest tokens are left out; /compact {id} keeps them as a summary"
+                ),
+                LineKind::Info,
+            );
+        }
     }
 
     /// `/handoff <id> [from <summarizer>] [note]` or `/handoff <id> raw [n]` (ADR 0020).
@@ -2165,7 +2425,7 @@ impl App {
             }
             if identity_changed && let Some(seat) = self.seat_mut(&p.id) {
                 seat.session = None;
-                seat.history = Default::default();
+                seat.forget();
             }
         }
         let gone: Vec<String> = self
@@ -2181,7 +2441,7 @@ impl App {
             // Coming back later is a fresh start, whatever it points to then.
             if let Some(seat) = self.seat_mut(&id) {
                 seat.session = None;
-                seat.history = Default::default();
+                seat.forget();
             }
         }
         for p in &next.participants {
@@ -2203,6 +2463,7 @@ impl App {
                     prompt: None,
                     turn_identity: None,
                     thread_tokens: (0, 0),
+                    compaction: Compaction::default(),
                 });
             }
         }
@@ -2398,6 +2659,37 @@ impl App {
                 .as_deref()
                 .map(|r| format!(" Your role: {r}."))
                 .unwrap_or_default();
+            let system = format!(
+                "You are `{}`, one participant in a group chat with a human and other AI \
+                 models, run by roundtable.{role} Answer the human's message.",
+                p.id
+            );
+            let context_window = p
+                .context_window
+                .unwrap_or(crate::openai::DEFAULT_CONTEXT_WINDOW);
+            let max_output = p
+                .max_output_tokens
+                .unwrap_or(crate::openai::DEFAULT_MAX_OUTPUT);
+            // Attributed conversation data, never a system message (ADR 0021).
+            let summary = self
+                .seats
+                .iter()
+                .find(|s| s.id == p.id)
+                .and_then(|s| s.compaction.checkpoint.as_ref())
+                .map(|(summary, _)| {
+                    format!(
+                        "summary of the conversation so far (by {}): {summary}",
+                        p.id
+                    )
+                });
+            self.suggest_compact(
+                &p.id,
+                &system,
+                summary.as_deref(),
+                &prompt,
+                context_window,
+                max_output,
+            );
             return vec![
                 delivery,
                 Effect::StartChat {
@@ -2405,19 +2697,12 @@ impl App {
                     base_url: p.base_url.clone().unwrap_or_default(),
                     model: p.model.clone().unwrap_or_default(),
                     key_ref: p.key.clone(),
-                    system: format!(
-                        "You are `{}`, one participant in a group chat with a human and other AI \
-                         models, run by roundtable.{role} Answer the human's message.",
-                        p.id
-                    ),
+                    system,
+                    summary,
                     history,
                     prompt,
-                    context_window: p
-                        .context_window
-                        .unwrap_or(crate::openai::DEFAULT_CONTEXT_WINDOW),
-                    max_output: p
-                        .max_output_tokens
-                        .unwrap_or(crate::openai::DEFAULT_MAX_OUTPUT),
+                    context_window,
+                    max_output,
                     connect_timeout_s: p
                         .connect_timeout_s
                         .unwrap_or(crate::openai::DEFAULT_CONNECT_TIMEOUT_S),
@@ -2645,15 +2930,19 @@ impl App {
             .iter()
             .find(|s| s.id == id)
             .and_then(|s| s.turn_identity.clone());
+        let mut link = link;
         if outcome == Outcome::Complete
             && self.registry.get(id).is_some_and(|p| {
                 p.adapter == Adapter::OpenAi && Some(&p.identity) == turn_identity.as_ref()
             })
             && let Some(prompt) = prompt
         {
+            // Keyed, so a later `/compact` can name this reply as its `upto` (ADR 0021).
+            link.key = self.next_key();
             let seat = self.seat_mut(id).expect("seat");
             // Copies only if a turn still shares it; normally the runner is done with it.
             std::sync::Arc::make_mut(&mut seat.history).push((prompt, text.clone()));
+            seat.compaction.at.push(At::Key(link.key));
         }
         let asker = self
             .seats
@@ -4102,6 +4391,150 @@ mod tests {
         assert_eq!(chats(&effects)[0].1.len(), 1, "only the completed exchange");
     }
 
+    /// The summary a chat start replays (ADR 0021).
+    fn replayed(effects: &[Effect]) -> Option<String> {
+        effects.iter().find_map(|e| match e {
+            Effect::StartChat { summary, .. } => summary.clone(),
+            _ => None,
+        })
+    }
+
+    fn exchange(app: &mut App, prompt: &str, reply: &str) {
+        type_line(app, &format!("@llama {prompt}"));
+        app.update(agent("llama", PEvent::TextDelta(reply.into())));
+        app.update(agent("llama", PEvent::Done(Outcome::Complete)));
+    }
+
+    fn compacted(id: &str, seq: u64, result: Result<&str, &str>) -> Event {
+        Event::Compacted {
+            id: id.into(),
+            upto: ("T1".into(), seq),
+            result: result.map(str::to_string).map_err(str::to_string),
+        }
+    }
+
+    #[test]
+    fn compact_turns_a_free_models_history_into_a_checkpoint() {
+        let mut app = App::default();
+        reload(&mut app, &format!("{DEFAULT_FILE}{LLAMA}"));
+        type_line(&mut app, "/compact");
+        assert_eq!(last_text(&app), "no free model has history to compact");
+        type_line(&mut app, "/compact claude");
+        assert_eq!(last_text(&app), "claude and codex compact on their own");
+        exchange(&mut app, "hi", "hello");
+        exchange(&mut app, "again", "sure");
+
+        let effects = type_line(&mut app, "/compact");
+        match &effects[..] {
+            [
+                Effect::Compact {
+                    id,
+                    exchanges,
+                    previous: None,
+                    upto: At::Key(_),
+                    ..
+                },
+            ] => {
+                assert_eq!(id, "llama");
+                assert_eq!(exchanges.len(), 2, "the whole history, before any trimming");
+            }
+            other => panic!("{other:?}"),
+        }
+        type_line(&mut app, "/compact llama");
+        assert_eq!(last_text(&app), "llama: already compacting");
+
+        // The checkpoint is recorded, synced, before it takes effect.
+        let effects = app.update(compacted("llama", 7, Ok("S1")));
+        match &effects[..] {
+            [
+                Effect::Record {
+                    event,
+                    durable: true,
+                    ..
+                },
+            ] => {
+                assert_eq!(event.kind, transcript::Kind::Status);
+                assert_eq!(event.payload["subkind"], "compact");
+                assert_eq!(event.payload["for"], "llama");
+                assert_eq!(event.payload["upto"], json!({"thread": "T1", "seq": 7}));
+                assert_eq!(event.payload["summary"], "S1");
+            }
+            other => panic!("{other:?}"),
+        }
+        let effects = type_line(&mut app, "@llama next");
+        assert!(chats(&effects)[0].1.is_empty(), "the summary replaces them");
+        assert_eq!(
+            replayed(&effects).as_deref(),
+            Some("summary of the conversation so far (by llama): S1"),
+            "replayed as attributed data"
+        );
+        app.update(agent("llama", PEvent::TextDelta("ok".into())));
+        app.update(agent("llama", PEvent::Done(Outcome::Complete)));
+        type_line(&mut app, "/context llama");
+        assert!(last_text(&app).contains("1 exchanges; compacted at #7"));
+
+        // A failure changes nothing; the next compaction starts from the checkpoint.
+        let effects = type_line(&mut app, "/compact llama");
+        assert!(matches!(
+            &effects[..],
+            [Effect::Compact { previous: Some(p), exchanges, .. }] if p == "S1" && exchanges.len() == 1
+        ));
+        assert!(app.update(compacted("llama", 9, Err("cut off"))).is_empty());
+        assert!(last_text(&app).contains("nothing changed: cut off"));
+        let effects = type_line(&mut app, "@llama more");
+        assert_eq!(chats(&effects)[0].1.len(), 1);
+        assert!(replayed(&effects).unwrap().ends_with("S1"));
+    }
+
+    #[test]
+    fn a_compaction_belongs_to_the_destination_it_started_for() {
+        let mut app = App::default();
+        reload(&mut app, &format!("{DEFAULT_FILE}{LLAMA}"));
+        exchange(&mut app, "hi", "hello");
+        type_line(&mut app, "/compact llama");
+        let hosted = LLAMA.replace("http://localhost:11434/v1", "https://openrouter.ai/api/v1");
+        reload(&mut app, &format!("{DEFAULT_FILE}{hosted}"));
+        assert!(app.update(compacted("llama", 3, Ok("S"))).is_empty());
+        let effects = type_line(&mut app, "@llama hi");
+        assert_eq!(
+            replayed(&effects),
+            None,
+            "never carried to the new endpoint"
+        );
+        app.update(agent("llama", PEvent::Done(Outcome::Complete)));
+
+        // `/clear` drops a compaction under way too.
+        exchange(&mut app, "a", "b");
+        type_line(&mut app, "/compact llama");
+        type_line(&mut app, "/clear");
+        assert!(app.update(compacted("llama", 3, Ok("S"))).is_empty());
+    }
+
+    #[test]
+    fn compact_is_suggested_once_when_trimming_drops_a_quarter_of_the_window() {
+        let small = LLAMA.replace(
+            "model = \"llama3.3\"",
+            "model = \"llama3.3\"\ncontext_window = 400\nmax_output_tokens = 100",
+        );
+        let mut app = App::default();
+        reload(&mut app, &format!("{DEFAULT_FILE}{small}"));
+        let long = "x".repeat(300); // ~100 tokens
+        let hint = |app: &App| {
+            app.lines
+                .iter()
+                .filter(|l| l.text.contains("/compact llama keeps them"))
+                .count()
+        };
+        for _ in 0..3 {
+            exchange(&mut app, "q", &long);
+        }
+        assert_eq!(hint(&app), 0, "still fits");
+        for _ in 0..3 {
+            exchange(&mut app, "q", &long);
+        }
+        assert_eq!(hint(&app), 1, "once per thread");
+    }
+
     #[test]
     fn a_new_endpoint_starts_with_empty_history() {
         let mut app = App::default();
@@ -4660,6 +5093,52 @@ mod tests {
             )),
             "a session made for another identity is not resumed"
         );
+    }
+
+    #[test]
+    fn resume_replays_a_checkpoint_of_the_same_destination() {
+        let mut app = App::default();
+        reload(&mut app, &format!("{DEFAULT_FILE}{LLAMA}"));
+        let mut events = past_thread(&app);
+        let llama = transcript::Party {
+            id: "llama".into(),
+            identity: Some(app.registry.get("llama").unwrap().identity.clone()),
+        };
+        events.push(transcript::EventLine {
+            seq: 100,
+            ts: 0,
+            turn: None,
+            parent: None,
+            from: transcript::Party {
+                id: "router".into(),
+                identity: None,
+            },
+            to: vec![llama],
+            kind: transcript::Kind::Status,
+            payload: json!({
+                "text": "llama compacted 1 exchanges up to #2",
+                "subkind": "compact",
+                "for": "llama",
+                "upto": {"thread": "T1", "seq": 2},
+                "summary": "S",
+            }),
+            tokens_in: None,
+            tokens_out: None,
+        });
+        app.update(Event::Resumed {
+            title: "old".into(),
+            events,
+            sessions: BTreeMap::new(),
+            elsewhere: None,
+        });
+        let effects = type_line(&mut app, "@llama q2");
+        assert!(
+            chats(&effects)[0].1.is_empty(),
+            "q1/a1 (#2) is in the summary"
+        );
+        assert!(replayed(&effects).unwrap().ends_with(": S"));
+        type_line(&mut app, "/compact llama");
+        assert_eq!(last_text(&app), "llama: nothing to compact");
     }
 
     #[test]
