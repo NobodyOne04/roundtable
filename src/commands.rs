@@ -49,6 +49,11 @@ pub const COMMANDS: &[Command] = &[
         help: "open the whole thread as Markdown in the configured `editor`",
     },
     Command {
+        name: "/compact",
+        args: "[id]",
+        help: "summarize a free model's history so its start isn't dropped",
+    },
+    Command {
         name: "/context",
         args: "[id]",
         help: "what each participant has seen and how full its window is",
@@ -126,7 +131,7 @@ pub fn complete(input: &str, ids: &[String]) -> Vec<String> {
     }
     let takes_id = matches!(
         words.as_slice(),
-        ["/context", _] | ["/model", "enable" | "disable" | "use" | "test", _]
+        ["/context" | "/compact", _] | ["/model", "enable" | "disable" | "use" | "test", _]
     );
     if takes_id {
         return ids
